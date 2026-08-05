@@ -28,16 +28,30 @@ from datetime import datetime, timezone, timedelta
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
-# 合法文件名字符（字母/数字/下划线/连字符/点），其余替换为下划线
-_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.\-]")
+# 合法文件名字符（字母/数字/下划线/连字符/点/中文等 Unicode 字符），其余替换为下划线
+# 控制字符、路径分隔符、Windows 保留字符（<>:"/\|?*）及首尾点/空格需替换
+# 正向白名单：保留字母、数字、下划线、连字符、点、中文及常见 Unicode 字母（\w 包含 Unicode）
+_SAFE_NAME_RE = re.compile(r'[^\w.\-]', re.UNICODE)
+# Windows 文件名保留字符（额外防御性过滤，\w 未覆盖）
+_WIN_RESERVED_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def _safe_segment(value):
-    """将变量值规范化为文件名安全片段"""
+    """将变量值规范化为文件名安全片段
+
+    保留中文等 Unicode 字母（常见于批次/场景名），
+    仅替换控制字符、路径分隔符、Windows 保留字符为下划线。
+    """
     if value is None:
         return ""
     s = str(value).strip()
-    return _SAFE_NAME_RE.sub("_", s) or "NA"
+    # 先替换 Windows 保留字符为下划线
+    s = _WIN_RESERVED_RE.sub("_", s)
+    # 再替换其他非白名单字符为下划线（\w 在 re.UNICODE 下保留中文）
+    s = _SAFE_NAME_RE.sub("_", s)
+    # 去除首尾点和空格（Windows 不允许文件名以点/空格结尾）
+    s = s.strip(". ")
+    return s or "NA"
 
 
 def _build_context(subject, data_type, original_filename, seq=None, video_type=None):
