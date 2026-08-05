@@ -57,3 +57,7 @@ capture_screenshots.py
 capture_screenshots_v2.py
 generate_word_manual.py
 改动需求.md
+
+# ===================== 后端一次性脚本与单元测试（部署非必要）=====================
+back/scripts/
+back/tests/
