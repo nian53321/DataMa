@@ -83,6 +83,7 @@ def list_subjects():
         risk_level=request.args.get("cognitive_risk_level", "").strip(),
         batch=request.args.get("collection_batch", "").strip(),
         has_video=request.args.get("has_video", "").strip(),
+        ids_only=request.args.get("ids_only", "false").strip().lower() == "true",
     )
     return success(result)
 

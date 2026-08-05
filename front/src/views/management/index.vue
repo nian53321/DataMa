@@ -99,7 +99,23 @@
     <!-- 受试者列表 -->
     <el-card v-if="viewMode === 'subject'" style="margin-top: 16px">
       <template #header>
-        <span>受试者列表</span>
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px">
+          <span>受试者列表</span>
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap">
+            <el-button type="primary" plain :icon="Check" @click="selectAllSubjectsAcrossPages" :loading="selectAllSubjectsLoading">
+              跨页全选
+            </el-button>
+            <el-button :icon="CircleClose" :disabled="!selectedSubjects.length" @click="clearAllSubjectSelection">
+              清空选择
+            </el-button>
+            <el-tag v-if="selectedSubjects.length" type="warning" effect="plain">
+              已选 {{ selectedSubjects.length }} 个受试者<span v-if="selectedSubjects.length > subjectList.length">（含其他页）</span>
+            </el-tag>
+            <el-button v-if="canDelete" type="danger" plain :icon="Delete" :disabled="!selectedSubjects.length" @click="batchRemoveSubjects">
+              批量删除<span v-if="selectedSubjects.length"> ({{ selectedSubjects.length }})</span>
+            </el-button>
+          </div>
+        </div>
       </template>
       <!-- 筛选栏 -->
       <el-form :inline="true" style="margin-bottom: 12px">
@@ -136,7 +152,16 @@
           <el-button :icon="RefreshLeft" @click="onResetFilters">重置</el-button>
         </el-form-item>
       </el-form>
-      <el-table :data="subjectList" border stripe v-loading="tableLoading">
+      <el-table
+        ref="subjectTableRef"
+        :data="subjectList"
+        border
+        stripe
+        v-loading="tableLoading"
+        :row-key="(row) => row.id"
+        @selection-change="onSubjectSelectionChange"
+      >
+        <el-table-column type="selection" width="44" />
         <el-table-column prop="pseudo_id" label="伪ID" min-width="110" show-overflow-tooltip />
         <el-table-column prop="age" label="年龄" width="60" align="center" header-align="center" />
         <el-table-column prop="gender" label="性别" width="60" align="center" header-align="center" />
@@ -1030,6 +1055,108 @@ const layerStat = reactive({ raw: 0, cleaned: 0, feature: 0, annotation: 0 })
 const saving = ref(false)
 const tableLoading = ref(false)
 
+// ===== 受试者批量选择（跨页选中） =====
+const subjectTableRef = ref()
+const selectedSubjects = ref([])
+const selectAllSubjectsLoading = ref(false)
+// 防止 _syncSubjectTableSelection 触发的 selection-change 反向覆盖
+let _suppressSubjectSelectionChange = false
+
+const onSubjectSelectionChange = (rows) => {
+  if (_suppressSubjectSelectionChange) return
+  const currentPageIds = new Set(subjectList.value.map((r) => r.id))
+  const selectedInPage = new Set(rows.map((r) => r.id))
+  const kept = selectedSubjects.value.filter((r) => !currentPageIds.has(r.id))
+  const pageRows = rows.map((r) => ({ ...r, _placeholder: false }))
+  const seen = new Set(kept.map((r) => r.id))
+  const merged = [...kept]
+  for (const r of pageRows) {
+    if (!seen.has(r.id)) {
+      seen.add(r.id)
+      merged.push(r)
+    }
+  }
+  selectedSubjects.value = merged
+}
+
+const _syncSubjectTableSelection = () => {
+  if (!subjectTableRef.value) return
+  _suppressSubjectSelectionChange = true
+  try {
+    const selectedIds = new Set(selectedSubjects.value.map((r) => r.id))
+    subjectList.value.forEach((row) => {
+      subjectTableRef.value.toggleRowSelection(row, selectedIds.has(row.id))
+    })
+  } finally {
+    _suppressSubjectSelectionChange = false
+  }
+}
+
+const selectAllSubjectsAcrossPages = async () => {
+  selectAllSubjectsLoading.value = true
+  try {
+    const res = await getSubjectsApi({
+      page: 1,
+      page_size: 1,
+      keyword: filters.keyword,
+      gender: filters.gender,
+      cognitive_risk_level: filters.riskLevel,
+      collection_batch: filters.batch,
+      has_video: filters.hasVideo,
+      ids_only: true,
+    })
+    const allIds = (res.data?.items || []).map((x) => x.id)
+    if (!allIds.length) {
+      ElMessage.warning('当前筛选条件下无可选数据')
+      return
+    }
+    const allIdSet = new Set(allIds)
+    const existingNotInFilter = selectedSubjects.value.filter((r) => !allIdSet.has(r.id))
+    const newSelected = allIds.map((id) => {
+      const existing = selectedSubjects.value.find((r) => r.id === id)
+      return existing || { id, _placeholder: true }
+    })
+    selectedSubjects.value = [...existingNotInFilter, ...newSelected]
+    ElMessage.success(`已跨页全选 ${allIds.length} 个受试者`)
+    nextTick(() => _syncSubjectTableSelection())
+  } catch (e) {
+    /* 接口失败时静默 */
+  } finally {
+    selectAllSubjectsLoading.value = false
+  }
+}
+
+const clearAllSubjectSelection = () => {
+  selectedSubjects.value = []
+  subjectTableRef.value?.clearSelection()
+}
+
+const batchRemoveSubjects = () => {
+  if (!selectedSubjects.value.length) return
+  ElMessageBox.confirm(
+    `确认删除选中的 ${selectedSubjects.value.length} 个受试者？该操作将级联删除其所有数据资产与磁盘文件，不可恢复。`,
+    '批量删除',
+    { type: 'warning', confirmButtonText: '确认删除', confirmButtonClass: 'el-button--danger' }
+  ).then(async () => {
+    try {
+      const results = await Promise.allSettled(selectedSubjects.value.map((s) => deleteSubjectApi(s.id)))
+      const successCount = results.filter(r => r.status === 'fulfilled').length
+      const failCount = results.length - successCount
+      if (failCount === 0) {
+        ElMessage.success(`已删除 ${successCount} 个受试者`)
+      } else {
+        ElMessage.warning(`成功删除 ${successCount} 个，失败 ${failCount} 个（失败可能因权限或文件占用）`)
+      }
+      if (successCount > 0) {
+        subjectTableRef.value?.clearSelection()
+        selectedSubjects.value = []
+        loadSubjects()
+        loadLayerStat()
+      }
+    } catch (e) { /* 拦截器已提示 */ }
+  }).catch(() => {})
+}
+
 // ===== 数据动态可视化 =====
 const dataStatsLoading = ref(false)
 const dataStatsDays = ref(30)
@@ -1359,6 +1486,8 @@ const loadSubjects = async () => {
     })
     subjectList.value = res.data.items || []
     pagination.total = res.data.total || 0
+    // 翻页后同步当前页的勾选状态到表格 DOM
+    nextTick(() => _syncSubjectTableSelection())
   } catch (e) {
     subjectList.value = []
   } finally {
@@ -1853,6 +1982,8 @@ const removeSubject = (row) => {
     try {
       await deleteSubjectApi(row.id)
       ElMessage.success('受试者已删除')
+      // 从已选列表中移除（避免残留 ID）
+      selectedSubjects.value = selectedSubjects.value.filter((s) => s.id !== row.id)
       loadSubjects()
       loadLayerStat()
     } catch (e) { /* 拦截器已提示 */ }

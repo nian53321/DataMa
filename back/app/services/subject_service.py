@@ -33,11 +33,13 @@ class SubjectService(BaseService):
     def list_subjects(self, page: int = 1, page_size: int = 20,
                       keyword: str = "", gender: str = "",
                       risk_level: str = "", batch: str = "",
-                      has_video: str = "") -> dict:
+                      has_video: str = "", ids_only: bool = False) -> dict:
         """受试者列表（支持关键词搜索与多条件筛选）
 
         风险分级传 'none' 表示筛选未评估（NULL 或空字符串）
         has_video 传 'true'/'false' 筛选已采集/未采集视频
+        ids_only=True 时仅返回当前筛选条件下的全部 ID 列表（不分页，轻量），
+        用于前端跨页全选。返回格式：{"items": [{"id": 1}, ...], "total": N}
         返回分页 dict，items 已按角色脱敏，附带 has_video 标记。
         """
         query = Subject.query
@@ -72,6 +74,10 @@ class SubjectService(BaseService):
                 query = query.filter(~Subject.id.in_(
                     db.select(video_subject_ids.c.subject_id)
                 ))
+        # ids_only 模式：仅返回 ID 列表（用于跨页全选），不分页、不脱敏
+        if ids_only:
+            ids = [r[0] for r in query.with_entities(Subject.id).all()]
+            return {"items": [{"id": i} for i in ids], "total": len(ids)}
         query = query.order_by(Subject.created_at.desc())
         result = paginate(query, page, page_size)
         # 批量查询每个受试者的视频资产，聚合出 video_types（已采集类型列表）+ has_video（向后兼容）
