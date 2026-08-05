@@ -1,0 +1,604 @@
+# -*- coding: utf-8 -*-
+"""可视化接口：时间轴对齐、单受试者多模态同步展示"""
+import os
+import io
+import csv
+import json
+import math
+import struct
+from flask import request, current_app
+from flask_jwt_extended import jwt_required
+
+from app.api import visualization_bp
+from app.models import Subject, DataAsset, DataType
+from app.utils.response import success, fail
+from app.utils.time import to_local_str
+from app.services.asset_service import _decrypt_for_serving
+
+
+@visualization_bp.route("/subjects/<int:subject_id>", methods=["GET"])
+@jwt_required()
+def subject_overview(subject_id):
+    """受试者总览面板：基本信息+量表+采集信息"""
+    subject = Subject.query.get(subject_id)
+    if not subject:
+        return fail("受试者不存在", 404)
+    assets = DataAsset.query.filter_by(subject_id=subject_id).all()
+    return success({
+        "subject": subject.to_dict(),
+        "modalities": [
+            {"id": a.id, "data_type": a.data_type.value, "file_name": a.file_name,
+             "file_url": f"/api/data/assets/{a.id}/file",
+             "file_format": a.file_format,
+             "sample_rate": a.sample_rate, "timestamp_utc": to_local_str(a.timestamp_utc)}
+            for a in assets
+        ],
+    })
+
+
+@visualization_bp.route("/align", methods=["POST"])
+@jwt_required()
+def align_modalities():
+    """多模态时间轴对齐（以采集触发信号为基准）"""
+    data = request.get_json(silent=True) or {}
+    subject_id = data.get("subject_id")
+    anchor = data.get("anchor", "trigger")  # trigger / utc
+    if not subject_id:
+        return fail("受试者ID必填", 422)
+    # TODO: 调用对齐引擎计算时钟偏差、插值重采样
+    return success({"subject_id": subject_id, "anchor": anchor, "status": "queued"}, message="对齐任务已提交")
+
+
+@visualization_bp.route("/timeline/<int:subject_id>", methods=["GET"])
+@jwt_required()
+def timeline(subject_id):
+    """统一时间轴数据（10ms 粒度同步序列 + 事件锚点）"""
+    # TODO: 返回对齐后的多模态同步序列
+    assets = DataAsset.query.filter_by(subject_id=subject_id).all()
+    return success({
+        "subject_id": subject_id,
+        "granularity_ms": 10,
+        "tracks": [
+            {"id": a.id, "data_type": a.data_type.value, "file_name": a.file_name,
+             "file_url": f"/api/data/assets/{a.id}/file",
+             "file_format": a.file_format,
+             "offset_ms": a.align_offset_ms or 0}
+            for a in assets
+        ],
+    })
+
+
+def _get_asset_file_path(asset):
+    """获取数据资产的可读文件路径（自动处理加密文件解密）
+    返回 (file_path, tmp_path_or_none)：tmp_path 非空时调用方需负责删除
+
+    复用 asset_service._decrypt_for_serving 统一解密包装器，避免重复实现。
+    """
+    if not asset.file_path:
+        return None, None
+    storage_root = current_app.config["DATA_LAKE_DIR"]
+    abs_path = os.path.join(storage_root, asset.file_path)
+    # 防护：路径为目录或不存在时返回 None（避免 open() 目录触发系统错误）
+    if not os.path.isfile(abs_path):
+        return None, None
+    ext = os.path.splitext(asset.file_name)[1] or ".bin"
+    path, is_temp = _decrypt_for_serving(abs_path, suffix=ext)
+    return path, (path if is_temp else None)
+
+
+def _read_asset_text(asset):
+    """读取数据资产文件文本内容（自动处理加密文件解密）
+    返回 (text, tmp_path_or_none)：tmp_path 非空时调用方需负责删除
+    """
+    file_path, tmp_path = _get_asset_file_path(asset)
+    if file_path is None:
+        return None, None
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    return text, tmp_path
+
+
+def _parse_eeg_edf(asset):
+    """解析 EDF/EDF+ 格式脑电文件（纯 Python 实现，无需第三方库）
+    EDF 格式：256字节固定头 + 每信号256字节 + 数据记录
+    支持 EDF+（含时间戳通道）和普通 EDF。
+    """
+    file_path, tmp_path = _get_asset_file_path(asset)
+    if file_path is None:
+        return fail("EDF 文件不存在于存储目录", 404)
+    try:
+        with open(file_path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return fail(f"EDF 文件读取失败: {str(e)}", 422)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    if len(raw) < 256:
+        return fail("EDF 文件头不完整（<256字节）", 422)
+
+    try:
+        # 解析固定头部（256字节）
+        version = raw[0:8].decode("ascii", errors="replace").strip()
+        patient_id = raw[8:88].decode("ascii", errors="replace").strip()
+        recording_id = raw[88:168].decode("ascii", errors="replace").strip()
+        start_date = raw[168:176].decode("ascii", errors="replace").strip()
+        start_time = raw[176:184].decode("ascii", errors="replace").strip()
+        header_bytes = int(raw[184:192].decode("ascii", errors="replace").strip())
+        num_records = int(raw[236:244].decode("ascii", errors="replace").strip())
+        record_duration = float(raw[244:252].decode("ascii", errors="replace").strip())
+        num_signals = int(raw[252:256].decode("ascii", errors="replace").strip())
+
+        if num_signals <= 0 or num_signals > 256:
+            return fail(f"EDF 信号数异常: {num_signals}", 422)
+        if num_records <= 0:
+            return fail("EDF 数据记录数为 0", 422)
+
+        # 解析每个信号的头部（每信号256字节）
+        offset = 256
+        labels = []
+        phys_dims = []
+        phys_mins = []
+        phys_maxs = []
+        dig_mins = []
+        dig_maxs = []
+        samples_per_record = []
+
+        for i in range(num_signals):
+            base = offset + i * 256
+            labels.append(raw[base:base + 16].decode("ascii", errors="replace").strip())
+            phys_dims.append(raw[base + 16:base + 24].decode("ascii", errors="replace").strip())
+            phys_mins.append(float(raw[base + 56:base + 64].decode("ascii", errors="replace").strip()))
+            phys_maxs.append(float(raw[base + 64:base + 72].decode("ascii", errors="replace").strip()))
+            dig_mins.append(int(raw[base + 72:base + 80].decode("ascii", errors="replace").strip()))
+            dig_maxs.append(int(raw[base + 80:base + 88].decode("ascii", errors="replace").strip()))
+            samples_per_record.append(int(raw[base + 104:base + 112].decode("ascii", errors="replace").strip()))
+
+        # 过滤掉 EDF+ 的时间戳通道（标签以 "EDF Annotations" 开头）
+        data_channels = []
+        for i in range(num_signals):
+            if "EDF Annotations" not in labels[i] and samples_per_record[i] > 0:
+                data_channels.append(i)
+
+        if not data_channels:
+            return fail("EDF 文件未找到有效数据通道", 422)
+
+        # 采样率 = samples_per_record / record_duration
+        ch0 = data_channels[0]
+        sample_rate = round(samples_per_record[ch0] / record_duration) if record_duration > 0 else 500
+        duration_sec = round(num_records * record_duration, 2)
+
+        # 解析数据记录
+        # 每个记录包含所有信号，按信号顺序排列
+        data_offset = header_bytes
+        total_samples_per_record = sum(samples_per_record)
+
+        # 降采样目标
+        max_points = 1500
+        total_samples = num_records * samples_per_record[ch0]
+        step = max(1, total_samples // max_points)
+
+        # 预计算每个通道的数据点索引
+        channels = []
+        for ci in data_channels:
+            spr = samples_per_record[ci]
+            # 该通道在每条记录中的起始偏移
+            ch_offset_in_record = sum(samples_per_record[j] for j in range(ci))
+            # 物理值转换
+            p_min = phys_mins[ci]
+            p_max = phys_maxs[ci]
+            d_min = dig_mins[ci]
+            d_max = dig_maxs[ci]
+            scale = (p_max - p_min) / (d_max - d_min) if d_max != d_min else 1.0
+
+            downsampled = []
+            for rec_idx in range(num_records):
+                rec_start = data_offset + rec_idx * total_samples_per_record * 2 + ch_offset_in_record * 2
+                # 该通道在此记录中的数据
+                for s in range(spr):
+                    global_sample = rec_idx * spr + s
+                    if global_sample % step != 0:
+                        continue
+                    byte_pos = rec_start + s * 2
+                    if byte_pos + 2 > len(raw):
+                        break
+                    dig_val = struct.unpack("<h", raw[byte_pos:byte_pos + 2])[0]
+                    phys_val = dig_val * scale + p_min
+                    downsampled.append(round(phys_val, 2))
+
+            label = labels[ci] or f"Channel {ci}"
+            channels.append({"name": label, "data": downsampled})
+
+        return success({
+            "meta": {
+                "sampleRate": sample_rate,
+                "duration": duration_sec,
+                "channels": len(channels),
+                "totalSamples": total_samples,
+                "device": f"EDF ({len(channels)}ch)",
+            },
+            "channels": channels,
+        })
+    except (ValueError, struct.error, IndexError) as e:
+        return fail(f"EDF 解析失败: {str(e)}", 422)
+
+
+def _parse_eeg_csv(text):
+    """解析 OpenBCI 风格 CSV 脑电数据
+    格式：Sample Index,EXG Channel 0..15,Timestamp
+    相同时间戳的连续行属于同一秒数据，自适应计算采样率。
+    返回 16 通道波形数据（降采样到便于绘制的规模）。
+    """
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return fail("CSV 文件为空", 422)
+    header = [h.strip() for h in rows[0]]
+
+    # 定位通道列和时间戳列
+    channel_indices = []  # [(col_idx, channel_name), ...]
+    ts_idx = None
+    for i, h in enumerate(header):
+        if h.startswith("EXG Channel"):
+            channel_indices.append((i, h))
+        elif h == "Timestamp":
+            ts_idx = i
+
+    if not channel_indices:
+        return fail("CSV 未找到 EXG Channel 列", 422)
+
+    num_channels = len(channel_indices)
+
+    # 解析数据行：收集每行各通道值和时间戳
+    # 按时间戳分组：相同时间戳的连续行 = 1 秒数据
+    channel_data = [[] for _ in range(num_channels)]  # 每个通道的完整数据
+    timestamps = []
+    for row in rows[1:]:
+        if not row:
+            continue
+        try:
+            for ci, (col_idx, _) in enumerate(channel_indices):
+                if col_idx < len(row):
+                    channel_data[ci].append(float(row[col_idx]))
+                else:
+                    channel_data[ci].append(0.0)
+            if ts_idx is not None and ts_idx < len(row):
+                timestamps.append(float(row[ts_idx]))
+        except (ValueError, IndexError):
+            continue
+
+    total = len(channel_data[0]) if channel_data else 0
+    if total == 0:
+        return fail("CSV 无有效数据行", 422)
+
+    # 自适应计算采样率：从时间戳实际跨度推算
+    if len(timestamps) >= 2:
+        duration = timestamps[-1] - timestamps[0]
+        if duration > 0:
+            sample_rate = round(total / duration)
+            duration_sec = round(duration, 2)
+        else:
+            sample_rate = 500
+            duration_sec = round(total / sample_rate, 2)
+    else:
+        # 无时间戳列，fallback
+        sample_rate = 500
+        duration_sec = round(total / sample_rate, 2)
+
+    # 降采样：每通道最多保留 1500 点（便于前端绘制）
+    max_points = 1500
+    step = max(1, total // max_points)
+
+    channels = []
+    for ci, (_, ch_name) in enumerate(channel_indices):
+        downsampled = [round(channel_data[ci][i], 2) for i in range(0, total, step)]
+        channels.append({"name": ch_name, "data": downsampled})
+
+    return success({
+        "meta": {
+            "sampleRate": sample_rate,
+            "duration": duration_sec,
+            "channels": num_channels,
+            "totalSamples": total,
+            "device": f"OpenBCI ({num_channels}ch)",
+        },
+        "channels": channels,
+    })
+
+
+def _parse_eeg_json(text):
+    """解析 BrainLink 风格 JSON 脑电数据，转换为通道波形格式"""
+    data = json.loads(text)
+    samples = data.get("samples", [])
+    # BrainLink 只有 1 通道原始波，转换为单通道
+    raw_all = []
+    for s in samples[:10]:
+        for v in s.get("raw", []):
+            raw_all.append(v)
+    raw_down = raw_all[::2]
+    raw_uv = [round(v * (1.8 / 4096) / 2000 * 1e6, 2) for v in raw_down]
+    return success({
+        "meta": {
+            "sampleRate": data.get("rawSampleRateHz", 512),
+            "duration": data.get("durationSeconds", 0),
+            "channels": 1,
+            "totalSamples": len(raw_uv),
+            "device": "BrainLink Pro",
+        },
+        "channels": [{"name": "FP1", "data": raw_uv}],
+    })
+
+
+@visualization_bp.route("/eeg-asset/<int:asset_id>", methods=["GET"])
+@jwt_required()
+def eeg_asset_parse(asset_id):
+    """解析指定数据资产的脑电文件内容并返回多通道波形数据
+    支持：
+    - CSV 格式（OpenBCI 风格：Sample Index,EXG Channel 0..15,Timestamp）
+    - JSON 格式（BrainLink 风格）
+    - EDF/EDF+ 格式（标准脑电二进制格式，纯Python解析）
+    自动处理加密文件解密，自适应计算采样率。
+    """
+    asset = DataAsset.query.get(asset_id)
+    if not asset:
+        return fail("数据资产不存在", 404)
+    if asset.data_type != DataType.EEG:
+        return fail("该资产非脑电类型", 422)
+    if not asset.file_path:
+        return fail("该资产无关联文件，请重新上传脑电文件", 404)
+
+    fmt = (asset.file_format or "").lower()
+
+    # EDF 是二进制格式，需要单独处理
+    if fmt in ("edf", "edf+", "bdf"):
+        return _parse_eeg_edf(asset)
+
+    text, tmp_path = _read_asset_text(asset)
+    if text is None:
+        return fail("文件不存在于存储目录，请检查文件是否已正确上传", 404)
+
+    try:
+        # 按内容嗅探格式
+        stripped = text.lstrip()
+        if fmt == "csv" or stripped.startswith("Sample Index"):
+            return _parse_eeg_csv(text)
+        elif fmt == "json" or stripped.startswith("{"):
+            return _parse_eeg_json(text)
+        else:
+            # 兜底：按首字符嗅探
+            if stripped.startswith("{"):
+                return _parse_eeg_json(text)
+            # 尝试当作 CSV 解析
+            if "," in text.split("\n")[0]:
+                return _parse_eeg_csv(text)
+            return fail(f"不支持的脑电文件格式: {fmt or '未知'}，支持 CSV/JSON/EDF", 422)
+    except (json.JSONDecodeError, ValueError, IndexError) as e:
+        return fail(f"脑电文件解析失败: {str(e)}", 422)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+@visualization_bp.route("/ecg-asset/<int:asset_id>", methods=["GET"])
+@jwt_required()
+def ecg_asset_parse(asset_id):
+    """解析指定数据资产的心电文件内容并返回单通道波形数据
+    支持 CSV 格式（sample_index,time_sec,source,frame,value）。
+    自动处理加密文件解密，自适应计算采样率。
+    """
+    asset = DataAsset.query.get(asset_id)
+    if not asset:
+        return fail("数据资产不存在", 404)
+    if asset.data_type != DataType.ECG:
+        return fail("该资产非心电类型", 422)
+    if not asset.file_path:
+        return fail("该资产无关联文件", 404)
+
+    text, tmp_path = _read_asset_text(asset)
+    if text is None:
+        return fail("文件不存在于存储目录", 404)
+
+    try:
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        if not rows:
+            return fail("CSV 文件为空", 422)
+
+        header = [h.strip().lower() for h in rows[0]]
+        # 查找 value 列和 time 列
+        value_col = None
+        time_col = None
+        for i, h in enumerate(header):
+            if h in ("value", "ecg", "voltage", "mv"):
+                value_col = i
+            elif h in ("time_sec", "time", "timestamp", "t"):
+                time_col = i
+        # 兜底：如果没找到 value 列，取最后一列
+        if value_col is None:
+            value_col = len(header) - 1
+
+        data_values = []
+        time_values = []
+        for row in rows[1:]:
+            if len(row) <= value_col:
+                continue
+            try:
+                data_values.append(float(row[value_col]))
+                if time_col is not None and time_col < len(row):
+                    time_values.append(float(row[time_col]))
+            except (ValueError, IndexError):
+                continue
+
+        total = len(data_values)
+        if total == 0:
+            return fail("CSV 无有效数据行", 422)
+
+        # 降采样到最多 2000 点
+        max_points = 2000
+        step = max(1, total // max_points)
+        downsampled = [round(data_values[i], 2) for i in range(0, total, step)]
+
+        # 计算采样率和时长
+        sample_rate = 0
+        duration_sec = 0
+        if len(time_values) >= 2:
+            dt = time_values[-1] - time_values[0]
+            duration_sec = round(dt, 2)
+            if dt > 0:
+                sample_rate = round(total / dt)
+        elif total > 1:
+            sample_rate = 250  # 默认假设
+
+        return success({
+            "meta": {
+                "channels": 1,
+                "sampleRate": sample_rate,
+                "duration": duration_sec,
+                "device": "CSV",
+                "points": len(downsampled),
+            },
+            "data": downsampled,
+        })
+    except (ValueError, IndexError) as e:
+        return fail(f"心电文件解析失败: {str(e)}", 422)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+@visualization_bp.route("/eye-asset/<int:asset_id>", methods=["GET"])
+@jwt_required()
+def eye_asset_parse(asset_id):
+    """解析眼动评估数据资产，返回关键指标用于可视化
+
+    优先从 metadata_json 读取（扫描导入时已解析），
+    若无则解密文件后用 load_sync_data 解析。
+    返回：风险指数、能力值、眼跳统计、图片回忆统计等
+    """
+    asset = DataAsset.query.get(asset_id)
+    if not asset:
+        return fail("数据资产不存在", 404)
+    if asset.data_type != DataType.EYE_TRACKING:
+        return fail("该资产非眼动类型", 422)
+
+    # 优先从 metadata_json 读取（扫描导入时已解析 sync_data 字段）
+    data = asset.metadata_json
+    if not data or not isinstance(data, dict) or "risk_value" not in data:
+        # 回退：解密文件后解析
+        if not asset.file_path:
+            return fail("该资产无关联文件，请重新上传", 404)
+        text, tmp_path = _read_asset_text(asset)
+        if text is None:
+            return fail("文件不存在于存储目录", 404)
+        try:
+            from app.utils.eye_tracking_adapter import load_sync_data
+            import tempfile
+            fd, tmp_json = tempfile.mkstemp(suffix=".json")
+            try:
+                os.write(fd, text.encode("utf-8"))
+                os.close(fd)
+                data = load_sync_data(tmp_json)
+            finally:
+                try:
+                    os.remove(tmp_json)
+                except OSError:
+                    pass
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    if not data:
+        return fail("眼动数据解析失败", 422)
+
+    # 提取关键指标用于可视化
+    result = {
+        "risk_value": data.get("risk_value"),
+        "risk_proportion": data.get("risk_proportion"),
+        "age_rang": data.get("age_rang"),
+        "capacity_values": {
+            "注意力": data.get("fir_capacity_value"),
+            "执行力": data.get("sec_capacity_value"),
+            "记忆力": data.get("third_capacity_value"),
+            "言语理解": data.get("fourth_capacity_value"),
+            "MoCA数理": data.get("fifth_capacity_value"),
+        },
+        "eye_jump": data.get("fir_statistics"),
+        "image_recall": data.get("sec_statistics"),
+        "custom_name": data.get("custom_name"),
+        "estimate_time": data.get("estimate_time"),
+        "estimate_num": data.get("estimate_num"),
+    }
+    return success(result)
+
+
+@visualization_bp.route("/scale-asset/<int:asset_id>", methods=["GET"])
+@jwt_required()
+def scale_asset_parse(asset_id):
+    """解析量表数据资产，返回得分摘要用于可视化
+
+    优先从 metadata_json 读取（扫描导入时已解析），
+    若无则解密文件后用 load_scale_data 解析。
+    MoCA 量表返回总分与分项得分。
+    """
+    asset = DataAsset.query.get(asset_id)
+    if not asset:
+        return fail("数据资产不存在", 404)
+    if asset.data_type != DataType.SCALE:
+        return fail("该资产非量表类型", 422)
+
+    # 优先从 metadata_json 读取（扫描导入时已解析，含 raw + summary）
+    meta = asset.metadata_json
+    if meta and isinstance(meta, dict) and "summary" in meta:
+        # 扫描导入时已解析（含 raw + summary）
+        return success({
+            "summary": meta["summary"],
+            "raw": meta.get("raw"),
+        })
+
+    # 回退：解密文件后解析
+    if not asset.file_path:
+        return fail("该资产无关联文件，请重新上传", 404)
+    text, tmp_path = _read_asset_text(asset)
+    if text is None:
+        return fail("文件不存在于存储目录", 404)
+    try:
+        from app.utils.scale_adapter import load_scale_data, parse_moca_summary
+        import tempfile
+        fd, tmp_json = tempfile.mkstemp(suffix=".json")
+        try:
+            os.write(fd, text.encode("utf-8"))
+            os.close(fd)
+            raw = load_scale_data(tmp_json)
+        finally:
+            try:
+                os.remove(tmp_json)
+            except OSError:
+                pass
+
+        if raw is None:
+            return fail("量表数据解析失败", 422)
+
+        result = {"raw": raw}
+        summary = parse_moca_summary(raw)
+        if summary:
+            result["summary"] = summary
+        return success(result)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass

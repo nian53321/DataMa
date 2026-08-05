@@ -1,0 +1,23 @@
+# 环境与密钥
+.env
+*.env
+master.key
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 数据湖本地存储
+data_lake/
+
+# 迁移文件（首次生成后纳入版本管理）
+migrations/
+
+# IDE
+.idea/
+.vscode/

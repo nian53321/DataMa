@@ -1,0 +1,59 @@
+# ===================== 环境与密钥（绝不提交）=====================
+.env
+*.env
+!back/.env.example
+!front/.env.development
+!front/.env.production
+master.key
+*.key
+*.pem
+密钥.txt
+
+# ===================== 依赖与编译产物 =====================
+node_modules/
+dist/
+dist-ssr/
+build/
+*.local
+
+# ===================== Python 缓存 =====================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+
+# ===================== 日志与本地数据 =====================
+back/logs/
+*.log
+data_lake/
+migrations/
+
+# ===================== IDE 与编辑器 =====================
+.idea/
+.vscode/
+.trae/
+front/front.iml
+
+# ===================== 操作系统 =====================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===================== 非部署必需的资料（样例数据/截图/测算文档）=====================
+样例/
+样例2/
+manual_screenshots/
+测算申请/
+.trae/documents/
+
+# ===================== 非源代码文档与一次性脚本 =====================
+*.docx
+多模态数据标注与分析处理平台用户手册.docx
+capture_screenshots.py
+capture_screenshots_v2.py
+generate_word_manual.py
+改动需求.md

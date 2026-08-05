@@ -1,0 +1,40 @@
+/* 全局样式 */
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.page-container {
+  padding: 16px;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 8px;
+
+  .title {
+    font-size: 18px;
+    font-weight: 600;
+  }
+}
+
+/* 弹窗响应式：窄屏自动收缩，避免固定 px 宽度溢出视口 */
+.el-dialog {
+  max-width: calc(100vw - 24px) !important;
+}
+.el-drawer {
+  max-width: 100vw !important;
+}

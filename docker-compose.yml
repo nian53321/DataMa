@@ -1,0 +1,73 @@
+services:
+  backend:
+    build: ./back
+    ports:
+      - "5000:5000"
+    env_file:
+      - ./back/.env
+    volumes:
+      - backend-data:/app/data_lake
+      - backend-logs:/app/logs
+      - ./back/master.key:/app/master.key:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      # 从根目录 .env 读取 DB_PASSWORD（deploy.ps1 自动生成并同步）
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-DataMgmt2026Secure}
+      MYSQL_DATABASE: data_management
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD:-DataMgmt2026Secure}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  celery-worker:
+    build: ./back
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+    env_file:
+      - ./back/.env
+    volumes:
+      - backend-data:/app/data_lake
+      - ./back/master.key:/app/master.key:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build: ./front
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+  backend-logs:
+  mysql-data:
