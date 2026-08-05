@@ -429,18 +429,14 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
     :param skip_data_types: 已导入的数据类型集合（set[str]），这些类型的文件将被跳过（增量导入去重）
     """
     from flask import current_app
-    from app.models.standard import DataStandard
+    from app.utils.naming import get_naming_standard
 
     data_lake = current_app.config["DATA_LAKE_DIR"]
-    # 受试者数据目录: data_lake/raw/{pseudo_id}/ 和 data_lake/feature/{pseudo_id}/
-    subject_raw_dir = os.path.join(data_lake, "raw", subject.pseudo_id)
-    subject_feature_dir = os.path.join(data_lake, "feature", subject.pseudo_id)
-    os.makedirs(subject_raw_dir, exist_ok=True)
-
-    # 查找命名规范
-    naming_std = DataStandard.query.filter_by(
-        standard_type="naming", is_active=True
-    ).first()
+    # 受试者数据目录基: data_lake/raw/{pseudo_id}/ 和 data_lake/feature/{pseudo_id}/
+    # 实际文件存储在 data_lake/{layer}/{pseudo_id}/{data_type}/{filename}，与 upload_asset 保持一致
+    subject_raw_base = os.path.join(data_lake, "raw", subject.pseudo_id)
+    subject_feature_base = os.path.join(data_lake, "feature", subject.pseudo_id)
+    os.makedirs(subject_raw_base, exist_ok=True)
 
     # 跳过文件名集合：元数据文件
     # （正常情况下扫描目录不含密钥文件，但防御性跳过避免误入库）
@@ -478,8 +474,9 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
         # 增量导入去重：跳过已导入的数据类型
         if skip_data_types and data_type in skip_data_types:
             continue
-        # 应用命名规范（apply_naming_standard 返回 (name, ext) 元组）
+        # 应用命名规范（按模态精确匹配命名规范，回退到通用规范）
         new_name = original_name
+        naming_std = get_naming_standard(data_type)
         if naming_std:
             try:
                 norm_name, norm_ext = apply_naming_standard(
@@ -497,13 +494,15 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
                 new_name = original_name
 
         # 根据数据类型选择存储目录和分层
+        # 目录结构: data_lake/{layer}/{pseudo_id}/{data_type}/{filename}，与 upload_asset 保持一致
         if is_sync or is_scale:
-            target_dir = subject_feature_dir
+            target_dir = os.path.join(subject_feature_base, data_type)
             os.makedirs(target_dir, exist_ok=True)
             layer_name = "feature"
             asset_layer = DataLayer.FEATURE
         else:
-            target_dir = subject_raw_dir
+            target_dir = os.path.join(subject_raw_base, data_type)
+            os.makedirs(target_dir, exist_ok=True)
             layer_name = "raw"
             asset_layer = DataLayer.RAW
         dst_path = os.path.join(target_dir, new_name)
@@ -524,18 +523,27 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
         # 创建数据资产记录
         file_size = os.path.getsize(dst_path)
         valid_types = [t.value for t in DataType]
-        # 相对存储路径入库（便于跨环境迁移，与 upload_asset 接口保持一致）
-        rel_path = f"{layer_name}/{subject.pseudo_id}/{new_name}"
-        # 眼动/量表数据：解析 JSON 字段存入 metadata_json（仅解析存储，不映射到 Subject）
-        asset_metadata = None
+        # 相对存储路径入库（与 upload_asset 保持一致：{layer}/{pseudo_id}/{data_type}/{filename}）
+        rel_path = f"{layer_name}/{subject.pseudo_id}/{data_type}/{new_name}"
+        # 元数据：记录原始文件名+大小（与 upload_asset 一致，支持幂等去重）
+        # 眼动/量表数据额外解析 JSON 字段存入 metadata_json
+        src_size = os.path.getsize(src_path)
+        asset_metadata = {
+            "original_filename": fname,
+            "original_size": src_size,
+        }
         if is_sync:
-            asset_metadata = load_sync_data(src_path)
+            sync_data = load_sync_data(src_path)
+            if sync_data:
+                asset_metadata.update(sync_data)
         elif is_scale:
-            asset_metadata = load_scale_data(src_path)
+            scale_data = load_scale_data(src_path)
+            if scale_data:
+                asset_metadata["raw"] = scale_data
             # MoCA 量表额外计算总分与分项得分摘要
-            moca_summary = parse_moca_summary(asset_metadata)
+            moca_summary = parse_moca_summary(scale_data)
             if moca_summary:
-                asset_metadata = {"raw": asset_metadata, "summary": moca_summary}
+                asset_metadata["summary"] = moca_summary
         asset = DataAsset(
             subject_id=subject.id,
             file_name=new_name,
