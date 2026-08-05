@@ -2,7 +2,7 @@
 """数据模型"""
 from app.models.user import User, Role, init_default_admin
 from app.models.subject import Subject
-from app.models.data import DataAsset, DataVersion, DataType, DataLayer
+from app.models.data import DataAsset, DataVersion, DataType, DataLayer, VIDEO_TYPES, VIDEO_TYPE_LABELS
 from app.models.annotation import (
     AnnotationTask,
     Annotation,
@@ -50,6 +50,8 @@ __all__ = [
     "DataVersion",
     "DataType",
     "DataLayer",
+    "VIDEO_TYPES",
+    "VIDEO_TYPE_LABELS",
     "AnnotationTask",
     "Annotation",
     "AnnotationVersion",

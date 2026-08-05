@@ -24,7 +24,7 @@ from typing import Tuple, Optional
 from flask import current_app
 
 from app.extensions import db
-from app.models import DataAsset, DataType, DataLayer, Subject
+from app.models import DataAsset, DataType, DataLayer, Subject, VIDEO_TYPES
 from app.services.base import (
     BaseService, ValidationError, NotFoundError, OperationNotAllowedError,
 )
@@ -212,7 +212,8 @@ class AssetService(BaseService):
 
     def upload_asset(self, subject_id: int, data_type: str,
                      file_storage, layer: str = "raw",
-                     sample_rate: Optional[int] = None):
+                     sample_rate: Optional[int] = None,
+                     video_type: Optional[str] = None):
         """实际上传文件并登记数据资产，按受试者伪ID分目录存储
 
         存储结构：{DATA_LAKE_DIR}/{layer}/{subject_pseudo_id}/{data_type}/{filename}
@@ -224,6 +225,8 @@ class AssetService(BaseService):
         4. 应用命名规范生成规范化文件名
         5. 路径穿越防护：确保最终路径仍在 DATA_LAKE_DIR 内
         6. 落盘：启用加密时直接将上传流加密写入磁盘（不留明文临时文件）
+        7. 视频类型（face/body/gait）：存入 metadata.video_type，
+           并按 video_type 精准重采（删除同类型旧视频，不影响其他类型）
         """
         if not subject_id or not data_type:
             raise ValidationError("受试者ID与数据类型必填")
@@ -233,6 +236,16 @@ class AssetService(BaseService):
             dt = DataType(data_type)
         except ValueError:
             raise ValidationError("数据类型非法")
+
+        # 视频子类型校验（仅 video 模态支持，且必填 face/body/gait）
+        if dt == DataType.VIDEO:
+            if not video_type:
+                raise ValidationError("视频采集必须指定类型（face/body/gait）")
+            if video_type not in VIDEO_TYPES:
+                raise ValidationError(f"视频类型非法，仅支持 {', '.join(VIDEO_TYPES)}")
+        else:
+            # 非 video 模态忽略 video_type，避免污染 metadata
+            video_type = None
 
         original_name = file_storage.filename or "unnamed"
         # 检测外部加密文件（.enc 后缀）：需先用数据库外部密钥解密，再用内部密钥加密入库
@@ -259,8 +272,8 @@ class AssetService(BaseService):
         original_size = file_storage.stream.tell()
         file_storage.stream.seek(0)  # 重置到开头
 
-        # 幂等检查：同受试者+同模态+同原始文件名+同原始大小，视为重复上传（前端定时扫描场景）
-        # 命名规范会改写存储文件名，所以用原始文件名作为去重 key
+        # 幂等检查：同受试者+同模态+同原始文件名+同原始大小（视频还需 video_type 一致）
+        # 视为重复上传（前端定时扫描场景）。命名规范会改写存储文件名，所以用原始文件名作为去重 key
         existing = DataAsset.query.filter_by(
             subject_id=subject_id,
             data_type=dt,
@@ -268,7 +281,8 @@ class AssetService(BaseService):
         for ex in existing:
             meta = ex.metadata_json or {}
             if (meta.get("original_filename") == original_name
-                    and meta.get("original_size") == original_size):
+                    and meta.get("original_size") == original_size
+                    and meta.get("video_type") == video_type):
                 original_ref = f"（原始: {original_name}）" if original_name != ex.file_name else ""
                 log_operation("upload", "asset", ex.id,
                               f"重复上传跳过（命中既有资产 {ex.file_name}）{original_ref} 到 {subject.pseudo_id}/{data_type}",
@@ -276,11 +290,19 @@ class AssetService(BaseService):
                 self._commit()
                 return ex, True  # (asset, is_duplicate) 命中既有资产
 
+        # 视频重采：删除受试者名下同 video_type 的旧视频资产（不影响其他类型）
+        # 这是新规则：每个受试者可同时存在 face/body/gait 三类视频，重采只替换同类型
+        if dt == DataType.VIDEO and video_type:
+            self._purge_subject_video_by_type(subject_id, video_type, storage_root=None)
+
         # 应用命名规范：查询启用的命名规范并生成规范化文件名
         # 外部加密文件传剥离 .enc 后的文件名，确保扩展名是真实类型（wav 而非 enc）
+        # 视频传 video_type 用于命名区分（face/body/gait）
         naming_input = base_name if is_external_enc else original_name
         naming_std = get_naming_standard(data_type)
-        norm_name, norm_ext = apply_naming_standard(naming_std, subject, data_type, naming_input)
+        norm_name, norm_ext = apply_naming_standard(
+            naming_std, subject, data_type, naming_input, video_type=video_type,
+        )
         # 拼接扩展名（保留原后缀；无后缀时不追加）
         final_ext = norm_ext or ext
         filename = f"{norm_name}.{final_ext}" if final_ext else norm_name
@@ -351,11 +373,13 @@ class AssetService(BaseService):
 
         # 相对存储路径入库（便于跨环境迁移）
         rel_path = f"{layer}/{subject.pseudo_id}/{data_type}/{filename}"
-        # 元数据：记录原始文件名+大小，用于幂等去重
+        # 元数据：记录原始文件名+大小，用于幂等去重；视频记录 video_type
         metadata = {
             "original_filename": original_name,
             "original_size": original_size,
         }
+        if video_type:
+            metadata["video_type"] = video_type
         asset = DataAsset(
             subject_id=subject_id,
             data_type=dt,
@@ -478,6 +502,45 @@ class AssetService(BaseService):
             return None
         from app.models.user import User
         return User.query.get(self.operator_id)
+
+    def _purge_subject_video_by_type(self, subject_id: int, video_type: str,
+                                     storage_root: Optional[str] = None):
+        """删除受试者名下指定 video_type 的视频资产（重采前调用）
+
+        仅删除同类型视频，保留其他类型（face/body/gait 互不影响）。
+        删除顺序：先留档 + 收集关联记录 → DB commit → 删磁盘文件（best-effort）。
+        """
+        from app.services.subject_service import _purge_asset_records, _collect_asset_file_paths
+
+        if storage_root is None:
+            storage_root = current_app.config["DATA_LAKE_DIR"]
+
+        # 仅删除 metadata.video_type == 指定类型 的视频资产
+        # 注意：JSON 字段查询兼容 MySQL/SQLite，这里用 Python 过滤更稳
+        candidates = DataAsset.query.filter_by(
+            subject_id=subject_id,
+            data_type=DataType.VIDEO,
+        ).all()
+        to_delete = [
+            a for a in candidates
+            if (a.metadata_json or {}).get("video_type") == video_type
+        ]
+        if not to_delete:
+            return
+
+        for asset in to_delete:
+            snapshot_delete("data_asset", asset, f"重采替换 {asset.file_name}",
+                            operator=self._operator_user())
+            _purge_asset_records(asset)
+            pending_files = _collect_asset_file_paths(asset, storage_root)
+            self.session.delete(asset)
+            log_operation("delete", "asset", asset.id,
+                          f"重采删除视频 {asset.file_name}（{video_type}）",
+                          operator=self._operator_user())
+            # 提交 DB 后再删磁盘（事务保护，DB 失败则磁盘文件保留可重试）
+            self._commit()
+            _remove_file_safely(pending_files[0])
+            _remove_file_safely(pending_files[1])
 
 
 # ==================== 模块级辅助函数（文件服务相关） ====================

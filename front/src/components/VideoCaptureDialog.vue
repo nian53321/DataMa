@@ -9,14 +9,43 @@
     @open="onOpen"
     @closed="onClosed"
   >
-    <!-- 受试者信息 -->
+    <!-- 受试者信息 + 三类视频采集状态 -->
     <div class="subject-bar">
       <el-tag type="info">受试者</el-tag>
       <span style="margin-left: 8px; font-weight: 600">{{ subject?.pseudo_id || '—' }}</span>
       <span style="margin-left: 12px; color: #909399">{{ subject?.name || '匿名' }}</span>
-      <el-tag v-if="subject?.has_video" type="warning" size="small" style="margin-left: 12px">
-        已有视频，上传后将替换
+      <el-divider direction="vertical" />
+      <span class="video-status-label">视频采集进度：</span>
+      <el-tag
+        v-for="t in VIDEO_TYPE_OPTIONS"
+        :key="t.value"
+        :type="hasVideoType(t.value) ? 'success' : 'info'"
+        size="small"
+        effect="plain"
+        style="margin-right: 6px"
+      >
+        {{ t.label }}：{{ hasVideoType(t.value) ? '已采' : '未采' }}
       </el-tag>
+    </div>
+
+    <!-- 视频类型选择 -->
+    <div class="type-bar">
+      <span class="type-label">采集类型：</span>
+      <el-radio-group v-model="currentVideoType" size="small">
+        <el-radio-button
+          v-for="t in VIDEO_TYPE_OPTIONS"
+          :key="t.value"
+          :label="t.value"
+        >
+          {{ t.label }}
+          <el-tag v-if="hasVideoType(t.value)" type="warning" size="small" style="margin-left: 4px">
+            重采
+          </el-tag>
+        </el-radio-button>
+      </el-radio-group>
+      <span v-if="hasVideoType(currentVideoType)" style="margin-left: 12px; color: #e6a23c; font-size: 12px">
+        当前类型已有视频，上传后将替换
+      </span>
     </div>
 
     <!-- 视频区 -->
@@ -100,7 +129,7 @@
           @click="applyTrim"
         >应用裁剪</el-button>
         <el-button type="primary" :icon="Upload" :loading="uploading" @click="handleUpload">
-          {{ subject?.has_video ? '替换上传' : '上传保存' }}
+          {{ hasVideoType(currentVideoType) ? '替换上传' : '上传保存' }}
         </el-button>
       </template>
 
@@ -187,7 +216,14 @@ import {
   Scissor, Check, Aim,
 } from '@element-plus/icons-vue'
 import { VideoCamera } from '@element-plus/icons-vue'
-import { uploadAssetApi, getAssetsApi, deleteAssetApi } from '@/api/data'
+import { uploadAssetApi } from '@/api/data'
+
+// 视频类型定义（与后端 VIDEO_TYPES 对应）
+const VIDEO_TYPE_OPTIONS = [
+  { value: 'face', label: '面部' },
+  { value: 'body', label: '身体' },
+  { value: 'gait', label: '步态' },
+]
 
 const props = defineProps({
   modelValue: Boolean,
@@ -204,6 +240,15 @@ const fileInputRef = ref(null)       // 文件选择 input
 const canvasRef = ref(null)          // 裁剪用 canvas
 const initMessage = ref('正在请求摄像头权限...')
 const sourceLabel = ref('录制完成')  // 录制完成 / 已选文件 / 裁剪片段
+
+// 当前采集的视频类型：face / body / gait（默认 face）
+const currentVideoType = ref('face')
+
+// 判断指定类型是否已采集（来自父组件传入的 subject.video_types）
+const hasVideoType = (t) => {
+  const vtypes = props.subject?.video_types || []
+  return Array.isArray(vtypes) && vtypes.includes(t)
+}
 
 let mediaRecorder = null
 let chunks = []
@@ -597,28 +642,31 @@ const handleUpload = async () => {
     ElMessage.warning('无录制内容或受试者信息缺失')
     return
   }
+  if (!currentVideoType.value) {
+    ElMessage.warning('请选择采集类型（面部/身体/步态）')
+    return
+  }
   uploading.value = true
   uploadProgress.value = 0
   const ext = (recordedBlob.type && recordedBlob.type.includes('mp4')) ? 'mp4' : 'webm'
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-  const filename = `${props.subject.pseudo_id}_video_${ts}.${ext}`
+  const filename = `${props.subject.pseudo_id}_${currentVideoType.value}_${ts}.${ext}`
 
   try {
-    // 替换模式：先删除受试者名下原有视频资产，避免产生多个视频文件
-    if (props.subject.has_video) {
-      await removeExistingVideoAssets(props.subject.id)
-    }
-
+    // 后端按 video_type 精准重采：自动删除同类型旧视频，不影响其他类型
+    // 前端无需再调用 deleteAssetApi，避免误删其他类型
     const formData = new FormData()
     formData.append('file', recordedBlob, filename)
     formData.append('subject_id', props.subject.id)
     formData.append('data_type', 'video')
     formData.append('layer', 'raw')
+    formData.append('video_type', currentVideoType.value)
 
     await uploadAssetApi(formData, (e) => {
       if (e.total) uploadProgress.value = Math.round((e.loaded / e.total) * 100)
     })
-    ElMessage.success(props.subject.has_video ? '视频已替换上传' : '视频已上传并登记为数据资产')
+    const typeLabel = VIDEO_TYPE_OPTIONS.find(t => t.value === currentVideoType.value)?.label || currentVideoType.value
+    ElMessage.success(`${typeLabel}视频已上传${hasVideoType(currentVideoType.value) ? '（已替换原视频）' : ''}`)
     emit('success')
     emit('update:modelValue', false)
   } catch (e) {
@@ -628,24 +676,8 @@ const handleUpload = async () => {
   }
 }
 
-// 删除受试者原有视频资产（避免多个视频文件）
-const removeExistingVideoAssets = async (subjectId) => {
-  try {
-    const res = await getAssetsApi({
-      subject_id: subjectId,
-      data_type: 'video',
-      page: 1,
-      page_size: 50,
-    })
-    const items = res?.data?.items || res?.items || []
-    for (const it of items) {
-      try { await deleteAssetApi(it.id) } catch {}
-    }
-  } catch {
-    // 查询失败不阻塞上传，但提示
-    ElMessage.warning('原有视频资产查询失败，可能产生多个视频文件，请稍后清理')
-  }
-}
+// 历史函数 removeExistingVideoAssets 已废弃：
+// 新规则下后端按 video_type 精准重采，前端不再主动删除资产，避免误删其他类型
 
 // ==================== 工具函数 ====================
 const getSupportedMime = () => {
@@ -703,10 +735,35 @@ const releaseCamera = () => {
 .subject-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
   margin-bottom: 12px;
   padding: 8px 12px;
   background: #f5f7fa;
   border-radius: 4px;
+}
+
+.video-status-label {
+  color: #606266;
+  font-size: 13px;
+  margin-right: 4px;
+}
+
+.type-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: #fdf6ec;
+  border: 1px solid #faecd8;
+  border-radius: 4px;
+}
+
+.type-label {
+  color: #606266;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .video-stage {

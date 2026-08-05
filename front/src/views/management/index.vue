@@ -160,11 +160,23 @@
         <el-table-column prop="collection_scene" label="场景" width="100" show-overflow-tooltip header-align="center">
           <template #default="{ row }">{{ row.collection_scene || '—' }}</template>
         </el-table-column>
-        <el-table-column label="视频" width="80" align="center" header-align="center">
+        <el-table-column label="视频采集" width="220" align="center" header-align="center">
           <template #default="{ row }">
-            <el-tag :type="row.has_video ? 'success' : 'info'" size="small">
-              {{ row.has_video ? '已采集' : '未采集' }}
-            </el-tag>
+            <div style="display: flex; gap: 4px; justify-content: center; flex-wrap: wrap">
+              <el-tag
+                v-for="t in [
+                  { value: 'face', label: '面' },
+                  { value: 'body', label: '身' },
+                  { value: 'gait', label: '步' },
+                ]"
+                :key="t.value"
+                :type="(row.video_types || []).includes(t.value) ? 'success' : 'info'"
+                size="small"
+                effect="plain"
+              >
+                {{ t.label }}
+              </el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column prop="created_at" label="创建时间" min-width="150" show-overflow-tooltip header-align="center" />
@@ -1134,19 +1146,9 @@ const goVisualization = (row) => {
 // 视频采集
 const videoCaptureDialog = ref(false)
 const videoCaptureSubject = ref(null)
-const openVideoCapture = async (row) => {
-  // 已采集视频时提示是否重采（避免产生多个视频文件）
-  if (row.has_video) {
-    try {
-      await ElMessageBox.confirm(
-        `受试者 ${row.pseudo_id} 已采集视频数据。重新采集将删除原有视频文件，是否继续？`,
-        '重新采集确认',
-        { confirmButtonText: '重新采集', cancelButtonText: '取消', type: 'warning' }
-      )
-    } catch {
-      return  // 用户取消
-    }
-  }
+const openVideoCapture = (row) => {
+  // 新规则：受试者需要 face/body/gait 三类视频，可分别采集或重采
+  // 重采确认由 VideoCaptureDialog 内部按单类型提示，这里无需全量确认
   videoCaptureSubject.value = row
   videoCaptureDialog.value = true
 }

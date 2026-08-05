@@ -74,22 +74,30 @@ class SubjectService(BaseService):
                 ))
         query = query.order_by(Subject.created_at.desc())
         result = paginate(query, page, page_size)
-        # 批量查询每个受试者是否有视频资产（避免 N+1）
+        # 批量查询每个受试者的视频资产，聚合出 video_types（已采集类型列表）+ has_video（向后兼容）
         items = result.get("items", [])
         if items:
             subject_ids = [s["id"] for s in items]
-            has_video_ids = set(
-                db.session.query(DataAsset.subject_id)
+            rows = (
+                db.session.query(
+                    DataAsset.subject_id,
+                    DataAsset.metadata_json,
+                )
                 .filter(
                     DataAsset.subject_id.in_(subject_ids),
                     DataAsset.data_type == DataType.VIDEO,
                 )
-                .distinct()
                 .all()
             )
-            has_video_ids = {row[0] for row in has_video_ids}
+            # subject_id -> set(video_type)
+            video_map = {}
+            for sid, meta in rows:
+                vt = (meta or {}).get("video_type") if isinstance(meta, dict) else None
+                video_map.setdefault(sid, set()).add(vt) if vt else video_map.setdefault(sid, set())
             for s in items:
-                s["has_video"] = s["id"] in has_video_ids
+                vtypes = sorted(video_map.get(s["id"], set()) or [])
+                s["video_types"] = vtypes
+                s["has_video"] = bool(vtypes)
         # 按角色脱敏（admin 不脱敏）
         desensitize_list(items, self.operator_role)
         return result

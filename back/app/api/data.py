@@ -416,11 +416,15 @@ def parse_scale_data():
 def upload_asset():
     """实际上传文件并登记数据资产，按受试者伪ID分目录存储
     存储结构：{DATA_LAKE_DIR}/{layer}/{subject_pseudo_id}/{data_type}/{filename}
+
+    视频可选参数：video_type（face/body/gait），用于受试者视频采集的子类型。
+    重采时会按 video_type 精准替换（不影响其他类型视频）。
     """
     subject_id = request.form.get("subject_id", type=int)
     data_type = request.form.get("data_type")
     layer = request.form.get("layer", "raw")
     sample_rate = request.form.get("sample_rate", type=int)
+    video_type = (request.form.get("video_type") or "").strip() or None
 
     if "file" not in request.files:
         return fail("未检测到上传文件", 422)
@@ -431,6 +435,7 @@ def upload_asset():
     asset, is_duplicate = _svc_asset().upload_asset(
         subject_id=subject_id, data_type=data_type,
         file_storage=file, layer=layer, sample_rate=sample_rate,
+        video_type=video_type,
     )
     if is_duplicate:
         return success(asset.to_dict(), message="文件已存在，跳过重复上传")

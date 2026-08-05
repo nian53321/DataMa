@@ -26,6 +26,16 @@ class DataLayer(enum.Enum):
     ANNOTATION = "annotation"  # 标注数据
 
 
+# 视频子类型（存入 DataAsset.metadata_json['video_type']）
+# 用于受试者视频采集的三类视频：面部/身体/步态
+VIDEO_TYPES = ("face", "body", "gait")
+VIDEO_TYPE_LABELS = {
+    "face": "面部",
+    "body": "身体",
+    "gait": "步态",
+}
+
+
 class DataAsset(db.Model):
     """数据资产：每条多模态数据记录"""
     __tablename__ = "data_assets"
