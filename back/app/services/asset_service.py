@@ -43,6 +43,7 @@ from app.utils.naming import (
 )
 from app.utils.response import paginate
 from werkzeug.utils import secure_filename
+from app.utils.naming import _safe_segment as safe_filename_segment
 
 
 class AssetService(BaseService):
@@ -237,12 +238,12 @@ class AssetService(BaseService):
         except ValueError:
             raise ValidationError("数据类型非法")
 
-        # 视频子类型校验（仅 video 模态支持，且必填 face/body/gait）
+        # 视频子类型校验（仅 video 模态支持 face/body/gait）
+        # video_type 可选：视频采集弹窗传 face/body/gait，扫描上传不传（通用视频）
         if dt == DataType.VIDEO:
-            if not video_type:
-                raise ValidationError("视频采集必须指定类型（face/body/gait）")
-            if video_type not in VIDEO_TYPES:
+            if video_type and video_type not in VIDEO_TYPES:
                 raise ValidationError(f"视频类型非法，仅支持 {', '.join(VIDEO_TYPES)}")
+            # video_type 未传时不报错，作为通用视频上传（扫描场景）
         else:
             # 非 video 模态忽略 video_type，避免污染 metadata
             video_type = None
@@ -306,8 +307,12 @@ class AssetService(BaseService):
         # 拼接扩展名（保留原后缀；无后缀时不追加）
         final_ext = norm_ext or ext
         filename = f"{norm_name}.{final_ext}" if final_ext else norm_name
-        # 去除连续下划线/空段，保证文件名合法
-        filename = secure_filename(filename) or "unnamed"
+        # 安全化文件名：保留中文等 Unicode 字母（_safe_segment），
+        # 不使用 werkzeug.secure_filename（会把中文全部删除）
+        filename = safe_filename_segment(filename) or "unnamed"
+        # 压缩连续下划线为单个（scene/batch 为空时会产生 __）
+        import re as _re
+        filename = _re.sub(r'_+', '_', filename).strip('_') or "unnamed"
 
         storage_root = current_app.config["DATA_LAKE_DIR"]
         # 目录结构：根目录/分层/受试者伪ID/模态类型/文件名

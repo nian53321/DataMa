@@ -211,26 +211,29 @@ export async function runScanFromFiles(allFiles, options = {}) {
     onProgress,
   } = options
 
-  // 3. diff 出新增/变更文件
-  const newFiles = diffFiles(allFiles, uploadedMap)
+  // 3. diff 出新增/变更文件（增量扫描，避免全量重传）
+  const effectiveMap = { ...uploadedMap }
+  const newFiles = diffFiles(allFiles, effectiveMap)
+
   if (!newFiles.length) {
     onProgress?.({ phase: 'done', current: 0, total: 0, currentFile: '' })
-    return { newSubjects: 0, uploadedPaths: [], failures: [], uploadedMap }
+    return { newSubjects: 0, uploadedPaths: [], failures: [], uploadedMap: effectiveMap }
   }
 
   // 4. 按受试者分组（基于新增文件）
-  let groups = groupBySubject(newFiles)
+  const groups = groupBySubject(newFiles)
   if (!groups.length) {
     onProgress?.({ phase: 'done', current: 0, total: 0, currentFile: '' })
-    return { newSubjects: 0, uploadedPaths: [], failures: [], uploadedMap }
+    return { newSubjects: 0, uploadedPaths: [], failures: [], uploadedMap: effectiveMap }
   }
 
+  // 全量文件按受试者分组（用于补回 userInfo 和新建受试者的数据文件）
+  const allGroups = groupBySubject(allFiles)
+  const allGroupMap = new Map(allGroups.map((g) => [g.pseudoId, g]))
+
   // diff 可能过滤掉未变更的 userInfo，从全量文件补回（新建受试者需要）
-  const allUserInfo = new Map(
-    groupBySubject(allFiles).map((g) => [g.pseudoId, g.userInfo])
-  )
   for (const g of groups) {
-    if (!g.userInfo) g.userInfo = allUserInfo.get(g.pseudoId) || null
+    if (!g.userInfo) g.userInfo = allGroupMap.get(g.pseudoId)?.userInfo || null
   }
 
   // 5. 恢复受试者缓存
@@ -239,7 +242,7 @@ export async function runScanFromFiles(allFiles, options = {}) {
   let newSubjects = 0
   const uploadedPaths = []
   const failures = []
-  const updatedMap = { ...uploadedMap }
+  const updatedMap = { ...effectiveMap }
 
   // 计算总文件数用于进度
   const totalFiles = groups.reduce((n, g) => n + g.files.length, 0)
@@ -284,6 +287,18 @@ export async function runScanFromFiles(allFiles, options = {}) {
           reason: '创建失败：' + (e.response?.data?.message || e.message),
         })
         continue // 受试者未建成功，跳过其文件
+      }
+
+      // 新建受试者：uploadedMap 中该受试者的缓存必然过期（受试者刚创建，不可能上传过）
+      // 从全量文件补回该受试者的所有数据文件
+      const allG = allGroupMap.get(g.pseudoId)
+      if (allG && allG.files.length > 0 && g.files.length === 0) {
+        // 清除该受试者的旧缓存记录
+        for (const f of allG.files) {
+          delete updatedMap[f.path]
+        }
+        // 补回数据文件
+        g.files = [...allG.files]
       }
     }
 
