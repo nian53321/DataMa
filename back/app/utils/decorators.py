@@ -13,13 +13,20 @@ logger = logging.getLogger(__name__)
 
 
 def retry_on_deadlock(max_retries=2, delay=0.3):
-    """MySQL 死锁/锁超时自动重试装饰器
+    """MySQL 死锁/锁超时/连接异常自动重试装饰器
 
-    当出现 (1213, 'Deadlock') 或 (1205, 'Lock wait timeout') 时，
-    自动回滚当前 session 并延迟重试，避免前端收到 500 错误。
+    当出现以下情况时，自动回滚当前 session 并延迟重试，避免前端收到 500 错误：
+    - 1213 Deadlock
+    - 1205 Lock wait timeout
+    - 2006 MySQL server has gone away（连接被服务端关闭）
+    - 2013 Lost connection during query（连接丢失）
+    - 2014 Command Out of Sync（连接池状态错乱）
 
     适用于 GET 读取接口（stats、list 等），也适用于写入接口。
     """
+    # 可重试的 MySQL errno：死锁、锁超时、连接异常
+    _RETRYABLE_ERRNO = (1213, 1205, 2006, 2013, 2014)
+
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
@@ -30,15 +37,17 @@ def retry_on_deadlock(max_retries=2, delay=0.3):
                 except OperationalError as e:
                     orig = getattr(e, "orig", None)
                     errno = getattr(orig, "args", [None])[0] if orig else None
-                    # 1213 = deadlock, 1205 = lock wait timeout
-                    if errno in (1213, 1205) and attempt < max_retries:
+                    if errno in _RETRYABLE_ERRNO and attempt < max_retries:
                         logger.warning(
-                            "DB 死锁/锁超时 (errno=%s)，第 %d 次重试 %s",
+                            "DB 异常 (errno=%s)，第 %d 次重试 %s",
                             errno, attempt + 1, fn.__name__
                         )
                         try:
                             from app.extensions import db
                             db.session.rollback()
+                            # 连接异常时 dispose 旧连接，强制下条拿新连接
+                            if errno in (2006, 2013, 2014):
+                                db.engine.dispose()
                         except Exception:
                             pass
                         time.sleep(delay)
