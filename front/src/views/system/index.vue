@@ -2297,7 +2297,7 @@ const handleExport = async () => {
     let downloaded = false
     try {
       const sigRes = await fetchSignedUrlApi({ kind: 'asset_export', task_id: taskId })
-      const signedUrl = sigRes?.data?.data?.url
+      const signedUrl = sigRes?.data?.url
       if (signedUrl) {
         const a = document.createElement('a')
         a.href = signedUrl

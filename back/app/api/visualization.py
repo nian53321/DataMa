@@ -643,18 +643,48 @@ def _is_depth_stream(s):
 
 
 def _read_depth_frames(file_path, stream_index, w, h, step=1, src_pix_fmt=""):
-    """生成器：ffmpeg 提取深度轨帧，yield 每帧 float32 二维数组（无效像素=0）
+    """生成器：提取深度帧，yield 每帧 float32 二维数组（无效像素=0）
 
     step 为取样步长（select 滤镜每 step 帧取 1 帧），第一遍扫描用大步长提速。
 
-    深度轨 pix_fmt 因录制器而异（实测 pyk4a 写 rgb555le，k4arecorder 写 gray16be）：
-    - rgb555le（16bit 小端，bit15=无效标志，低13位为毫米值）：
-      必须按原格式透传（-pix_fmt rgb555le），若输出 gray16be 会被 ffmpeg 当作
-      RGB555 做色彩转换，彻底破坏深度值；
-    - gray16be/gray16le（16bit 值即深度）：统一输出 gray16be（16bit→16bit 仅换字节序，数值不变）。
+    深度数据来源两类：
+    - realsense 新方案：zstd 无损压缩序列（.zst，格式见 realsense_child.py _zstd_writer）：
+      直接解压逐帧 yield，16 位精度原样保留；
+    - 深度轨视频（orbbec mkv 等）：ffmpeg 提取，pix_fmt 因录制器而异：
+      rgb555le（16bit 小端，bit15=无效标志，低13位为毫米值）必须按原格式透传，
+      gray16be/gray16le 统一输出 gray16be（16bit→16bit 仅换字节序，数值不变）。
     """
-    import subprocess
     import numpy as np
+    import struct
+
+    if (file_path or "").lower().endswith(".zst"):
+        try:
+            import zstandard as _zstd
+        except ImportError:
+            return
+        dctx = _zstd.ZstdDecompressor()
+        with open(file_path, "rb") as f:
+            if f.read(4) != b"DZST":
+                return
+            _ver, fw, fh, _count = struct.unpack("<IIII", f.read(16))
+            idx = 0
+            while True:
+                hdr = f.read(4)
+                if not hdr or len(hdr) < 4:
+                    break
+                (clen,) = struct.unpack("<I", hdr)
+                blk = f.read(clen)
+                if len(blk) < clen:
+                    break
+                raw = dctx.decompress(blk, max_output_size=fw * fh * 2)
+                idx += 1
+                if step and idx % step != 0:
+                    continue
+                frame = np.frombuffer(raw, dtype="<u2").reshape(fh, fw).astype(np.float32)
+                yield frame
+        return
+
+    import subprocess
     frame_bytes = w * h * 2
     is_555 = "555" in (src_pix_fmt or "")
     out_fmt = "rgb555le" if is_555 else "gray16be"
@@ -764,11 +794,15 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
 @visualization_bp.route("/depth-video/<int:asset_id>", methods=["GET"])
 @media_auth_required("depth_video", resource_key="asset_id")
 def depth_video(asset_id):
-    """深度视频播放：把 mkv 深度轨转码为伪彩色 MP4，浏览器 <video> 直接播放
+    """深度视频播放：把深度数据转码为伪彩色 MP4，浏览器 <video> 直接播放
 
     鉴权：优先 ?media_token=<短期签名>，兼容 JWT（header / access_token query）。
+    深度数据源两类：
+    - 资产本身是深度轨视频（orbbec mkv 等）：直接探测深度轨转码；
+    - 资产是 realsense 彩色视频（无深度轨）：通过 metadata.realsense.depth_asset_id
+      定位原始深度序列（.zst）再转码，实现"点一下从深度通道转换"。
     首次请求触发转码（耗时较长），结果缓存到临时目录，后续秒开。
-    非深度视频（无深度轨）返回 404。自动处理加密文件解密。
+    自动处理加密文件解密。
     """
     import tempfile
     from flask import send_file
@@ -781,21 +815,60 @@ def depth_video(asset_id):
     if file_path is None:
         return fail("文件不存在于存储目录", 404)
     try:
-        streams = _probe_video_streams(file_path)
-        depth_streams = [s for s in streams if _is_depth_stream(s)]
-        if not depth_streams:
-            return fail("非深度视频（无深度轨）", 404)
-        d = depth_streams[0]
-        try:
-            w, h = int(d["width"]), int(d["height"])
-        except (KeyError, TypeError, ValueError):
-            return fail("深度轨分辨率未知", 422)
-        fps = 30.0
-        try:
-            num, den = d.get("r_frame_rate", "30/1").split("/")
-            fps = float(num) / float(den) if float(den) > 0 else 30.0
-        except Exception:
-            pass
+        src_asset = asset
+        is_zst = (file_path or "").lower().endswith(".zst")
+        depth_streams = []
+        while not is_zst:
+            streams = _probe_video_streams(file_path)
+            depth_streams = [s for s in streams if _is_depth_stream(s)]
+            if depth_streams:
+                break
+            # 无深度轨：realsense 彩色资产通过 metadata 定位原始深度资产
+            ameta = src_asset.metadata_json or {}
+            depth_asset_id = (ameta.get("realsense") or {}).get("depth_asset_id")
+            if not depth_asset_id:
+                return fail("非深度视频（无深度轨）", 404)
+            dasset = DataAsset.query.get(depth_asset_id)
+            if not dasset:
+                return fail("深度资产不存在", 404)
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            src_asset = dasset
+            file_path, tmp_path = _get_asset_file_path(dasset)
+            if file_path is None:
+                return fail("文件不存在于存储目录", 404)
+            is_zst = (file_path or "").lower().endswith(".zst")
+
+        if is_zst:
+            with open(file_path, "rb") as f:
+                if f.read(4) != b"DZST":
+                    return fail("深度数据格式错误", 422)
+                _ver, w, h, _cnt = struct.unpack("<IIII", f.read(16))
+            fps = 30.0
+            rmeta = (src_asset.metadata_json or {}).get("realsense") or {}
+            try:
+                fps = float(rmeta.get("fps") or 30.0) or 30.0
+            except (TypeError, ValueError):
+                pass
+            stream_index = -1
+            src_pix_fmt = "zstd"
+        else:
+            d = depth_streams[0]
+            try:
+                w, h = int(d["width"]), int(d["height"])
+            except (KeyError, TypeError, ValueError):
+                return fail("深度轨分辨率未知", 422)
+            fps = 30.0
+            try:
+                num, den = d.get("r_frame_rate", "30/1").split("/")
+                fps = float(num) / float(den) if float(den) > 0 else 30.0
+            except Exception:
+                pass
+            stream_index = d["index"]
+            src_pix_fmt = d.get("pix_fmt", "")
 
         # 转码结果缓存（按资产 ID），避免每次播放都重新转码
         # v2：修复 rgb555le 深度轨被色彩转换破坏的 bug；
@@ -809,8 +882,8 @@ def depth_video(asset_id):
                 except OSError:
                     pass
         if not (os.path.isfile(cache) and os.path.getsize(cache) > 0):
-            ok = _transcode_depth_video(file_path, d["index"], w, h, fps, cache,
-                                        src_pix_fmt=d.get("pix_fmt", ""))
+            ok = _transcode_depth_video(file_path, stream_index, w, h, fps, cache,
+                                        src_pix_fmt=src_pix_fmt)
             if not ok:
                 try:
                     os.remove(cache)
@@ -818,7 +891,7 @@ def depth_video(asset_id):
                     pass
                 return fail("深度视频转码失败", 500)
         return send_file(cache, mimetype="video/mp4", as_attachment=False,
-                         download_name=f"depth_{asset.file_name}.mp4", conditional=True)
+                         download_name=f"depth_{src_asset.file_name}.mp4", conditional=True)
     finally:
         if tmp_path:
             try:

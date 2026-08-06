@@ -694,7 +694,7 @@ const loadDepthVideo = (assetId) => {
   // 用 5 分钟过期的资源绑定签名 URL 替代长期 JWT 进 URL（避免 token 泄漏）
   fetchSignedUrlApi({ kind: 'depth_video', asset_id: assetId })
     .then((res) => {
-      const url = res?.data?.data?.url
+      const url = res?.data?.url
       if (url && depthVideoState.status === 'loading') depthVideoState.url = url
     })
     .catch(() => {
@@ -765,7 +765,13 @@ const onResetFilters = () => {
 }
 
 // 视频轨/音频轨（支持多路，可切换）
-const videoList = computed(() => tracks.value.filter((t) => t.data_type === 'video'))
+// 视频播放列表：排除原始深度序列资产（.zst，非可播放视频，经 depth-video 端点单独转码）
+const videoList = computed(() => tracks.value.filter((t) => {
+  if (t.data_type !== 'video') return false
+  const m = t.metadata || {}
+  if ((t.file_name || '').toLowerCase().endsWith('.zst') || m.depth_raw) return false
+  return true
+}))
 const audioList = computed(() => tracks.value.filter((t) => t.data_type === 'audio'))
 const currentVideoId = ref(null)
 const currentAudioId = ref(null)
@@ -791,7 +797,7 @@ const refreshMediaSignedUrl = (kind, id) => {
   mediaUrlFetching.add(key)
   fetchSignedUrlApi({ kind, asset_id: id })
     .then((res) => {
-      const url = res?.data?.data?.url
+      const url = res?.data?.url
       if (url) mediaUrlCache[key] = { url, ts: Date.now() }
     })
     .catch(() => {})

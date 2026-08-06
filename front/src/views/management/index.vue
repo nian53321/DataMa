@@ -2582,6 +2582,9 @@ const initBrowserWatch = async () => {
   try {
     await bsStore.init()
     bsStore.setOnScanComplete(_onScanComplete)
+    // 刷新页面后自动恢复监控：权限仍有效则直接恢复扫描（不弹授权框、无需用户点击）；
+    // 仅权限降级（需用户手势授权）时才保留"恢复监控"按钮。
+    await bsStore.autoResumeIfGranted()
   } catch { /* 忽略初始化错误 */ }
 }
 

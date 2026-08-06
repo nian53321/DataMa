@@ -48,7 +48,12 @@
     <!-- 设备源选择：普通摄像头 / Orbbec 深度相机 -->
     <div class="source-bar">
       <span class="type-label">设备源：</span>
-      <el-radio-group v-model="deviceSource" size="small" @change="onDeviceSourceChange">
+      <el-radio-group
+        v-model="deviceSource"
+        size="small"
+        :disabled="phase === 'recording' || phase === 'paused'"
+        @change="onDeviceSourceChange"
+      >
         <el-radio-button label="webcam">普通摄像头</el-radio-button>
         <el-radio-button label="orbbec" :disabled="!orbbecAvailable">
           Orbbec 深度相机
@@ -446,6 +451,8 @@ const sourceLabel = ref('录制完成')  // 录制完成 / 已选文件 / 裁剪
 
 // 设备源：webcam（普通摄像头）/ orbbec（Orbbec 深度相机）
 const deviceSource = ref('webcam')
+// 当前实际生效的设备源：切换成功后才更新；录制中拦截切换时据此回退 radio 状态
+const activeSource = ref('webcam')
 // 普通摄像头设备列表（enumerateDevices 的 videoinput，含深度相机 RGB，仅作普通摄像头使用）
 const cameraDevices = ref([])
 const selectedDeviceId = ref('')
@@ -556,10 +563,17 @@ const onOpen = async () => {
   // 避免串行等待拖慢弹窗打开/页面卡顿
   await Promise.all([checkOrbbecStatus(), checkRealSenseStatus()])
   // 记住上次设备源：上传成功后界面关闭、相机可能仍开着，
-  // 重开时若上次用 Orbbec 且设备可用，自动恢复并直接出画面（无需手动切换）
+  // 重开时若上次用深度相机且设备可用，自动恢复并直接出画面（无需手动切换）
   const lastSource = localStorage.getItem('orbbec_last_source') || 'webcam'
+  if (lastSource === 'realsense' && realSenseAvailable.value) {
+    deviceSource.value = 'realsense'
+    activeSource.value = 'realsense'
+    startRealSenseLive()
+    return
+  }
   if (lastSource === 'orbbec' && orbbecAvailable.value) {
     deviceSource.value = 'orbbec'
+    activeSource.value = 'orbbec'
     if (orbbecBackendPreviewing.value) {
       // 后端相机会话仍开着（上次 stop 被忽略/未执行），直接复用，秒出画面
       orbbecPreviewing.value = true
@@ -568,6 +582,8 @@ const onOpen = async () => {
     }
     return
   }
+  deviceSource.value = 'webcam'
+  activeSource.value = 'webcam'
   await initCamera()
 }
 
@@ -640,41 +656,48 @@ const checkRealSenseStatus = async () => {
   }
 }
 
-// 切换设备源
-const onDeviceSourceChange = (val) => {
-  // 切到 orbbec 时若不可用，回退 webcam
-  if (val === 'orbbec' && !orbbecAvailable.value) {
-    ElMessage.warning('未检测到深度相机，已回退普通摄像头')
-    deviceSource.value = 'webcam'
+// 切换设备源（异步：先确保旧会话完全停止/释放，再启动新会话）
+const onDeviceSourceChange = async (val) => {
+  // 录制中/暂停中禁止切换：录制子进程/媒体录制器仍在运行，中途切走会留下孤儿进程
+  if (phase.value === 'recording' || phase.value === 'paused') {
+    ElMessage.warning('录制进行中，请先停止采集再切换设备源')
+    deviceSource.value = activeSource.value
     return
   }
-  // 切到 realsense 时若不可用，回退 webcam
+  // 切到 orbbec 时若不可用，回退原设备源
+  if (val === 'orbbec' && !orbbecAvailable.value) {
+    ElMessage.warning('未检测到深度相机，已回退')
+    deviceSource.value = activeSource.value
+    return
+  }
+  // 切到 realsense 时若不可用，回退原设备源
   if (val === 'realsense' && !realSenseAvailable.value) {
-    ElMessage.warning('未检测到 RealSense 深度相机，已回退普通摄像头')
-    deviceSource.value = 'webcam'
+    ElMessage.warning('未检测到 RealSense 深度相机，已回退')
+    deviceSource.value = activeSource.value
     return
   }
   // 记住当前设备源，下次打开对话框自动恢复
   localStorage.setItem('orbbec_last_source', val)
   resetState()
   if (val === 'orbbec') {
-    // 深度模式：启动实时预览(MJPEG 流)。切回普通摄像头时停止预览释放设备
-    stopRealSenseLive()
+    // 深度模式：先停 RealSense 会话/普通摄像头，再启动 Orbbec 实时预览
     releaseCamera()
-    startOrbbecLive()
+    await stopRealSenseLive()
+    await startOrbbecLive()
   } else if (val === 'realsense') {
-    // RealSense 模式：与 orbbec 相同，启动实时预览(MJPEG 流)
-    stopOrbbecLive()
+    // RealSense 模式：先停 Orbbec 会话/普通摄像头，再启动 RealSense 实时预览
     releaseCamera()
-    startRealSenseLive()
+    await stopOrbbecLive()
+    await startRealSenseLive()
   } else {
-    stopOrbbecLive()
-    stopRealSenseLive()
+    // 切回普通摄像头：等两个深度相机会话完全释放（后端 USB 释放余量）再延迟初始化
+    await Promise.all([stopOrbbecLive(), stopRealSenseLive()])
     selectedDeviceId.value = ''
     // 记录定时器 id：关闭/卸载时清除，避免组件卸载后摄像头被重新占用
     clearTimeout(switchCameraTimer)
     switchCameraTimer = setTimeout(() => initCamera(), 600)
   }
+  activeSource.value = val
 }
 
 const releaseOrbbec = () => {
@@ -719,7 +742,8 @@ let realSenseLiveRefreshTimer = null
 const refreshMediaSignedUrl = async (kind, payload) => {
   try {
     const res = await fetchSignedUrlApi({ kind, ...payload })
-    return res?.data?.data?.url || ''
+    // 响应拦截器已解包一层：res = {code, message, data}，data 即 {url}
+    return res?.data?.url || ''
   } catch {
     return ''
   }
@@ -868,6 +892,13 @@ const startOrbbecRecord = async () => {
       depth_mode: 'NFOV_UNBINNED',
       fps: 30,
     })
+    // 录制开始后，若前端没有实时预览会话则恢复它：后端 record/start 在会话
+    // 未启动时会自动打开相机会话（如"停止录制后重新采集"场景），前端需同步
+    // 恢复预览状态，否则录制中画面区不显示实时预览（img 依赖 orbbecPreviewing）。
+    // 后端会话已运行，preview/start 返回 already，秒级完成。
+    if (!orbbecPreviewing.value) {
+      await startOrbbecLive()
+    }
     // 计时器
     const startTs = Date.now()
     if (orbbecRecordTimerId) clearInterval(orbbecRecordTimerId)
@@ -1121,8 +1152,11 @@ const startRealSenseRecord = async () => {
     }, 200)
     ElMessage.success('录制已开始')
   } catch (e) {
+    // 录制启动失败（如 USB 未释放/设备占用）：后端预览子进程已停，恢复实时预览
     phase.value = 'idle'
+    realSensePreviewing.value = false
     ElMessage.error(e?.response?.data?.message || '启动录制失败')
+    startRealSenseLive()
   }
 }
 

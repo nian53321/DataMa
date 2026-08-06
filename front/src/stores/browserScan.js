@@ -9,6 +9,7 @@ import { defineStore } from 'pinia'
 import { reactive } from 'vue'
 import {
   supportsFsAccess, pickDirectory, loadHandle, clearHandle, verifyPermission,
+  queryPermission,
 } from '@/utils/dirWatcher'
 import {
   runBrowserScan, loadSubjectCache, loadUploadedMap, saveUploadedMap,
@@ -41,7 +42,7 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
 
   const setOnScanComplete = (fn) => { _onScanComplete = fn }
 
-  /** 初始化：恢复持久化的目录句柄与已上传记录 */
+  /** 初始化：恢复持久化的目录句柄与已上传记录（不自动启动扫描） */
   const init = async () => {
     if (!state.supported) return
     _uploadedMap = loadUploadedMap()
@@ -50,12 +51,28 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
       if (h) {
         state.handle = h
         state.dirName = h.name
-        // 仅在定时器未运行时标记需要恢复（页面刷新后定时器丢失，路由切换不会）
-        if (!state.running && !_watchTimer) {
-          state.pendingRestore = true
-        }
+        // 刷新页面后定时器已丢失。不在此处自动启动扫描——此时组件尚未注册
+        // 扫描完成回调，首次扫描结果无法通知列表刷新；由组件在注册回调后
+        // 调用 autoResumeIfGranted() 恢复。
+        state.pendingRestore = true
       }
     } catch { /* 忽略 */ }
+  }
+
+  /**
+   * 权限仍有效则自动恢复监控（刷新页面后调用，无需用户点击）。
+   * 仅权限降级（prompt/denied，需用户手势授权）时保留 pendingRestore。
+   */
+  const autoResumeIfGranted = async () => {
+    if (!state.handle) return false
+    if (state.running || _watchTimer) {
+      state.pendingRestore = false
+      return true
+    }
+    if ((await queryPermission(state.handle)) !== 'granted') return false
+    await startWatch({ skipVerify: true })
+    state.pendingRestore = false
+    return true
   }
 
   const pickDir = async () => {
@@ -121,11 +138,16 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
 
   const scanOnce = async () => { await _doScan() }
 
-  const startWatch = async () => {
+  const startWatch = async (opts = {}) => {
     // 已有定时器在运行则直接返回，避免重复创建定时器导致扫描并发堆积
     if (_watchTimer) return
     if (!state.handle) throw new Error('请先选择监控目录')
-    if (!(await verifyPermission(state.handle))) throw new Error('未获得目录读取权限')
+    // 自动恢复（刷新页面后权限仍 granted）时直接使用已有授权，不弹授权框
+    if (opts.skipVerify) {
+      if ((await queryPermission(state.handle)) !== 'granted') throw new Error('未获得目录读取权限')
+    } else if (!(await verifyPermission(state.handle))) {
+      throw new Error('未获得目录读取权限')
+    }
     try { await loadSubjectCache() } catch { /* 缓存加载失败不阻断 */ }
     state.running = true
     state.pendingRestore = false
@@ -153,7 +175,7 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
   }
 
   return {
-    state, init, pickDir, clearDir, scanOnce,
+    state, init, autoResumeIfGranted, pickDir, clearDir, scanOnce,
     startWatch, stopWatch, restoreWatch, setOnScanComplete,
   }
 })

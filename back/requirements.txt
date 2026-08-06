@@ -24,3 +24,5 @@ opencv-python-headless
 av
 # Intel RealSense（D455f 等 D400 系）Python SDK：pip wheel 自带动态库，无需系统依赖
 pyrealsense2
+# RealSense 原始深度序列 zstd 无损压缩（realsense_child.py / visualization 深度转码）
+zstandard

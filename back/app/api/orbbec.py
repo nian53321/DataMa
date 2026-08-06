@@ -201,6 +201,10 @@ class _CameraProc:
             os.close(w_fd)
             self._out = os.fdopen(r_fd, "rb", buffering=0)
             self._active = False
+            # 新子进程必然未在录制：复位录制标志，防止旧标志残留导致
+            # record/start 误报"已有录制进行中"
+            self._recording = False
+            self._color_res = None
             return True
         except Exception:
             self._proc = None
@@ -217,6 +221,9 @@ class _CameraProc:
         proc, self._proc = self._proc, None
         out, self._out = self._out, None
         self._active = False
+        # 子进程终止后录制必然停止：复位录制标志，避免"已有录制进行中"
+        # 幽灵状态卡死（子进程被 kill 但标志残留 True，导致无法重新录制）
+        self._recording = False
         if proc is not None and proc.poll() is None:
             try:
                 proc.stdin.write((json.dumps({"cmd": "stop"}) + "\n").encode("utf-8"))
@@ -308,24 +315,29 @@ class _CameraProc:
         usbip 透传下深度传感器 nvram 读取**间歇性失败**（实测有时 2.5s 成功，
         有时无限重试卡死）。失败后 kill 已释放设备，等待数秒让设备复位，
         重新启动子进程重试——多次尝试以提高命中"成功窗口"的概率。
+
+        注意：设备探测必须在重试循环内。录制切换分辨率时刚 stop 释放设备，
+        connected_device_count 会短暂枚举失败（几秒），若探测在循环外则
+        一次失败直接返回"未检测到深度摄像头"，永远不会进入 start 重试。
         """
-        if not _container_rec.available:
-            return None, "未检测到深度摄像头"
         last_err = None
         for attempt in range(3):
-            resp, err, _ = self._send({"cmd": "start", "config": {
-                "color_resolution": color_res,
-                "color_format": "MJPG",
-                "depth_mode": "NFOV_UNBINNED",
-                "fps": 30,
-            }}, timeout=10)
-            if not err:
-                with self._lock:
-                    self._active = True
-                    self._started_at = time.time()
-                    self._color_res = color_res
-                return True, None
-            last_err = err
+            if not _container_rec.available:
+                last_err = "未检测到深度摄像头"
+            else:
+                resp, err, _ = self._send({"cmd": "start", "config": {
+                    "color_resolution": color_res,
+                    "color_format": "MJPG",
+                    "depth_mode": "NFOV_UNBINNED",
+                    "fps": 30,
+                }}, timeout=10)
+                if not err:
+                    with self._lock:
+                        self._active = True
+                        self._started_at = time.time()
+                        self._color_res = color_res
+                    return True, None
+                last_err = err
             if attempt < 2:
                 # 失败后子进程已被 kill、设备已释放；等待数秒让设备复位再重试
                 time.sleep(4)
@@ -371,9 +383,12 @@ class _CameraProc:
 
     def stop_record(self):
         resp, err, _ = self._send({"cmd": "stop_record"}, timeout=15)
+        # 无论 stop_record 指令成功还是子进程业务报错（如文件合并失败），
+        # 录制本身都已结束，必须复位标志——否则残留 True 会导致后续任何
+        # 录制/预览操作误报"已有录制进行中"。传输层失败时 _kill 也已复位。
+        self._recording = False
         if err:
             return None, err
-        self._recording = False
         mkv = resp.get("path")
         if not mkv or not os.path.isfile(mkv) or os.path.getsize(mkv) < 1024 * 1024:
             return None, "录制文件过小或未生成，请重试"
@@ -559,9 +574,9 @@ def record_start():
     """启动录制（容器内 pyk4a 直连）
 
     录制与实时预览共用同一相机会话，相机已打开时无需重启（秒开），
-    未打开则先启动。录制分辨率由请求 color_res 决定（默认 1080P）；
-    若已打开的预览会话分辨率不同（预览默认 720P），会先重启会话切换
-    分辨率后再录制。
+    未打开则先启动。预览与录制统一 1080P 会话，录制时**绝不切换分辨率**
+    ——usbip 透传下 stop+start 切换会触发深度传感器 nvram 读取不稳定，
+    曾导致内核卡死蓝屏。会话已启动时直接复用当前会话录制。
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -571,7 +586,6 @@ def record_start():
             return fail("未检测到深度摄像头（请确认 usbipd 已透传 USB 到容器）", 503)
         if _camera.recording:
             return fail("已有录制进行中", 409)
-        # 录制目标分辨率（前端默认 1080P）；与当前会话不一致时重启切换
         want_res = data.get("color_res", "1080P")
         if not _camera.active:
             # 运行中设备可能重连/重 attach 导致设备号变化，先修复 USB 节点
@@ -583,16 +597,8 @@ def record_start():
             _, err = _camera.start(want_res)
             if err:
                 return fail(err, 409)
-        elif _camera._color_res != want_res:
-            # 预览会话分辨率与录制请求不符：停止会话后按录制分辨率重启。
-            # usbip 透传下 nvram 读取间歇性卡死，1080P 重启可能失败——
-            # 失败时尝试恢复原 720P 预览会话，避免预览流永久断开（录制失败
-            # 不应连带杀掉预览）。
-            _camera.stop(force=True)
-            _, err = _camera.start(want_res)
-            if err:
-                _camera.start("720P")  # 尽力恢复预览会话（失败则等待设备复位）
-                return fail(err, 409)
+        # 会话已存在（预览 1080P 或上次录制残留）：直接录制当前会话，
+        # 不做任何 stop+start 分辨率切换（usbip 透传下该操作极不稳定）。
         # 主进程创建录制目录，子进程写 mkv
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = os.path.join(ORBBEC_REC_DIR, f"orbbec_{ts}")
@@ -612,7 +618,7 @@ def record_start():
                     "format": "mkv",
                     # 录制只保留彩色+深度两种
                     "streams": ["COLOR", "DEPTH"],
-                    "color_resolution": data.get("color_res", "1080P"),
+                    "color_resolution": _camera._color_res or want_res,  # 实际会话分辨率
                     "depth_mode": data.get("depth_mode", "NFOV_UNBINNED"),
                     "fps": int(data.get("fps", 30)),
                     "device_serial": _container_rec.serial,
@@ -640,6 +646,12 @@ def record_stop():
             return fail("当前没有进行中的录制", 409)
         mkv_path, err = _camera.stop_record()
         if err:
+            # 录制已停止（stop_record 已复位 _recording 标志），仅后处理失败
+            # （如录制文件合并失败）。此时若复用预览会话，相机仍运行——
+            # 保留会话让实时预览继续可用，不 force stop（避免误杀预览流）。
+            # 标记 end_time，前端可据此识别"录制已结束但文件异常"。
+            with _rec_state_lock:
+                _rec_state["meta"]["end_time"] = datetime.now().isoformat(timespec="seconds")
             return fail(err, 409)
         # 录制结束自动关闭相机：usbip 透传场景相机长期占用会拖累后续
         # 重连/重 attach，录制完成即干净释放（SDK stop，非 kill 子进程）。
@@ -678,9 +690,9 @@ def preview_start():
     """启动容器内实时预览（相机会话；与录制共用同一会话，录制中画面不断流）
 
     k4a.start() 在子进程内执行，卡死时主进程超时 kill 子进程并返回错误，
-    不会冻结整个后端。
+    不会冻结整个后端。会话固定 1080P（与录制一致），杜绝录制时切换分辨率。
     """
-    ok, err = _camera.start()
+    ok, err = _camera.start("1080P")
     if err:
         return fail(err, 409)
     return success({"stream": "/api/orbbec/preview/stream"}, message="实时预览已启动")
@@ -712,16 +724,15 @@ def preview_stream():
         last_seq = -1
         last_ts = 0.0
         empty_streak = 0  # 连续无帧计数（容忍相机启动首帧延迟与录制瞬态）
-        session_closed_since = None  # 会话重启窗口起始（录制切换分辨率时 stop+start）
+        session_closed_since = None  # 会话短暂关闭窗口起始（兜底：SDK 层异常重启时保持连接）
         while True:
             now = time.time()
             if not _camera.active:
-                # 相机会话可能正在重启：录制请求 1080P 而预览会话为 720P 时，
-                # record/start 会先 stop 再 start 切换分辨率（耗时数秒）。此期间
-                # 保持流连接等待恢复，画面短暂冻结后自动续播，避免 <img> 断流
-                # 冻结在最后一帧（浏览器不会自动重连）。
+                # 预览/录制统一 1080P 会话，正常流程不会再 stop+start 切换；
+                # 此处仅兜底 SDK 层偶发异常导致的会话短暂关闭——保持流连接
+                # 等待恢复（30s 上限），避免 <img> 断流冻结在最后一帧。
                 # 客户端主动停止/关闭弹窗时生成器会被关闭（GeneratorExit），
-                # 此处超时退出仅作兜底。
+                # 超时退出仅作兜底。
                 if session_closed_since is None:
                     session_closed_since = now
                 elif now - session_closed_since > 30:
@@ -729,8 +740,8 @@ def preview_stream():
                 time.sleep(0.2)
                 continue
             if session_closed_since is not None:
-                # 会话已恢复：可能已切换分辨率（如 720P→1080P），新会话 seq 从
-                # 0 重新计数，重置序号避免 seq 回绕导致误判无新帧/跳帧。
+                # 会话已恢复：新会话 seq 可能从 0 重新计数，重置序号避免
+                # seq 回绕导致误判无新帧/跳帧。
                 session_closed_since = None
                 last_seq = -1
                 last_ts = 0.0

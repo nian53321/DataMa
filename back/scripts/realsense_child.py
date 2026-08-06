@@ -204,6 +204,8 @@ def cmd_stream(fps):
                 pass
 
         threading.Thread(target=_watch_stdin, daemon=True).start()
+        # 就绪行：父进程据此确认 pipeline 已成功启动（stdin "stop" 即优雅退出）
+        _safe_print(f"READY {actual_fps}")
         try:
             while not stop_event.is_set():
                 frames = pipe.wait_for_frames()
@@ -258,35 +260,53 @@ def _enc_writer(q, proc):
             pass
 
 
-# 深度伪彩色归一化范围（单位 mm，D455f 有效量程；0=无效像素置深灰）
-_DEPTH_MIN, _DEPTH_MAX = 200, 8000
-
-
-def _depth_colorize(depth, w, h):
-    """z16 深度帧 -> jet 伪彩色 BGR 帧（0 无效像素置深灰）"""
-    import numpy as np
-    import cv2
-    d = np.asanyarray(depth.get_data()).reshape(h, w).astype(np.float32)
-    norm = np.zeros((h, w), dtype=np.uint8)
-    mask = d > 0
-    norm[mask] = np.clip((d[mask] - _DEPTH_MIN) / (_DEPTH_MAX - _DEPTH_MIN) * 255, 0, 255).astype(np.uint8)
-    color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-    color[~mask] = (16, 16, 16)
-    return color
+# zstd 深度序列文件格式（绝对无损，压缩率远高于 ffv1）：
+#   magic "DZST" | version u32le | width u32le | height u32le | frame_count u32le
+#   然后逐帧: [compressed_len u32le][zstd block]
+def _zstd_writer(q, fobj, w, h):
+    """写线程：从队列取 z16 深度帧字节，zstd 压缩追加写入；None 哨兵后回填帧数并关闭"""
+    import struct
+    try:
+        import zstandard as _zstd
+    except ImportError:
+        import sys
+        sys.stderr.write("zstandard 未安装，无法写入深度序列\n")
+        sys.stderr.flush()
+        fobj.close()
+        return
+    try:
+        cctx = _zstd.ZstdCompressor(level=3)
+        fobj.write(b"DZST")
+        fobj.write(struct.pack("<IIII", 1, w, h, 0))
+        count = 0
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            comp = cctx.compress(item)
+            fobj.write(struct.pack("<I", len(comp)))
+            fobj.write(comp)
+            count += 1
+        fobj.seek(16)
+        fobj.write(struct.pack("<I", count))
+        fobj.flush()
+    finally:
+        fobj.close()
 
 
 def cmd_record(path, fps):
-    """录制彩色 H.264 MP4 + 深度伪彩色 H.264 MP4 + 原始深度 ffv1 无损 MKV + 元数据
+    """录制彩色 H.264 MP4 + 原始深度 zstd 无损压缩序列 + 元数据
 
     产物（输出目录保留，不打包；全部为最终格式，无需二次转码）：
       <path>/color.mp4      彩色视频（H.264，libx264 CRF 18，浏览器可播）
-      <path>/depth.mp4      深度伪彩色视频（H.264，CRF 23，jet 色标，0=深灰无效）
-      <path>/depth_raw.mkv  原始深度序列（ffv1 无损，z16 16 位精度完整保留，供分析）
+      <path>/depth_raw.zst  原始深度序列（zstd 无损压缩，z16 16 位精度完整保留，供分析）
       <path>/meta.json      序列号 / 配置 / 每帧时间戳 / 编码信息
+    深度伪彩色不再录制：可视化播放时由后端从原始深度实时转码（depth-video 端点）。
     输出 "DONE <out_dir> <frames>" 或 "ERR <原因>" 到 stdout。
     """
     import json
     import queue
+    import struct
     import time as _time
 
     try:
@@ -333,13 +353,10 @@ def cmd_record(path, fps):
         os.makedirs(out_dir, exist_ok=True)
 
         color_mp4 = os.path.join(out_dir, "color.mp4")
-        depth_mp4 = os.path.join(out_dir, "depth.mp4")
-        depth_mkv = os.path.join(out_dir, "depth_raw.mkv")
+        depth_zst = os.path.join(out_dir, "depth_raw.zst")
 
-        # 启动三个 ffmpeg 编码器（各单输入单管道，规避多输入 pipe 消费慢导致掉帧）：
-        # 1) 彩色 bgr24 -> libx264（一次有损，直接 H.264 浏览器可播，替代旧 MJPG 写盘+二次转码）
-        # 2) 深度伪彩色 bgr24 -> libx264（浏览器预览用）
-        # 3) 深度原始 gray16le -> ffv1 无损（z16 16 位精度完整保留）
+        # 编码器：仅彩色 bgr24 -> libx264（一次有损，直接 H.264 浏览器可播）
+        # 深度原始帧不走 ffmpeg，由 zstd 写线程直接压缩，省掉 ffv1 EOF flush 卡顿
         logf = None
         try:
             logf = open(os.path.join(out_dir, "ffmpeg.log"), "ab")
@@ -353,17 +370,6 @@ def cmd_record(path, fps):
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "15",
                 "-movflags", "+faststart", "-an", color_mp4], logf))
-            encs.append(_spawn_ffmpeg([
-                "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{dw}x{dh}",
-                "-r", str(actual_fps), "-i", "pipe:0",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "15",
-                "-movflags", "+faststart", "-an", depth_mp4], logf))
-            encs.append(_spawn_ffmpeg([
-                "-f", "rawvideo", "-pix_fmt", "gray16le", "-s", f"{dw}x{dh}",
-                "-r", str(actual_fps), "-i", "pipe:0",
-                "-c:v", "ffv1", "-threads", "0", "-an",
-                "-f", "matroska", depth_mkv], logf))
         except Exception as e:
             for p in encs:
                 try:
@@ -378,12 +384,16 @@ def cmd_record(path, fps):
             _safe_print(f"ERR 启动编码器失败: {e}")
             return 1
 
-        # 每个编码器独立队列+写线程（顺序写多 pipe 会因管道缓冲互等死锁）
-        qs = [queue.Queue(maxsize=30) for _ in encs]
-        writers = [threading.Thread(target=_enc_writer, args=(q, p), daemon=True)
-                   for q, p in zip(qs, encs)]
-        for t in writers:
-            t.start()
+        color_q = queue.Queue(maxsize=30)
+        color_writer = threading.Thread(
+            target=_enc_writer, args=(color_q, encs[0]), daemon=True)
+        color_writer.start()
+
+        depth_q = queue.Queue(maxsize=30)
+        depth_fobj = open(depth_zst, "wb")
+        depth_writer = threading.Thread(
+            target=_zstd_writer, args=(depth_q, depth_fobj, dw, dh), daemon=True)
+        depth_writer.start()
 
         frame_idx = 0
         meta = {
@@ -398,23 +408,23 @@ def cmd_record(path, fps):
             "start_time": datetime.now().isoformat(timespec="seconds"),
             "frames": [],
         }
+        # 就绪行：所有编码器/写线程就绪后才输出，父进程据此确认录制已可用
+        _safe_print(f"READY {actual_fps}")
         try:
             while not stop_event.is_set():
                 frames = pipe.wait_for_frames()
                 ts = _time.time()
                 color = frames.get_color_frame()
                 depth = frames.get_depth_frame()
-                items = [None, None, None]
+                items = [None, None]
                 if color is not None:
                     items[0] = color.get_data().tobytes()
                 if depth is not None:
-                    dw_, dh_ = depth.get_width(), depth.get_height()
-                    items[1] = _depth_colorize(depth, dw_, dh_).tobytes()
-                    items[2] = depth.get_data().tobytes()
-                for q, item in zip(qs, items):
+                    items[1] = depth.get_data().tobytes()
+                for q, item in zip((color_q, depth_q), items):
                     if item is None:
                         continue
-                    # 带超时入队：队列满表示编码背压（限速）；收到停止信号时丢弃该帧
+                    # 带超时入队：队列满表示编码/压缩背压（限速）；收到停止信号时丢弃该帧
                     while True:
                         try:
                             q.put(item, timeout=0.5)
@@ -431,13 +441,13 @@ def cmd_record(path, fps):
                 pass
             stop_event.set()
             # 哨兵 → 写线程关闭 stdin → ffmpeg 读到 EOF 正常 flush 收尾
-            for q in qs:
+            for q in (color_q, depth_q):
                 try:
                     q.put(None)
                 except Exception:
                     pass
-            for t in writers:
-                t.join(timeout=60)
+            color_writer.join(timeout=60)
+            depth_writer.join(timeout=120)
             for p in encs:
                 try:
                     p.wait(timeout=60)
@@ -459,18 +469,16 @@ def cmd_record(path, fps):
             return 1
 
         color_ok = os.path.isfile(color_mp4) and os.path.getsize(color_mp4) > 0
-        depth_ok = os.path.isfile(depth_mp4) and os.path.getsize(depth_mp4) > 0
-        raw_ok = os.path.isfile(depth_mkv) and os.path.getsize(depth_mkv) > 0
+        raw_ok = os.path.isfile(depth_zst) and os.path.getsize(depth_zst) > 16
         if not color_ok:
             _safe_print("ERR 彩色视频编码失败（详见 ffmpeg.log）")
             return 1
 
         meta["end_time"] = datetime.now().isoformat(timespec="seconds")
         meta["frame_count"] = frame_idx
-        meta["depth_video"] = bool(depth_ok)
         meta["depth_raw"] = bool(raw_ok)
         meta["color_codec"] = "h264"
-        meta["depth_codec"] = "ffv1"
+        meta["depth_codec"] = "zstd"
         try:
             with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)

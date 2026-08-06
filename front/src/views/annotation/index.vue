@@ -747,7 +747,7 @@ watch(assetInfo, (asset) => {
   if (!asset?.id) return
   fetchSignedUrlApi({ kind: 'asset_play', asset_id: asset.id })
     .then((res) => {
-      const url = res?.data?.data?.url
+      const url = res?.data?.url
       if (url && assetInfo.value?.id === asset.id) playSignedUrl.value = url
     })
     .catch(() => {})

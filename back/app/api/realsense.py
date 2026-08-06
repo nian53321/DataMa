@@ -51,6 +51,9 @@ REALSENSE_REC_DIR = "/app/realsense_recordings"
 _BACK_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CHILD_SCRIPT = os.path.join(_BACK_DIR, "scripts", "realsense_child.py")
 DEFAULT_FPS = 30
+# 子进程退出后 USB 设备释放余量（秒）：pyrealsense2 子进程退出后立即重启
+# 新进程（预览↔录制切换）可能因设备未完全释放导致 pipe.start() 失败/卡住
+USB_RELEASE_DELAY = 2.0
 
 
 def _run_child(args, timeout=30, **kw):
@@ -93,6 +96,67 @@ _proc_lock = threading.Lock()
 _stream_proc = None   # 预览子进程（stdin 写 stop 优雅退出）
 _rec_proc = None      # 录制子进程
 
+# USB 释放跟踪：记录最近一次子进程停止时刻，启动新进程前等待设备完全释放
+_last_stop_ts = 0.0
+_stop_ts_lock = threading.Lock()
+
+
+def _mark_stopped():
+    """记录一次子进程停止时刻（进程退出即释放 USB，供下次启动前等待）"""
+    global _last_stop_ts
+    with _stop_ts_lock:
+        _last_stop_ts = time.time()
+
+
+def _wait_usb_free():
+    """启动新子进程前等待 USB 设备释放完成，避免跨进程重开相机失败/卡住"""
+    with _stop_ts_lock:
+        last = _last_stop_ts
+    remain = USB_RELEASE_DELAY - (time.time() - last)
+    if remain > 0:
+        time.sleep(remain)
+
+
+def _wait_child_ready(proc, timeout=20):
+    """等待子进程输出就绪行（READY 成功 / ERR 失败），并消费该行。
+
+    返回 (ok, message)。超时未就绪则杀掉进程并报错，避免残留进程
+    或未消费的输出污染后续 MJPEG 流。
+    """
+    import queue
+    ready_q = queue.Queue(maxsize=1)
+
+    def _reader():
+        try:
+            for raw in proc.stdout:
+                text = raw.decode("utf-8", "replace").strip()
+                if text.startswith(("READY", "ERR ")):
+                    try:
+                        ready_q.put_nowait(text)
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        text = ready_q.get(timeout=timeout)
+    except queue.Empty:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            # 等待进程真正退出，避免孤儿进程继续占用 USB 导致后续启动失败
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        return False, "RealSense 相机启动超时"
+    if text.startswith("READY"):
+        return True, ""
+    return False, text[4:]
+
 # 录制状态（前端轮询 /record/status）
 _rec_state = {
     "dir": None,
@@ -123,6 +187,7 @@ def _start_proc(args, rec=False):
 def _stop_proc(proc, wait=30):
     """向子进程 stdin 写 stop 并等待退出，返回 (returncode, stdout_text)"""
     if proc is None or proc.poll() is not None:
+        _mark_stopped()
         return proc.returncode if proc else 0, ""
     try:
         if proc.stdin:
@@ -135,6 +200,7 @@ def _stop_proc(proc, wait=30):
     except subprocess.TimeoutExpired:
         proc.kill()
         out, _ = proc.communicate(timeout=10)
+    _mark_stopped()
     return proc.returncode, (out or b"").decode("utf-8", "replace")
 
 
@@ -187,10 +253,17 @@ def preview_start():
             return success({"stream": "/api/realsense/preview/stream"}, message="实时预览已启动")
         if _rec_proc is not None and _rec_proc.poll() is None:
             return fail("录制进行中，不能启动实时预览", 409)
+    _wait_usb_free()
     count, _serial, _detail = _probe()
     if count == 0:
         return fail("未检测到 RealSense 相机", 409)
-    _start_proc(["stream", str(DEFAULT_FPS)])
+    proc = _start_proc(["stream", str(DEFAULT_FPS)])
+    ok, msg = _wait_child_ready(proc, timeout=15)
+    if not ok:
+        with _proc_lock:
+            if _stream_proc is proc:
+                _stream_proc = None
+        return fail(msg, 409)
     return success({"stream": "/api/realsense/preview/stream"}, message="实时预览已启动")
 
 
@@ -239,7 +312,7 @@ def preview_stream():
 @jwt_required()
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def record_start():
-    """启动录制（子进程 record，彩色 MP4 + 深度 PNG）"""
+    """启动录制（子进程 record，彩色 MP4 + 深度 zstd 序列）"""
     global _rec_proc
     data = request.get_json(silent=True) or {}
     with _proc_lock:
@@ -249,6 +322,8 @@ def record_start():
             # 录制与预览互斥：先停预览
             _stop_proc(_stream_proc, wait=10)
             _stream_proc = None
+    # 预览子进程刚退出，等待 USB 释放后再探测/启动录制，避免 pipe.start() 失败
+    _wait_usb_free()
     count, serial, _detail = _probe()
     if count == 0:
         return fail("未检测到 RealSense 相机", 409)
@@ -256,7 +331,13 @@ def record_start():
     out_dir = os.path.join(REALSENSE_REC_DIR, f"realsense_{ts}")
     os.makedirs(out_dir, exist_ok=True)
     fps = int(data.get("fps", DEFAULT_FPS))
-    _start_proc(["record", out_dir, str(fps)], rec=True)
+    proc = _start_proc(["record", out_dir, str(fps)], rec=True)
+    ok, msg = _wait_child_ready(proc, timeout=20)
+    if not ok:
+        with _proc_lock:
+            if _rec_proc is proc:
+                _rec_proc = None
+        return fail(f"录制启动失败：{msg}", 409)
     with _rec_state_lock:
         _rec_state.update({
             "dir": out_dir,
@@ -287,8 +368,9 @@ def record_stop():
         _rec_proc = None
     if proc is None or proc.poll() is not None:
         return fail("没有进行中的录制", 409)
-    # wait 放宽到 300s：子进程停止后需等 ffmpeg 编码器 EOF flush 收尾（含 ffv1 无损深度）
-    rc, out = _stop_proc(proc, wait=300)
+    # 深度 zstd 序列不走 ffmpeg，停止时仅需等彩色 libx264 EOF flush（秒级）；
+    # 30s 上限兜底 USB 掉线等异常，避免 communicate 长时间阻塞请求线程
+    rc, out = _stop_proc(proc, wait=30)
     ok, result, frames = _parse_done(out)
     if not ok or rc != 0:
         with _rec_state_lock:
@@ -342,7 +424,7 @@ def preview():
 @jwt_required()
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def upload_recorded():
-    """将已录制的 color.mp4 入库为数据资产，深度伪彩色视频一并入库
+    """将已录制的 color.mp4 与原始深度序列一并入库
 
     请求体 JSON：
       dir: str          录制输出目录（来自 /record/stop 返回的 path）
@@ -369,7 +451,6 @@ def upload_recorded():
         return fail(f"录制文件不存在：{color_mp4}", 404)
 
     from werkzeug.datastructures import FileStorage
-    depth_mp4 = os.path.join(out_dir, "depth.mp4")
     asset = None
     try:
         with open(color_mp4, "rb") as f:
@@ -389,15 +470,14 @@ def upload_recorded():
                 video_type=video_type,
             )
         color_asset = asset
-        # 深度伪彩色视频一并入库（不传 video_type，避免被视频重采逻辑删除）：
-        # 先清理受试者名下旧的深度视频资产（metadata.depth=true），再上传新的
-        if os.path.isfile(depth_mp4):
-            _replace_depth_asset(svc, subject_id, depth_mp4)
-        # 原始深度序列（ffv1 无损 mkv）一并入库（metadata.depth_raw=true）
-        depth_raw_mkv = os.path.join(out_dir, "depth_raw.mkv")
-        if os.path.isfile(depth_raw_mkv):
-            _upload_raw_depth(svc, subject_id, depth_raw_mkv)
-        # 深度序列信息合并到彩色资产 metadata（depth 视频是否存在、序列号等）
+        # 原始深度序列（zstd 无损压缩）一并入库（metadata.depth_raw=true），
+        # 同时把深度资产 id 记到彩色资产 metadata，供可视化从深度通道转伪彩色时定位
+        depth_raw_zst = os.path.join(out_dir, "depth_raw.zst")
+        depth_asset_id = None
+        if os.path.isfile(depth_raw_zst):
+            depth_asset = _upload_raw_depth(svc, subject_id, depth_raw_zst)
+            depth_asset_id = depth_asset.id if depth_asset else None
+        # 深度序列信息合并到彩色资产 metadata
         meta_path = os.path.join(out_dir, "meta.json")
         extra_meta = {}
         if os.path.isfile(meta_path):
@@ -407,8 +487,8 @@ def upload_recorded():
                     child_meta = _json.load(f)
                 extra_meta = {
                     "depth_frames": child_meta.get("frame_count", 0),
-                    "depth_video": bool(child_meta.get("depth_video")),
                     "depth_raw": bool(child_meta.get("depth_raw")),
+                    "depth_codec": child_meta.get("depth_codec", "zstd"),
                     "device_serial": child_meta.get("device_serial", ""),
                     "device_name": child_meta.get("device_name", ""),
                     "firmware_version": child_meta.get("firmware_version", ""),
@@ -419,6 +499,8 @@ def upload_recorded():
                     "start_time": child_meta.get("start_time", ""),
                     "end_time": child_meta.get("end_time", ""),
                 }
+                if depth_asset_id:
+                    extra_meta["depth_asset_id"] = depth_asset_id
             except Exception:
                 pass
         if extra_meta:
@@ -430,7 +512,7 @@ def upload_recorded():
         logger.exception("RealSense 录制入库失败")
         return fail("入库失败，请稍后重试", 500)
 
-    # 入库后删除录制目录（数据湖已存副本；color.mp4/depth.mp4 已被 AssetService 复制/加密落盘）
+    # 入库后删除录制目录（数据湖已存副本；color.mp4/depth_raw.zst 已被 AssetService 复制/加密落盘）
     import shutil
     try:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -440,58 +522,10 @@ def upload_recorded():
     return success(asset.to_dict(), message="已入库", code=201)
 
 
-def _replace_depth_asset(svc, subject_id, depth_mp4):
-    """上传/替换受试者的深度伪彩色视频资产（metadata.depth=true）
+def _upload_raw_depth(svc, subject_id, zst_path):
+    """上传/替换受试者的原始深度序列资产（zstd 无损压缩，metadata.depth_raw=true）
 
-    返回新资产；深度文件缺失/入库失败返回 None。
-    不传 video_type，避免与彩色视频的重采逻辑（_purge_subject_video_by_type）互相删除。
-    """
-    from app.models import DataAsset as _DA
-    from app.models import DataType as _DT
-    from werkzeug.datastructures import FileStorage
-
-    # 清理旧的深度资产（先删关联记录与磁盘文件，再删 DB 行）
-    old = _DA.query.filter_by(subject_id=subject_id, data_type=_DT.VIDEO).all()
-    for a in old:
-        if (a.metadata_json or {}).get("depth"):
-            from app.services.subject_service import (
-                _purge_asset_records, _collect_asset_file_paths,
-            )
-            from app.utils.audit import snapshot_delete
-            storage_root = current_app.config["DATA_LAKE_DIR"]
-            snapshot_delete("data_asset", a, f"深度视频重采替换 {a.file_name}",
-                            operator=svc._operator_user())
-            _purge_asset_records(a)
-            for fp in _collect_asset_file_paths(a, storage_root):
-                try:
-                    os.remove(fp)
-                except OSError:
-                    pass
-            db.session.delete(a)
-    db.session.commit()
-
-    if not os.path.isfile(depth_mp4):
-        return None
-    with open(depth_mp4, "rb") as f:
-        fs = FileStorage(stream=f, filename="depth.mp4", content_type="video/mp4")
-        asset, _is_dup = svc.upload_asset(
-            subject_id=subject_id,
-            data_type="video",
-            file_storage=fs,
-            layer="raw",
-            video_type=None,  # 通用视频，不参与 face/body/gait 重采
-        )
-    dmeta = asset.metadata_json or {}
-    dmeta.update({"depth": True})
-    asset.metadata_json = dmeta
-    db.session.commit()
-    return asset
-
-
-def _upload_raw_depth(svc, subject_id, mkv_path):
-    """上传/替换受试者的原始深度序列资产（ffv1 无损 mkv，metadata.depth_raw=true）
-
-    与深度伪彩色资产（depth=true）分开管理，避免被深度视频预览/转码逻辑误用。
+    独立于彩色视频资产管理，避免被视频重采逻辑（video_type）误删。
     返回新资产；文件缺失/入库失败返回 None。
     """
     from app.models import DataAsset as _DA
@@ -518,11 +552,11 @@ def _upload_raw_depth(svc, subject_id, mkv_path):
             db.session.delete(a)
     db.session.commit()
 
-    if not os.path.isfile(mkv_path):
+    if not os.path.isfile(zst_path):
         return None
-    with open(mkv_path, "rb") as f:
-        fs = FileStorage(stream=f, filename="depth_raw.mkv",
-                         content_type="video/x-matroska")
+    with open(zst_path, "rb") as f:
+        fs = FileStorage(stream=f, filename="depth_raw.zst",
+                         content_type="application/octet-stream")
         asset, _is_dup = svc.upload_asset(
             subject_id=subject_id,
             data_type="video",

@@ -96,6 +96,20 @@ export async function verifyPermission(handle, write = false) {
   return false
 }
 
+/**
+ * 仅查询目录读取权限状态，不弹出授权框（不需要用户手势）
+ * @returns 'granted' | 'prompt' | 'denied'
+ */
+export async function queryPermission(handle, write = false) {
+  if (!handle) return 'denied'
+  const opts = { mode: write ? 'readwrite' : 'read' }
+  try {
+    return await handle.queryPermission(opts)
+  } catch {
+    return 'denied'
+  }
+}
+
 /** 弹出目录选择器并持久化句柄 */
 export async function pickDirectory() {
   if (!supportsFsAccess()) {
