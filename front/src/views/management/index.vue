@@ -1428,6 +1428,8 @@ const batchUploadProgress = reactive({
 const subjectFolderInputRef = ref(null)
 // 检测浏览器是否支持 webkitdirectory
 const supportsFolderSelect = ref(typeof document !== 'undefined' && 'webkitdirectory' in document.createElement('input'))
+// 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 512MB 一致）
+const MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
 // 按后缀识别模态类型
 const detectDataType = (ext, fileName = '') => {
@@ -1791,6 +1793,10 @@ const handleSubjectFileChange = (file) => {
     ElMessage.warning(`文件 ${file.name} 无法识别类型，已跳过`)
     return
   }
+  if (file.raw?.size > MAX_UPLOAD_BYTES) {
+    ElMessage.warning(`文件 ${file.name} 超过 512MB 上限，已跳过`)
+    return
+  }
   subjectFileList.value.push({
     file: file.raw,
     file_name: file.name,
@@ -1806,6 +1812,7 @@ const handleSubjectFolderChange = async (e) => {
   const recognized = []
   let userInfoFile = null
   let skippedMetaCount = 0
+  let oversizedCount = 0
   // 从 webkitRelativePath 提取文件夹名作为伪ID（优先级最高）
   let folderName = ''
   if (files.length && files[0].webkitRelativePath) {
@@ -1825,6 +1832,10 @@ const handleSubjectFolderChange = async (e) => {
     // 跳过眼动评估字段说明文件（仅供查阅，不导入）
     if (nameLower.endsWith('_sync_fields_zh.json')) {
       skippedMetaCount++
+      return
+    }
+    if (f.size > MAX_UPLOAD_BYTES) {
+      oversizedCount++
       return
     }
     // 检测 userInfo 文件（明文或外部加密），单独提取用于解析元数据
@@ -1881,15 +1892,16 @@ const handleSubjectFolderChange = async (e) => {
     }
   }
 
+  const oversizeNote = oversizedCount ? `，跳过 ${oversizedCount} 个超过 512MB 的文件` : ''
   if (unrecognized.length) {
     const sample = unrecognized.slice(0, 3).map((u) => `${u.name}（.${u.ext}）`).join('、')
     const metaNote = skippedMetaCount ? `，跳过 ${skippedMetaCount} 个元数据/密钥文件` : ''
     const userInfoNote = userInfoFile ? '，已读取 userInfo' : ''
-    ElMessage.warning(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别将被导入${userInfoNote}${metaNote}；${unrecognized.length} 个无法识别类型：${sample}${unrecognized.length > 3 ? ' 等' : ''}`)
+    ElMessage.warning(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别将被导入${userInfoNote}${metaNote}${oversizeNote}；${unrecognized.length} 个无法识别类型：${sample}${unrecognized.length > 3 ? ' 等' : ''}`)
   } else if (files.length > recognized.length + skippedMetaCount + (userInfoFile ? 1 : 0)) {
-    ElMessage.info(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别类型将被导入`)
+    ElMessage.info(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别类型将被导入${oversizeNote}`)
   } else if (userInfoFile) {
-    ElMessage.success(`已选 ${files.length} 个文件，${recognized.length} 个数据文件将被导入，已自动读取 userInfo 填充表单`)
+    ElMessage.success(`已选 ${files.length} 个文件，${recognized.length} 个数据文件将被导入，已自动读取 userInfo 填充表单${oversizeNote}`)
   }
 }
 
@@ -2018,6 +2030,10 @@ const openAccessDialog = () => {
 }
 
 const handleFileChange = (file) => {
+  if (file.raw?.size > MAX_UPLOAD_BYTES) {
+    ElMessage.warning('文件超过 512MB 上限，请选择较小的文件')
+    return
+  }
   uploadedFile.value = file
   if (!assetForm.file_name) assetForm.file_name = file.name
   // 眼动评估数据 sync_data.json 自动识别为 eye 类型
@@ -2040,6 +2056,7 @@ const handleFolderChange = (e) => {
   const unrecognized = []
   const recognized = []
   let skippedMetaCount = 0
+  let oversizedCount = 0
   files.forEach((f) => {
     const nameLower = f.name.toLowerCase()
     // 跳过 userInfo、密钥文件、眼动字段说明文件（元数据，不作为数据资产入库）
@@ -2047,6 +2064,10 @@ const handleFolderChange = (e) => {
         || nameLower === '密钥.txt' || nameLower === 'key.txt'
         || nameLower.endsWith('_sync_fields_zh.json')) {
       skippedMetaCount++
+      return
+    }
+    if (f.size > MAX_UPLOAD_BYTES) {
+      oversizedCount++
       return
     }
     // 提取扩展名：剥离外部加密后缀 .enc，取真实扩展名（如 xxx.wav.enc -> wav）
@@ -2071,14 +2092,15 @@ const handleFolderChange = (e) => {
     }
   })
   folderFiles.value = recognized // 仅导入可识别类型的文件
+  const oversizeNote = oversizedCount ? `，跳过 ${oversizedCount} 个超过 512MB 的文件` : ''
   if (unrecognized.length) {
     const sample = unrecognized.slice(0, 3).map((u) => `${u.name}（.${u.ext}）`).join('、')
     const metaNote = skippedMetaCount ? `，跳过 ${skippedMetaCount} 个元数据/密钥文件` : ''
-    ElMessage.warning(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别将被导入${metaNote}；${unrecognized.length} 个无法识别类型：${sample}${unrecognized.length > 3 ? ' 等' : ''}`)
+    ElMessage.warning(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别将被导入${metaNote}${oversizeNote}；${unrecognized.length} 个无法识别类型：${sample}${unrecognized.length > 3 ? ' 等' : ''}`)
   } else if (files.length > recognized.length + skippedMetaCount) {
-    ElMessage.info(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别类型将被导入`)
+    ElMessage.info(`已选 ${files.length} 个文件，其中 ${recognized.length} 个可识别类型将被导入${oversizeNote}`)
   } else if (skippedMetaCount) {
-    ElMessage.success(`已选 ${files.length} 个文件，${recognized.length} 个数据文件将被导入，跳过 ${skippedMetaCount} 个元数据/密钥文件`)
+    ElMessage.success(`已选 ${files.length} 个文件，${recognized.length} 个数据文件将被导入，跳过 ${skippedMetaCount} 个元数据/密钥文件${oversizeNote}`)
   }
 }
 
@@ -2255,6 +2277,8 @@ const onViewModeChange = (mode) => {
 }
 
 const loadAllSubjects = async () => {
+  // 缓存：页面生命周期内已加载则跳过重复拉取（subjectMap 仅在引用变化时重建）
+  if (allSubjects.value.length) return
   try {
     const res = await getSubjectsApi({ page: 1, page_size: 10000 })
     allSubjects.value = res.data.items || []

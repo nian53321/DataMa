@@ -1262,8 +1262,8 @@
             <el-upload
               :auto-upload="false"
               :limit="1"
-              :on-change="(file) => (extKeyImportForm.file = file.raw)"
-              :on-remove="() => (extKeyImportForm.file = null)"
+              :on-change="handleExtKeyFileChange"
+              :on-remove="handleExtKeyFileRemove"
             >
               <el-button :icon="Upload">选择密钥.txt 文件</el-button>
             </el-upload>
@@ -1416,6 +1416,7 @@ import {
   saveSubjectTemplateApi,
 } from '@/api/system'
 import { getSubjectsApi, exportStartApi, exportProgressApi, exportDownloadApi } from '@/api/data'
+import { fetchSignedUrlApi } from '@/api/media'
 import VersionHistoryDialog from '@/components/VersionHistoryDialog.vue'
 
 const userStore = useUserStore()
@@ -2154,6 +2155,7 @@ const exportProgress = reactive({
   processedFiles: 0,
 })
 const exportProgressTimer = ref(null)
+let _exportPollReject = null  // 导出轮询 Promise 的 reject（卸载时调用，避免挂起）
 
 const exportFilteredSubjects = computed(() => {
   let list = exportSubjectList.value
@@ -2243,10 +2245,20 @@ const handleExport = async () => {
     const taskId = startRes.data.task_id
     exportProgress.status = '任务已启动，正在解析导出范围...'
 
-    // 2. 轮询任务进度
+    // 2. 轮询任务进度（超时兜底 30 分钟；组件卸载时 reject，避免 Promise 永久挂起导致 zip 永不下载）
+    const _pollStartedAt = Date.now()
+    const _POLL_TIMEOUT = 30 * 60 * 1000
     await new Promise((resolve, reject) => {
+      _exportPollReject = reject
       exportProgressTimer.value = setInterval(async () => {
         try {
+          if (Date.now() - _pollStartedAt > _POLL_TIMEOUT) {
+            clearInterval(exportProgressTimer.value)
+            exportProgressTimer.value = null
+            _exportPollReject = null
+            reject(new Error('导出超时，请重试'))
+            return
+          }
           const res = await exportProgressApi(taskId)
           const task = res.data
           exportProgress.percent = task.percent || 0
@@ -2259,32 +2271,53 @@ const handleExport = async () => {
           if (task.status === 'success') {
             clearInterval(exportProgressTimer.value)
             exportProgressTimer.value = null
+            _exportPollReject = null
             exportProgress.phase = 'download'
             exportProgress.status = '压缩完成，正在下载...'
             resolve(task)
           } else if (task.status === 'failed') {
             clearInterval(exportProgressTimer.value)
             exportProgressTimer.value = null
+            _exportPollReject = null
             reject(new Error(task.error || '打包失败'))
           }
         } catch (e) {
           clearInterval(exportProgressTimer.value)
           exportProgressTimer.value = null
+          _exportPollReject = null
           reject(e)
         }
       }, 500)
     })
 
     // 3. 下载 zip
+    // 优先用短期签名 URL 直接导航下载（浏览器原生流式落盘，不整读内存，与后端流式响应配套）；
+    // 签名签发失败时回退 blob 下载。
     exportProgress.status = '正在下载压缩包...'
-    const dlRes = await exportDownloadApi(taskId)
-    const blob = dlRes instanceof Blob ? dlRes : new Blob([dlRes], { type: 'application/zip' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `data-export-${new Date().getTime()}.zip`
-    a.click()
-    URL.revokeObjectURL(url)
+    let downloaded = false
+    try {
+      const sigRes = await fetchSignedUrlApi({ kind: 'asset_export', task_id: taskId })
+      const signedUrl = sigRes?.data?.data?.url
+      if (signedUrl) {
+        const a = document.createElement('a')
+        a.href = signedUrl
+        a.download = `data-export-${new Date().getTime()}.zip`
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        downloaded = true
+      }
+    } catch { /* 签名失败则回退 blob 下载 */ }
+    if (!downloaded) {
+      const dlRes = await exportDownloadApi(taskId)
+      const blob = dlRes instanceof Blob ? dlRes : new Blob([dlRes], { type: 'application/zip' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `data-export-${new Date().getTime()}.zip`
+      a.click()
+      URL.revokeObjectURL(url)
+    }
 
     exportProgress.percent = 100
     exportProgress.status = '导出完成'
@@ -2436,6 +2469,12 @@ const openImportDialog = () => {
 }
 
 const handleImportFileChange = (file) => {
+  if (file.raw?.size > MAX_KEY_FILE_BYTES) {
+    ElMessage.warning('主密钥文件超过 1MB，请检查是否选错文件')
+    importForm.file = null
+    importFileList.value = []
+    return
+  }
   importForm.file = file.raw
   importFileList.value = [file]
 }
@@ -2483,11 +2522,15 @@ onMounted(() => {
   }
 })
 
-// 组件卸载时清理导出轮询定时器
+// 组件卸载时清理导出轮询定时器并 reject 挂起的轮询 Promise，避免导出永久挂起
 onBeforeUnmount(() => {
   if (exportProgressTimer.value) {
     clearInterval(exportProgressTimer.value)
     exportProgressTimer.value = null
+  }
+  if (_exportPollReject) {
+    _exportPollReject(new Error('页面已关闭，导出中断'))
+    _exportPollReject = null
   }
 })
 
@@ -2672,11 +2715,26 @@ const extKeyForm = reactive({
 // 导入对话框
 const extKeyImportDialog = ref(false)
 const extKeyImporting = ref(false)
+// 密钥文件为 32 字节文本，限制 1MB 内（防止误选大文件）
+const MAX_KEY_FILE_BYTES = 1 * 1024 * 1024
 const extKeyImportForm = reactive({
   name: '',
   description: '',
   file: null,
 })
+
+const handleExtKeyFileChange = (file) => {
+  if (file.raw?.size > MAX_KEY_FILE_BYTES) {
+    ElMessage.warning('密钥文件超过 1MB，请检查是否选错文件')
+    extKeyImportForm.file = null
+    return
+  }
+  extKeyImportForm.file = file.raw
+}
+
+const handleExtKeyFileRemove = () => {
+  extKeyImportForm.file = null
+}
 
 // 验证对话框
 const extKeyVerifyDialog = ref(false)

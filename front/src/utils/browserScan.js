@@ -18,6 +18,9 @@ import {
 // 伪ID合法格式：3-64位字母/数字/下划线/短横线（与后端 scanner 一致）
 const PSEUDO_ID_RE = /^[A-Za-z0-9_\-]{3,64}$/
 
+// 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 512MB 一致）
+const MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+
 // 跳过的元数据/密钥文件名（小写比对）
 const META_FILES = new Set([
   'userinfo.json', 'userinfo.json.enc',
@@ -311,6 +314,14 @@ export async function runScanFromFiles(allFiles, options = {}) {
         currentFile: f.path,
       })
       const data_type = detectDataType(f.name)
+      if (f.size > MAX_UPLOAD_BYTES) {
+        failures.push({
+          name: f.path,
+          reason: '文件超过 512MB 上限，已跳过',
+        })
+        done++
+        continue
+      }
       try {
         const fd = new FormData()
         fd.append('file', f.file, f.name)

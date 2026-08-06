@@ -112,6 +112,7 @@
         :autoplay="!canSeek"
         muted
         playsinline
+        @loadedmetadata="onVideoMeta"
       />
 
       <!-- Orbbec 深度相机：采集前与录制中显示实时画面(MJPEG 流)，完成后播放预览视频 -->
@@ -176,6 +177,11 @@
         <span class="rec-dot" :class="{ blink: phase === 'recording' }" />
         <span style="margin-left: 6px">{{ phase === 'recording' ? '录制中' : '已暂停' }}</span>
         <span style="margin-left: 12px; font-variant-numeric: tabular-nums">{{ formattedDuration }}</span>
+      </div>
+
+      <!-- 分辨率/帧数角标（右上角，实时画面阶段显示） -->
+      <div v-if="resInfoLabel" class="res-indicator">
+        {{ resInfoLabel }}
       </div>
 
       <!-- 未授权占位 -->
@@ -395,7 +401,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onBeforeUnmount, nextTick } from 'vue'
+import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   VideoPlay, VideoPause, CircleClose, RefreshLeft, Upload, Refresh,
@@ -403,6 +409,7 @@ import {
 } from '@element-plus/icons-vue'
 import { VideoCamera } from '@element-plus/icons-vue'
 import { uploadAssetApi } from '@/api/data'
+import { fetchSignedUrlApi } from '@/api/media'
 import {
   getOrbbecStatusApi, startOrbbecRecordApi, stopOrbbecRecordApi,
   uploadOrbbecRecordApi, getOrbbecRecordStatusApi,
@@ -442,6 +449,8 @@ const deviceSource = ref('webcam')
 // 普通摄像头设备列表（enumerateDevices 的 videoinput，含深度相机 RGB，仅作普通摄像头使用）
 const cameraDevices = ref([])
 const selectedDeviceId = ref('')
+// 普通摄像头录制分辨率（video 元素实际采集/回放分辨率，右上角角标显示录制参数）
+const webcamResolution = ref('')
 // Orbbec 设备状态
 const orbbecAvailable = ref(false)
 const orbbecChecked = ref(false)
@@ -455,6 +464,8 @@ const orbbecTrimmedUrl = ref('')        // 裁剪后的预览(本地 blob,仅预
 const stoppingOrbbec = ref(false)       // 停止采集中的 loading 状态
 const orbbecPreviewing = ref(false)     // 实时预览会话是否已启动(MJPEG 流)
 let orbbecRecordTimerId = null
+let switchCameraTimer = null            // 切回普通摄像头延迟初始化定时器（需在关闭/卸载时清理）
+let _disposed = false                   // 组件卸载标志：异步轮询/回调检查后提前退出
 // RealSense 设备状态
 const realSenseAvailable = ref(false)
 const realSenseChecked = ref(false)
@@ -504,6 +515,41 @@ const formattedDuration = computed(() => formatTime(durationMs.value / 1000))
 // 仅在已完成/编辑态显示原生控制器（时间轴），录制中不显示
 const canSeek = computed(() => phase.value === 'done' || phase.value === 'editing')
 
+// 右上角角标：录制的分辨率和帧率（录制中 / 录制完成后显示，不做实时帧率监控）
+const webcamResLabel = computed(() => {
+  if (deviceSource.value !== 'webcam' || !webcamResolution.value) return ''
+  // 录制中 video 元素实时播放采集流，done 阶段播放录制文件——两者均为录制分辨率
+  if (phase.value === 'recording' || phase.value === 'done') return `${webcamResolution.value} · 30fps`
+  return ''
+})
+const orbbecResLabel = computed(() => {
+  if (deviceSource.value !== 'orbbec') return ''
+  const meta = orbbecRecordMeta.value?.meta
+  const fps = meta?.fps || 30
+  if (phase.value === 'recording') return `1080P · ${fps}fps`   // 录制固定 1080P@30
+  if (phase.value === 'done') {
+    const res = meta?.color_resolution || '1080P'
+    return `${res} · ${fps}fps`
+  }
+  return ''
+})
+const realSenseResLabel = computed(() => {
+  if (deviceSource.value !== 'realsense') return ''
+  const meta = realSenseRecordMeta.value?.meta
+  if (phase.value === 'recording') return '1280×800 · 30fps'    // D455F 录制固定 30fps
+  if (phase.value === 'done') {
+    const res = (meta?.color_resolution || '1280x800').replace(/x/i, '×')
+    return `${res} · ${meta?.fps || 30}fps`
+  }
+  return ''
+})
+const resInfoLabel = computed(() => {
+  if (deviceSource.value === 'webcam') return webcamResLabel.value
+  if (deviceSource.value === 'orbbec') return orbbecResLabel.value
+  if (deviceSource.value === 'realsense') return realSenseResLabel.value
+  return ''
+})
+
 // ==================== 生命周期 ====================
 const onOpen = async () => {
   // 并行检测两种深度相机（互不依赖，各自后端 status 均已子进程化、有超时），
@@ -533,6 +579,9 @@ const onClosed = () => {
 }
 
 onBeforeUnmount(() => {
+  _disposed = true
+  if (orbbecLiveRefreshTimer) { clearInterval(orbbecLiveRefreshTimer); orbbecLiveRefreshTimer = null }
+  if (realSenseLiveRefreshTimer) { clearInterval(realSenseLiveRefreshTimer); realSenseLiveRefreshTimer = null }
   releaseCamera()
   releaseOrbbec()
   releaseRealSense()
@@ -622,11 +671,18 @@ const onDeviceSourceChange = (val) => {
     stopOrbbecLive()
     stopRealSenseLive()
     selectedDeviceId.value = ''
-    setTimeout(() => initCamera(), 600)
+    // 记录定时器 id：关闭/卸载时清除，避免组件卸载后摄像头被重新占用
+    clearTimeout(switchCameraTimer)
+    switchCameraTimer = setTimeout(() => initCamera(), 600)
   }
 }
 
 const releaseOrbbec = () => {
+  // 释放裁剪预览的 Blob URL，避免内存泄漏
+  if (orbbecTrimmedUrl.value) {
+    URL.revokeObjectURL(orbbecTrimmedUrl.value)
+    orbbecTrimmedUrl.value = ''
+  }
   if (orbbecRecordTimerId) {
     clearInterval(orbbecRecordTimerId)
     orbbecRecordTimerId = null
@@ -650,40 +706,89 @@ const releaseRealSense = () => {
   }
 }
 
-// 录制完成后的预览视频 URL(后端从 mkv 提取的彩色轨 mp4;裁剪后优先显示本地裁剪版)
-const orbbecPreviewUrl = computed(() => {
-  if (orbbecTrimmedUrl.value) return orbbecTrimmedUrl.value
-  const rel = orbbecRecordMeta.value?.preview_rel
-  if (!rel) return ''
-  const base = import.meta.env.VITE_API_BASE_URL || '/api'
-  const token = localStorage.getItem('token') || ''
-  return `${base}/orbbec/preview?path=${encodeURIComponent(rel)}&access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
-})
+// ==================== 媒体短期签名 URL ====================
+// <video>/<img> 无法带 Authorization 头，改为向 /api/media/signed-url 签发
+// 资源绑定、5 分钟过期的 ?media_token= 签名，避免长期 JWT 进 URL。
+// 实时流（MJPEG 长连接）在连接建立后签名过期不影响已建立的连接，
+// 故仅每 4 分钟后台刷新一次签名，防止断线重连时签名已失效。
+const orbbecLiveSignedUrl = ref('')
+const realSenseLiveSignedUrl = ref('')
+let orbbecLiveRefreshTimer = null
+let realSenseLiveRefreshTimer = null
 
-// 实时预览 MJPEG 流 URL(<img> 直接播放;img 无法带请求头,鉴权走 access_token query)
-const orbbecLiveUrl = computed(() => {
-  if (!orbbecPreviewing.value) return ''
-  const base = import.meta.env.VITE_API_BASE_URL || '/api'
-  const token = localStorage.getItem('token') || ''
-  return `${base}/orbbec/preview/stream?access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
+const refreshMediaSignedUrl = async (kind, payload) => {
+  try {
+    const res = await fetchSignedUrlApi({ kind, ...payload })
+    return res?.data?.data?.url || ''
+  } catch {
+    return ''
+  }
+}
+
+const loadOrbbecLiveUrl = async () => {
+  if (_disposed || !orbbecPreviewing.value) return
+  const url = await refreshMediaSignedUrl('orbbec_stream', {})
+  if (!_disposed && orbbecPreviewing.value) orbbecLiveSignedUrl.value = url
+}
+const loadRealSenseLiveUrl = async () => {
+  if (_disposed || !realSensePreviewing.value) return
+  const url = await refreshMediaSignedUrl('realsense_stream', {})
+  if (!_disposed && realSensePreviewing.value) realSenseLiveSignedUrl.value = url
+}
+
+// 录制完成后的预览视频 URL(后端从 mkv 提取的彩色轨 mp4;裁剪后优先显示本地裁剪版)
+const orbbecPreviewSignedUrl = ref('')
+const orbbecPreviewUrl = computed(() => orbbecTrimmedUrl.value || orbbecPreviewSignedUrl.value)
+watch(
+  () => orbbecTrimmedUrl.value || orbbecRecordMeta.value?.preview_rel,
+  async (v) => {
+    orbbecPreviewSignedUrl.value = ''
+    if (!v || orbbecTrimmedUrl.value) return
+    const url = await refreshMediaSignedUrl('orbbec_preview', { path: v })
+    if (!_disposed && url) orbbecPreviewSignedUrl.value = url
+  }
+)
+
+// 实时预览 MJPEG 流 URL(<img> 直接播放;img 无法带请求头,鉴权走短期签名)
+const orbbecLiveUrl = computed(() => (orbbecPreviewing.value ? orbbecLiveSignedUrl.value : ''))
+watch(orbbecPreviewing, (v) => {
+  if (v) {
+    loadOrbbecLiveUrl()
+    if (!orbbecLiveRefreshTimer) {
+      orbbecLiveRefreshTimer = setInterval(loadOrbbecLiveUrl, 4 * 60 * 1000)
+    }
+  } else {
+    if (orbbecLiveRefreshTimer) { clearInterval(orbbecLiveRefreshTimer); orbbecLiveRefreshTimer = null }
+    orbbecLiveSignedUrl.value = ''
+  }
 })
 
 // ==================== RealSense 计算属性 ====================
 // 录制完成后的预览视频 URL(后端提取的 H.264 彩色轨 mp4)
-const realSensePreviewUrl = computed(() => {
-  const rel = realSenseRecordMeta.value?.preview_rel
-  if (!rel) return ''
-  const base = import.meta.env.VITE_API_BASE_URL || '/api'
-  const token = localStorage.getItem('token') || ''
-  return `${base}/realsense/preview?path=${encodeURIComponent(rel)}&access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
-})
+const realSensePreviewSignedUrl = ref('')
+const realSensePreviewUrl = computed(() => realSensePreviewSignedUrl.value)
+watch(
+  () => realSenseRecordMeta.value?.preview_rel,
+  async (v) => {
+    realSensePreviewSignedUrl.value = ''
+    if (!v) return
+    const url = await refreshMediaSignedUrl('realsense_preview', { path: v })
+    if (!_disposed && url) realSensePreviewSignedUrl.value = url
+  }
+)
 
-// 实时预览 MJPEG 流 URL(<img> 直接播放;img 无法带请求头,鉴权走 access_token query)
-const realSenseLiveUrl = computed(() => {
-  if (!realSensePreviewing.value) return ''
-  const base = import.meta.env.VITE_API_BASE_URL || '/api'
-  const token = localStorage.getItem('token') || ''
-  return `${base}/realsense/preview/stream?access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
+// 实时预览 MJPEG 流 URL(<img> 直接播放;img 无法带请求头,鉴权走短期签名)
+const realSenseLiveUrl = computed(() => (realSensePreviewing.value ? realSenseLiveSignedUrl.value : ''))
+watch(realSensePreviewing, (v) => {
+  if (v) {
+    loadRealSenseLiveUrl()
+    if (!realSenseLiveRefreshTimer) {
+      realSenseLiveRefreshTimer = setInterval(loadRealSenseLiveUrl, 4 * 60 * 1000)
+    }
+  } else {
+    if (realSenseLiveRefreshTimer) { clearInterval(realSenseLiveRefreshTimer); realSenseLiveRefreshTimer = null }
+    realSenseLiveSignedUrl.value = ''
+  }
 })
 
 // 启动实时预览会话(与录制共用相机会话;开始采集无需停预览)
@@ -800,13 +905,16 @@ const stopOrbbecRecord = async () => {
   }
 }
 
-// 轮询录制后处理状态（预览生成），最多约 90s
+// 轮询录制后处理状态（预览生成），最多约 90s；组件卸载后立即退出，不再轮询
 const pollOrbbecPreview = async () => {
   orbbecPreviewReady.value = false
   for (let i = 0; i < 60; i++) {
+    if (_disposed) return
     await new Promise(r => setTimeout(r, 1500))
+    if (_disposed) return
     try {
       const res = await getOrbbecRecordStatusApi()
+      if (_disposed) return
       const d = res.data || {}
       if (d.done) {
         if (d.preview_rel && orbbecRecordMeta.value) {
@@ -835,7 +943,7 @@ const pollOrbbecPreview = async () => {
       }
     } catch { /* 继续轮询 */ }
   }
-  ElMessage.warning('预览生成超时，仍可上传录制数据')
+  if (!_disposed) ElMessage.warning('预览生成超时，仍可上传录制数据')
 }
 
 const resetOrbbecCapture = () => {
@@ -889,6 +997,8 @@ const applyOrbbecTrim = async () => {
   if (end - start < 0.1) { ElMessage.warning('裁剪区间过短'); return }
   trimming.value = true
   trimProgress.value = 0
+  let rafId = 0
+  let cropTimeout = null
   try {
     const canvas = canvasRef.value
     const w = v.videoWidth || 1280
@@ -932,10 +1042,21 @@ const applyOrbbecTrim = async () => {
     v.addEventListener('timeupdate', onTimeUpdate)
     const drawFrame = () => {
       if (!v.paused) ctx.drawImage(v, 0, 0, w, h)
-      if (rec.state === 'recording') requestAnimationFrame(drawFrame)
+      if (rec.state === 'recording' && rafId) rafId = requestAnimationFrame(drawFrame)
     }
-    requestAnimationFrame(drawFrame)
+    rafId = requestAnimationFrame(drawFrame)
+    // 超时兜底：视频卡住/暂停导致 timeupdate 未达终点时强制结束，避免 RAF 死循环（CPU 满载+内存增长）
+    cropTimeout = setTimeout(() => {
+      if (rec.state === 'recording') {
+        v.pause()
+        v.removeEventListener('timeupdate', onTimeUpdate)
+        rec.stop()
+        canvasStream.getTracks().forEach(t => t.stop())
+      }
+    }, Math.max(totalMs + 5000, 10000))
   } catch (e) {
+    cancelAnimationFrame(rafId)
+    clearTimeout(cropTimeout)
     trimming.value = false
     ElMessage.error(`裁剪失败：${e.message || e}`)
   }
@@ -1027,13 +1148,16 @@ const stopRealSenseRecord = async () => {
   }
 }
 
-// 轮询录制后处理状态（预览生成），最多约 90s
+// 轮询录制后处理状态（预览生成），最多约 90s；组件卸载后立即退出，不再轮询
 const pollRealSensePreview = async () => {
   realSensePreviewReady.value = false
   for (let i = 0; i < 60; i++) {
+    if (_disposed) return
     await new Promise(r => setTimeout(r, 1500))
+    if (_disposed) return
     try {
       const res = await getRealSenseRecordStatusApi()
+      if (_disposed) return
       const d = res.data || {}
       if (d.done) {
         if (d.preview_rel && realSenseRecordMeta.value) {
@@ -1060,7 +1184,7 @@ const pollRealSensePreview = async () => {
       }
     } catch { /* 继续轮询 */ }
   }
-  ElMessage.warning('预览生成超时，仍可上传录制数据')
+  if (!_disposed) ElMessage.warning('预览生成超时，仍可上传录制数据')
 }
 
 const resetRealSenseCapture = () => {
@@ -1218,6 +1342,15 @@ const onDeviceChange = (deviceId) => {
   switchToDevice(deviceId)
 }
 
+// ==================== 普通摄像头：录制分辨率 ====================
+// video 元素实际分辨率在 loadedmetadata 后才有（采集/回放通用，角标读取录制分辨率）
+const onVideoMeta = () => {
+  const el = videoRef.value
+  if (el && el.videoWidth && el.videoHeight) {
+    webcamResolution.value = `${el.videoWidth}×${el.videoHeight}`
+  }
+}
+
 const playPreview = async (s) => {
   await nextTick()
   if (videoRef.value) {
@@ -1340,6 +1473,8 @@ const switchToPlayback = (blob) => {
 }
 
 // ==================== 文件选择（无摄像头时的备选方案） ====================
+// 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 512MB 一致）
+const MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 const pickVideoFile = () => {
   fileInputRef.value?.click()
 }
@@ -1349,6 +1484,11 @@ const onVideoFileChange = (e) => {
   if (!file) return
   if (!file.type.startsWith('video/')) {
     ElMessage.warning('请选择视频文件')
+    e.target.value = ''
+    return
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    ElMessage.warning('文件过大（超过 512MB），请选择较小的视频文件')
     e.target.value = ''
     return
   }
@@ -1450,6 +1590,8 @@ const applyTrim = async () => {
   }
   trimming.value = true
   trimProgress.value = 0
+  let rafId = 0
+  let cropTimeout = null
   try {
     const video = videoRef.value
     const canvas = canvasRef.value
@@ -1525,10 +1667,21 @@ const applyTrim = async () => {
     // 同时用 requestAnimationFrame 持续绘制
     const drawFrame = () => {
       if (!video.paused) ctx.drawImage(video, 0, 0, w, h)
-      if (rec.state === 'recording') requestAnimationFrame(drawFrame)
+      if (rec.state === 'recording' && rafId) rafId = requestAnimationFrame(drawFrame)
     }
-    requestAnimationFrame(drawFrame)
+    rafId = requestAnimationFrame(drawFrame)
+    // 超时兜底：视频卡住/暂停导致 timeupdate 未达终点时强制结束，避免 RAF 死循环（CPU 满载+内存增长）
+    cropTimeout = setTimeout(() => {
+      if (rec.state === 'recording') {
+        video.pause()
+        video.removeEventListener('timeupdate', onTimeUpdate)
+        rec.stop()
+        canvasStream.getTracks().forEach(t => t.stop())
+      }
+    }, Math.max(totalMs + 5000, 10000))
   } catch (e) {
+    cancelAnimationFrame(rafId)
+    clearTimeout(cropTimeout)
     trimming.value = false
     ElMessage.error(`裁剪失败：${e.message || e}`)
   }
@@ -1562,6 +1715,10 @@ const handleUpload = async () => {
   }
   if (!currentVideoType.value) {
     ElMessage.warning('请选择采集类型（面部/身体/步态）')
+    return
+  }
+  if (recordedBlob.size > MAX_UPLOAD_BYTES) {
+    ElMessage.warning('文件过大（超过 512MB），请裁剪后重试')
     return
   }
   uploading.value = true
@@ -1633,6 +1790,11 @@ const formatFileSize = (bytes) => {
 
 // ==================== 资源释放 ====================
 const releaseCamera = () => {
+  // 清除延迟初始化摄像头的定时器，避免关闭/卸载后摄像头被重新占用
+  if (switchCameraTimer) {
+    clearTimeout(switchCameraTimer)
+    switchCameraTimer = null
+  }
   stopTimer()
   if (mediaRecorder && mediaRecorder.state !== 'inactive') {
     try { mediaRecorder.stop() } catch {}
@@ -1760,6 +1922,20 @@ const releaseCamera = () => {
 
 .rec-dot.blink {
   animation: blink 1s ease-in-out infinite;
+}
+
+/* 右上角：分辨率/帧数角标 */
+.res-indicator {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  padding: 4px 10px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 12px;
+  color: #fff;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 @keyframes blink {

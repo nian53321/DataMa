@@ -122,6 +122,8 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
   const scanOnce = async () => { await _doScan() }
 
   const startWatch = async () => {
+    // 已有定时器在运行则直接返回，避免重复创建定时器导致扫描并发堆积
+    if (_watchTimer) return
     if (!state.handle) throw new Error('请先选择监控目录')
     if (!(await verifyPermission(state.handle))) throw new Error('未获得目录读取权限')
     try { await loadSubjectCache() } catch { /* 缓存加载失败不阻断 */ }

@@ -635,6 +635,7 @@ import * as echarts from 'echarts'
 import { Aim, RefreshLeft, Download, Loading, User, DataLine, VideoCamera, Headset, Microphone, DataAnalysis } from '@element-plus/icons-vue'
 import { getSubjectOverviewApi, getTimelineApi, alignModalitiesApi, getEegAssetApi, getEcgAssetApi, getEyeAssetApi, getScaleAssetApi } from '@/api/visualization'
 import { getSubjectsApi as getSubjects, getAssetsApi } from '@/api/data'
+import { fetchSignedUrlApi } from '@/api/media'
 import { useUserStore } from '@/stores/user'
 import { ElMessage } from 'element-plus'
 
@@ -649,6 +650,7 @@ const subjectInfo = ref(null)
 const tracks = ref([])
 const loading = ref(false)
 const aligning = ref(false)
+let subjectSeq = 0  // 受试者切换请求序号：快速切换时丢弃过期响应，避免数据错配
 
 // 顶部筛选
 const filters = reactive({ keyword: '', gender: '', riskLevel: '' })
@@ -681,19 +683,26 @@ let assetBarChart = null
 // 状态机：idle（未请求）→ 点击"加载深度视频" → loading（转码中）→ ready（可播放）或 failed（无深度轨）
 // 手动触发：切换视频仅重置为 idle，不自动请求转码接口，避免无谓的服务器转码开销
 const depthVideoState = reactive({ url: '', status: 'idle' })
-const depthVideoUrlForAsset = (assetId) => {
-  if (!assetId) return ''
-  const token = userStore.token || ''
-  return `/api/visualization/depth-video/${assetId}?access_token=${encodeURIComponent(token)}`
-}
 const resetDepthVideo = () => {
   depthVideoState.url = ''
   depthVideoState.status = 'idle'
 }
 const loadDepthVideo = (assetId) => {
   if (!assetId || depthVideoState.status === 'loading' || depthVideoState.status === 'ready') return
-  depthVideoState.url = depthVideoUrlForAsset(assetId)
+  depthVideoState.url = ''
   depthVideoState.status = 'loading'
+  // 用 5 分钟过期的资源绑定签名 URL 替代长期 JWT 进 URL（避免 token 泄漏）
+  fetchSignedUrlApi({ kind: 'depth_video', asset_id: assetId })
+    .then((res) => {
+      const url = res?.data?.data?.url
+      if (url && depthVideoState.status === 'loading') depthVideoState.url = url
+    })
+    .catch(() => {
+      if (depthVideoState.status === 'loading') {
+        depthVideoState.url = ''
+        depthVideoState.status = 'failed'
+      }
+    })
 }
 const onDepthVideoLoaded = () => { depthVideoState.status = 'ready' }
 const onDepthVideoError = () => {
@@ -769,16 +778,39 @@ const currentAudio = computed(() => audioList.value.find((a) => a.id === current
 const PLAYABLE_VIDEO = ['mp4', 'webm', 'ogg', 'ogv', 'mov', 'm4v']
 const isPlayableVideo = (fmt) => PLAYABLE_VIDEO.includes((fmt || '').toLowerCase())
 
-// 视频播放地址：统一走 /play 接口（原生格式直出，其余自动转码）
+// 视频/音频/下载地址：统一走后端短期签名 URL（资源绑定、5 分钟过期）
 // 浏览器 <video>/<audio>/<a download> 标签无法发送 Authorization 头，
-// 故通过 query 参数携带 access_token 由后端校验。
-const signedUrl = (path) => {
-  const token = userStore.token || ''
-  const sep = path.includes('?') ? '&' : '?'
-  return `/api/data/assets/${path}${sep}access_token=${encodeURIComponent(token)}`
+// 故由 /api/media/signed-url 签发 ?media_token= 短期签名，避免长期 JWT 进 URL。
+// 缓存 4 分钟后后台刷新，保证 5 分钟窗口内不断流。
+const mediaUrlCache = reactive({})
+const mediaUrlFetching = new Set()
+const MEDIA_CACHE_TTL = 4 * 60 * 1000
+const refreshMediaSignedUrl = (kind, id) => {
+  const key = `${kind}:${id}`
+  if (mediaUrlFetching.has(key)) return
+  mediaUrlFetching.add(key)
+  fetchSignedUrlApi({ kind, asset_id: id })
+    .then((res) => {
+      const url = res?.data?.data?.url
+      if (url) mediaUrlCache[key] = { url, ts: Date.now() }
+    })
+    .catch(() => {})
+    .finally(() => mediaUrlFetching.delete(key))
 }
-const playUrl = (v) => signedUrl(`${v.id}/play`)
-const fileUrl = (v) => signedUrl(`${v.id}/file`)
+const getMediaSignedUrl = (kind, id) => {
+  if (!id) return ''
+  const key = `${kind}:${id}`
+  const cached = mediaUrlCache[key]
+  if (cached) {
+    if (Date.now() - cached.ts < MEDIA_CACHE_TTL) return cached.url
+    refreshMediaSignedUrl(kind, id) // 接近过期：后台刷新，暂用旧 URL
+    return cached.url
+  }
+  refreshMediaSignedUrl(kind, id)
+  return ''
+}
+const playUrl = (v) => getMediaSignedUrl('asset_play', v?.id)
+const fileUrl = (v) => getMediaSignedUrl('asset_file', v?.id)
 
 // 视频加载出错（如转码失败/文件损坏）
 // 注：MEDIA_ERR_ABORTED(1) 是切换视频时浏览器正常中止旧请求，忽略
@@ -1157,12 +1189,14 @@ const updateRadarChart = () => {
 // 选择受试者后加载数据
 const onSubjectChange = async () => {
   if (!selectedSubject.value) return
+  const seq = ++subjectSeq
   loading.value = true
   try {
     const [overview, timeline] = await Promise.all([
       getSubjectOverviewApi(selectedSubject.value),
       getTimelineApi(selectedSubject.value),
     ])
+    if (seq !== subjectSeq) return  // 已切换受试者，丢弃过期结果
     subjectInfo.value = overview.data.subject || overview.data
     tracks.value = timeline.data.tracks || []
     // 默认选中第一路视频/音频
@@ -1171,6 +1205,7 @@ const onSubjectChange = async () => {
     videoError.value = false
     videoLoading.value = !!currentVideoId.value
     await nextTick()
+    if (seq !== subjectSeq) return
     initCharts()
     // 检查各模态是否有真实数据
     const hasModality = (type) => tracks.value.some((t) => t.data_type === type)
@@ -1179,6 +1214,7 @@ const onSubjectChange = async () => {
       const eegAsset = tracks.value.find((t) => t.data_type === 'eeg')
       try {
         const eegRes = await getEegAssetApi(eegAsset.id)
+        if (seq !== subjectSeq) return  // 过期响应丢弃
         if (eegRes.code === 200 && eegRes.data) {
           updateEegCharts(eegRes.data)
         } else {
@@ -1187,6 +1223,7 @@ const onSubjectChange = async () => {
           clearEegCharts()
         }
       } catch (e) {
+        if (seq !== subjectSeq) return  // 过期响应丢弃
         const msg = e?.response?.data?.message || e?.message || '脑电文件解析失败'
         ElMessage.warning(msg)
         eegMeta.value = null
@@ -1201,6 +1238,7 @@ const onSubjectChange = async () => {
       const ecgAsset = tracks.value.find((t) => t.data_type === 'ecg')
       try {
         const ecgRes = await getEcgAssetApi(ecgAsset.id)
+        if (seq !== subjectSeq) return  // 过期响应丢弃
         if (ecgRes.code === 200 && ecgRes.data) {
           updateEcgChart(ecgRes.data)
         } else {
@@ -1208,6 +1246,7 @@ const onSubjectChange = async () => {
           clearEcgChart()
         }
       } catch (e) {
+        if (seq !== subjectSeq) return  // 过期响应丢弃
         const msg = e?.response?.data?.message || e?.message || '心电文件解析失败'
         ElMessage.warning(msg)
         clearEcgChart()
@@ -1221,6 +1260,7 @@ const onSubjectChange = async () => {
       const eyeAsset = tracks.value.find((t) => t.data_type === 'eye')
       try {
         const eyeRes = await getEyeAssetApi(eyeAsset.id)
+        if (seq !== subjectSeq) return  // 过期响应丢弃
         if (eyeRes.code === 200 && eyeRes.data) {
           eyeMeta.value = eyeRes.data
         }
@@ -1241,15 +1281,16 @@ const onSubjectChange = async () => {
       const scaleAsset = tracks.value.find((t) => t.data_type === 'scale')
       try {
         const scaleRes = await getScaleAssetApi(scaleAsset.id)
+        if (seq !== subjectSeq) return  // 过期响应丢弃
         if (scaleRes.code === 200 && scaleRes.data) {
           scaleMeta.value = scaleRes.data
         }
       } catch (e) { /* 解析失败回退 Subject 字段 */ }
     }
     // 量表雷达图
-    updateRadarChart()
+    if (seq === subjectSeq) updateRadarChart()
   } finally {
-    loading.value = false
+    if (seq === subjectSeq) loading.value = false
   }
 }
 

@@ -612,12 +612,11 @@ import {
   batchAssignApi, batchDeleteTasksApi,
 } from '@/api/annotation'
 import { getSubjectsApi } from '@/api/data'
+import { fetchSignedUrlApi } from '@/api/media'
 import { useUserStore } from '@/stores/user'
 import VersionHistoryDialog from '@/components/VersionHistoryDialog.vue'
 
 const userStore = useUserStore()
-const token = computed(() => userStore.token || '')
-
 const canReview = computed(() => ['admin', 'doctor'].includes(userStore.role))
 const canAnnotate = computed(() => ['admin', 'annotator'].includes(userStore.role))
 const isAdmin = computed(() => userStore.role === 'admin')
@@ -738,12 +737,23 @@ const wsMode = ref('group') // 'group' | 'my_tasks'
 // 工作台 EEG 预览
 const wsEegRef = ref()
 let wsEegChart = null
+let wsEegReqSeq = 0  // EEG/ECG 图表加载请求序号：切换任务/卸载后丢弃过期响应
 
-const playUrl = (asset) => {
-  if (!asset?.id) return ''
-  // 使用 /play 端点（所有登录用户可访问，支持 ?access_token=xxx 查询参数认证）
-  return `/api/data/assets/${asset.id}/play?access_token=${token.value}`
-}
+const playSignedUrl = ref('')
+// 当前资产变化时异步获取短期签名 URL（媒体标签不支持 Authorization 头，
+// 用 5 分钟过期的资源绑定签名替代长期 JWT 进 URL，避免 token 泄漏）
+watch(assetInfo, (asset) => {
+  playSignedUrl.value = ''
+  if (!asset?.id) return
+  fetchSignedUrlApi({ kind: 'asset_play', asset_id: asset.id })
+    .then((res) => {
+      const url = res?.data?.data?.url
+      if (url && assetInfo.value?.id === asset.id) playSignedUrl.value = url
+    })
+    .catch(() => {})
+}, { immediate: true })
+
+const playUrl = (asset) => (asset?.id && assetInfo.value?.id === asset.id) ? playSignedUrl.value : ''
 
 const onMediaError = () => {
   ElMessage.warning('媒体文件加载失败，可能格式不支持或文件损坏')
@@ -1238,14 +1248,18 @@ const loadWsEeg = async (assetId, dataType = 'eeg') => {
     setTimeout(() => loadWsEeg(assetId, dataType), 200)
     return
   }
+  // 请求序号：快速切换任务或组件卸载后，过期响应被丢弃，避免数据错配/写已销毁图表
+  const seq = ++wsEegReqSeq
   if (!wsEegChart) wsEegChart = echarts.init(wsEegRef.value)
-  wsEegChart.resize()
-  wsEegChart.showLoading()
+  wsEegChart?.resize()
+  wsEegChart?.showLoading()
+  const chart = wsEegChart
   try {
     // 根据数据类型选择对应 API（EEG 返回多通道，ECG 返回单通道）
     const res = dataType === 'ecg'
       ? await getEcgAssetApi(assetId)
       : await getEegAssetApi(assetId)
+    if (seq !== wsEegReqSeq) return  // 过期响应丢弃
     if (res.code === 200 && res.data) {
       // 统一转换为 channels 数组格式
       let channels = []
@@ -1263,8 +1277,8 @@ const loadWsEeg = async (assetId, dataType = 'eeg') => {
         deviceLabel = meta.device || 'CSV'
       }
       if (!channels.length) {
-        wsEegChart.hideLoading()
-        wsEegChart.setOption({ title: { text: '无有效数据', left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
+        chart?.hideLoading()
+        chart?.setOption({ title: { text: '无有效数据', left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
         return
       }
       const colors = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de', '#3ba272',
@@ -1285,8 +1299,8 @@ const loadWsEeg = async (assetId, dataType = 'eeg') => {
         data: ch.data,
       }))
       const yName = dataType === 'ecg' ? 'mV' : 'μV'
-      wsEegChart.hideLoading()
-      wsEegChart.setOption({
+      chart?.hideLoading()
+      chart?.setOption({
         title: { text: '', left: 'center', top: 0, textStyle: { fontSize: 12, color: '#606266' } },
         tooltip: { trigger: 'axis', axisPointer: { type: 'line' } },
         legend: { top: dataType === 'ecg' ? 5 : 0, textStyle: { fontSize: 9 }, data: series.map(s => s.name) },
@@ -1297,8 +1311,8 @@ const loadWsEeg = async (assetId, dataType = 'eeg') => {
         series,
       }, true)
       // legend 切换时重新计算可见通道的 Y 轴范围
-      wsEegChart.off('legendselectchanged')
-      wsEegChart.on('legendselectchanged', (params) => {
+      chart?.off('legendselectchanged')
+      chart?.on('legendselectchanged', (params) => {
         const selected = params.selected || {}
         let visMin = Infinity, visMax = -Infinity
         let hasVisible = false
@@ -1312,17 +1326,18 @@ const loadWsEeg = async (assetId, dataType = 'eeg') => {
           }
         })
         if (hasVisible) {
-          wsEegChart.setOption({ yAxis: [{ min: visMin, max: visMax }] })
+          chart?.setOption({ yAxis: [{ min: visMin, max: visMax }] })
         }
       })
     } else {
-      wsEegChart.hideLoading()
-      wsEegChart.setOption({ title: { text: res.message || '解析失败', left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
+      chart?.hideLoading()
+      chart?.setOption({ title: { text: res.message || '解析失败', left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
     }
   } catch (e) {
-    wsEegChart?.hideLoading()
+    if (seq !== wsEegReqSeq) return  // 过期响应丢弃
+    chart?.hideLoading()
     const errText = dataType === 'ecg' ? '心电数据加载失败' : '脑电数据加载失败'
-    wsEegChart?.setOption({ title: { text: errText, left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
+    chart?.setOption({ title: { text: errText, left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
   }
 }
 
@@ -1489,6 +1504,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
+  // 使在途 EEG/ECG 请求失效，避免响应写已销毁图表
+  wsEegReqSeq++
   statusPieChart?.dispose()
   statusPieChart = null
   annotatorBarChart?.dispose()
