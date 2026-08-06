@@ -18,8 +18,10 @@ dashboard_bp = Blueprint("dashboard", __name__, url_prefix="/api/dashboard")
 orbbec_bp = Blueprint("orbbec", __name__, url_prefix="/api/orbbec")
 # Intel RealSense 深度摄像头（D455f，pyrealsense2，容器内直连 USB）
 realsense_bp = Blueprint("realsense", __name__, url_prefix="/api/realsense")
+# 媒体资源短期签名 URL
+media_bp = Blueprint("media", __name__, url_prefix="/api/media")
 
 # 引入路由模块以注册视图
-from app.api import auth, data, annotation, visualization, system, dashboard, orbbec, realsense  # noqa: E402,F401
+from app.api import auth, data, annotation, visualization, system, dashboard, orbbec, realsense, media  # noqa: E402,F401
 
-ALL_BLUEPRINTS = [auth_bp, data_bp, annotation_bp, visualization_bp, system_bp, dashboard_bp, orbbec_bp, realsense_bp]
+ALL_BLUEPRINTS = [auth_bp, data_bp, annotation_bp, visualization_bp, system_bp, dashboard_bp, orbbec_bp, realsense_bp, media_bp]

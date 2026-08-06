@@ -166,7 +166,7 @@
         <el-collapse-item name="common" title="💡 通用注意事项">
           <div class="help-section">
             <ul>
-              <li>登录后 JWT Token 有效期默认 7 天，过期需重新登录；文件下载与视频播放接口同时支持 Header 与 query 参数 <code>?access_token=xxx</code> 两种认证方式</li>
+              <li>登录后 JWT Token 有效期默认 7 天，过期需重新登录；视频播放与文件下载使用后端签发的短期签名 URL（5 分钟有效），JWT 不会进入 URL</li>
               <li>文件上传按受试者伪ID分目录存储：<code>data_lake/raw/{伪ID}/{规范化文件名}</code></li>
               <li>所有数据湖文件采用 AES-256-GCM 信封加密，密钥由管理员通过"系统管理→密钥管理"单独维护</li>
               <li>视频转码缓存位于 <code>data_lake/.transcodes/{资产ID}.mp4</code>，删除资产会同步清理</li>
