@@ -13,6 +13,7 @@
 - DataProcessingService  清洗/标准化
 - SnapshotService        快照/操作日志
 """
+import logging
 import os
 from datetime import datetime, timedelta
 
@@ -28,6 +29,9 @@ from app.services import (
     export_task_manager,
 )
 from app.utils.response import success, fail
+from app.utils.media_auth import media_auth_required
+
+logger = logging.getLogger(__name__)
 from app.utils.decorators import role_required, retry_on_deadlock
 from app.utils.audit import get_current_user, current_role
 
@@ -278,8 +282,17 @@ def parse_userinfo():
             fields["collection_time"] = to_local_str(fields["collection_time"])
 
         return success({"fields": fields, "raw": data}, message="解析成功")
-    except Exception as e:
-        return fail(f"解析失败：{e}", 422)
+    except ValueError as e:
+        # 外部加密文件无可用密钥：保留可操作提示（用户需先上传外部密钥）
+        if "外部密钥" in str(e):
+            return fail(
+                "文件解密失败：数据库无可用外部密钥或密钥不匹配，"
+                "请先到「系统设置 → 外部密钥管理」上传外部密钥", 422)
+        logger.exception("解析 userInfo.json 失败")
+        return fail("解析失败，请检查文件格式后重试", 422)
+    except Exception:
+        logger.exception("解析 userInfo.json 失败")
+        return fail("解析失败，请检查文件格式后重试", 422)
 
 
 @data_bp.route("/parse-sync-data", methods=["POST"])
@@ -340,8 +353,17 @@ def parse_sync_data():
                 pass
 
         return success({"raw": raw}, message="解析成功")
-    except Exception as e:
-        return fail(f"解析失败：{e}", 422)
+    except ValueError as e:
+        # 外部加密文件无可用密钥：保留可操作提示（用户需先上传外部密钥）
+        if "外部密钥" in str(e):
+            return fail(
+                "文件解密失败：数据库无可用外部密钥或密钥不匹配，"
+                "请先到「系统设置 → 外部密钥管理」上传外部密钥", 422)
+        logger.exception("解析 sync_data.json 失败")
+        return fail("解析失败，请检查文件格式后重试", 422)
+    except Exception:
+        logger.exception("解析 sync_data.json 失败")
+        return fail("解析失败，请检查文件格式后重试", 422)
 
 
 @data_bp.route("/parse-scale", methods=["POST"])
@@ -407,8 +429,17 @@ def parse_scale_data():
             result["summary"] = summary
 
         return success(result, message="解析成功")
-    except Exception as e:
-        return fail(f"解析失败：{e}", 422)
+    except ValueError as e:
+        # 外部加密文件无可用密钥：保留可操作提示（用户需先上传外部密钥）
+        if "外部密钥" in str(e):
+            return fail(
+                "文件解密失败：数据库无可用外部密钥或密钥不匹配，"
+                "请先到「系统设置 → 外部密钥管理」上传外部密钥", 422)
+        logger.exception("解析量表 JSON 失败")
+        return fail("解析失败，请检查文件格式后重试", 422)
+    except Exception:
+        logger.exception("解析量表 JSON 失败")
+        return fail("解析失败，请检查文件格式后重试", 422)
 
 
 @data_bp.route("/assets/upload", methods=["POST"])
@@ -461,7 +492,7 @@ def batch_create_assets():
 # ====================== 文件下载与播放 ======================
 
 @data_bp.route("/assets/<int:asset_id>/file", methods=["GET"])
-@role_required(Role.ADMIN)
+@media_auth_required("asset_file", resource_key="asset_id", roles=(Role.ADMIN,))
 def serve_asset_file(asset_id):
     """流式提供数据文件原始下载（仅 ADMIN）
     鉴权：仅管理员可调用，用于下载原始文件。普通角色请用 /play 在线播放。
@@ -479,10 +510,11 @@ def serve_asset_file(asset_id):
 
 
 @data_bp.route("/assets/<int:asset_id>/play", methods=["GET"])
-@jwt_required()
+@media_auth_required("asset_play", resource_key="asset_id")
 def play_asset(asset_id):
     """播放数据文件：浏览器原生格式直接流，其余视频格式自动转码为 H.264 MP4 后流式播放
-    鉴权：登录用户可通过 ?access_token=xxx 或 Authorization 头访问（仅在线播放，不能下载原文件）。
+    鉴权：优先 ?media_token=<短期签名>（由 /api/media/signed-url 签发，资源绑定、5 分钟过期）；
+    兼容 ?access_token=<JWT> 或 Authorization 头（仅在线播放，不能下载原文件）。
     转码结果缓存到 {DATA_LAKE_DIR}/.transcodes/{asset_id}.mp4，首次较慢，后续秒开。
     加密文件播放流程：源文件解密到临时文件 -> 转码/直接播放 -> 响应后清理临时文件。
     """
@@ -540,29 +572,30 @@ def export_assets_progress(task_id):
 
 
 @data_bp.route("/assets/export/download/<task_id>", methods=["GET"])
-@role_required(Role.ADMIN)
+@media_auth_required("asset_export", resource_key="task_id", roles=(Role.ADMIN,))
 def export_assets_download(task_id):
     """下载已完成的导出 zip（仅 ADMIN）
 
-    下载后自动清理临时文件。仅限 status=success 的任务。
+    流式发送（不整读内存），响应 body 发送完成后自动清理临时文件与任务。
+    仅限 status=success 的任务。
     """
-    import io as _io
     result = export_task_manager.download_task(task_id)
     if not result:
         return fail("任务未完成或不存在", 404)
     zip_path, filename = result
-    # 读取到内存后立即清理任务和临时文件
-    try:
-        with open(zip_path, "rb") as f:
-            buf = _io.BytesIO(f.read())
-        buf.seek(0)
-    finally:
+    if not os.path.exists(zip_path):
         export_task_manager.cleanup_task(task_id)
-    return send_file(
-        buf, as_attachment=True,
+        return fail("导出文件不存在或已清理", 404)
+
+    resp = send_file(
+        zip_path, as_attachment=True,
         download_name=filename, mimetype="application/zip",
-        max_age=0,
+        max_age=0, conditional=True,
     )
+    # call_on_close 在响应 body 完全发送后执行，避免 after_request 在
+    # 大文件流式传输前删除文件（Windows 上删除被占用文件会失败）
+    resp.call_on_close(lambda: export_task_manager.cleanup_task(task_id))
+    return resp
 
 
 # ====================== 数据清洗与标准化 ======================

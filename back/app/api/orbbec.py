@@ -18,6 +18,7 @@
 - POST /api/orbbec/upload           将已录制 mkv 入库为数据资产（复用 AssetService）
 """
 import json
+import logging
 import os
 import select
 import subprocess
@@ -36,6 +37,9 @@ from app.services import AssetService
 from app.utils.response import success, fail
 from app.utils.decorators import role_required
 from app.utils.audit import current_role
+from app.utils.media_auth import media_auth_required
+
+logger = logging.getLogger(__name__)
 
 # ==================== 容器内录制 ====================
 # 容器内 pyk4a 直接录制深度摄像头（需 usbipd 透传 USB，见 ensure_usb_nodes.py）。
@@ -534,6 +538,7 @@ def status():
             "serial": _container_rec.serial,
             "recording": _camera.recording,
             "previewing": _camera.active,
+            "color_res": _camera._color_res,   # 当前相机会话的彩色分辨率（720P/1080P，未启动为 None）
             "mode": "container",
         })
     return success({
@@ -616,8 +621,9 @@ def record_start():
                 },
             })
         return success({"record_id": "default", "path": out_dir}, message="录制已启动")
-    except Exception as e:
-        return fail(f"启动录制失败：{e}", 503)
+    except Exception:
+        logger.exception("Orbbec 启动录制失败")
+        return fail("启动录制失败，请检查相机状态后重试", 503)
 
 
 @orbbec_bp.route("/record/stop", methods=["POST"])
@@ -646,8 +652,9 @@ def record_stop():
         # 后台：剥离 IR 轨(只留彩色+深度) → 生成预览
         threading.Thread(target=_post_process, args=(mkv_path, mkv_rel, _fps), daemon=True).start()
         return success({"path": mkv_path}, message="录制已停止")
-    except Exception as e:
-        return fail(f"停止录制失败：{e}", 503)
+    except Exception:
+        logger.exception("Orbbec 停止录制失败")
+        return fail("停止录制失败，请重试", 503)
 
 
 @orbbec_bp.route("/record/status", methods=["GET"])
@@ -690,10 +697,11 @@ def preview_stop():
 
 
 @orbbec_bp.route("/preview/stream", methods=["GET"])
-@jwt_required()
+@media_auth_required("orbbec_stream")
 def preview_stream():
     """实时预览 MJPEG 流（multipart/x-mixed-replace，浏览器 <img> 直接播放）
 
+    鉴权：优先 ?media_token=<短期签名>，兼容 JWT（header / access_token query）。
     录制中从录制线程扇出的彩色帧读取（录制不丢帧），非录制时直接取设备帧，
     均节流 ~10fps。客户端断开即结束。
     """
@@ -753,9 +761,12 @@ def preview_stream():
 
 
 @orbbec_bp.route("/preview", methods=["GET"])
-@jwt_required()
+@media_auth_required("orbbec_preview", resource_key="path")
 def preview():
-    """返回录制预览 mp4（从容器内录制目录读取）"""
+    """返回录制预览 mp4（从容器内录制目录读取）
+
+    鉴权：优先 ?media_token=<短期签名>（绑定 path），兼容 JWT。
+    """
     rel = (request.args.get("path") or "").lstrip("/\\")
     if not rel or ".." in rel.replace("\\", "/").split("/"):
         return fail("无效路径", 400)
@@ -802,6 +813,12 @@ def upload_recorded():
             path = alt
         else:
             return fail(f"录制文件不存在：{path}", 404)
+    # 路径穿越防护：仅允许容器录制目录内的文件入库（与 realsense 上传一致），
+    # 防止伪造路径把容器内任意文件包装成数据资产
+    _rec_root = os.path.realpath(ORBBEC_REC_DIR)
+    _file_real = os.path.realpath(path)
+    if not (_file_real == _rec_root or _file_real.startswith(_rec_root + os.sep)):
+        return fail("无效的录制路径（仅允许容器录制目录内文件）", 422)
 
     # 裁剪：前端只生成本地预览 blob，这里按裁剪区间对原始 mkv 双轨（彩色+深度）
     # 一起做精确无损裁剪后再入库，确保入库文件即裁剪后的片段且深度同步。
@@ -848,19 +865,23 @@ def upload_recorded():
             meta.update({"orbbec": extra_meta})
             asset.metadata_json = meta
             db.session.commit()
-    except Exception as e:
-        return fail(f"入库失败：{e}", 500)
+    except Exception:
+        logger.exception("Orbbec 录制入库失败")
+        return fail("入库失败，请稍后重试", 500)
 
     # 入库后清理容器内临时录制文件（数据湖已存副本）：
     # 1) 删除上传的 mkv；
     # 2) 若位于容器录制目录，连带删除该次录制的目录（含 preview.mp4 预览残片），
     #    避免容器磁盘被长期占用。
+    # 清理前再次校验 realpath 前缀：只删除录制目录内文件，防止误删其他路径。
     try:
-        os.remove(path)
-        parent = os.path.dirname(path)
-        if parent.startswith(ORBBEC_REC_DIR) and parent != ORBBEC_REC_DIR:
-            import shutil
-            shutil.rmtree(parent, ignore_errors=True)
+        _file_real = os.path.realpath(path)
+        if _file_real == _rec_root or _file_real.startswith(_rec_root + os.sep):
+            os.remove(path)
+            parent = os.path.dirname(_file_real)
+            if parent != _rec_root and parent.startswith(_rec_root + os.sep):
+                import shutil
+                shutil.rmtree(parent, ignore_errors=True)
     except Exception:
         pass
 

@@ -22,6 +22,7 @@ pyrealsense2 是 C 库，所有调用通过子进程 realsense_child.py 隔离�
 - POST /api/realsense/upload           将录制入库为数据资产（复用 AssetService）
 """
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -37,8 +38,11 @@ from app.extensions import db
 from app.models import Role
 from app.services import AssetService
 from app.utils.response import success, fail
+
+logger = logging.getLogger(__name__)
 from app.utils.decorators import role_required
 from app.utils.audit import current_role
+from app.utils.media_auth import media_auth_required
 
 # ==================== 常量 ====================
 # 容器内录制目录（与 orbbec_recordings 相同：容器本地盘，写入快）
@@ -203,9 +207,12 @@ def preview_stop():
 
 
 @realsense_bp.route("/preview/stream", methods=["GET"])
-@jwt_required()
+@media_auth_required("realsense_stream")
 def preview_stream():
-    """实时预览 MJPEG 流：透传子进程 stdout（multipart/x-mixed-replace）"""
+    """实时预览 MJPEG 流：透传子进程 stdout（multipart/x-mixed-replace）
+
+    鉴权：优先 ?media_token=<短期签名>，兼容 JWT（header / access_token query）。
+    """
     with _proc_lock:
         proc = _stream_proc
     if proc is None or proc.poll() is not None:
@@ -315,9 +322,12 @@ def record_status():
 
 
 @realsense_bp.route("/preview", methods=["GET"])
-@jwt_required()
+@media_auth_required("realsense_preview", resource_key="path")
 def preview():
-    """返回录制预览 mp4（color.mp4）"""
+    """返回录制预览 mp4（color.mp4）
+
+    鉴权：优先 ?media_token=<短期签名>（绑定 path），兼容 JWT。
+    """
     rel = (request.args.get("path") or "").lstrip("/\\")
     if not rel or ".." in rel.replace("\\", "/").split("/"):
         return fail("无效路径", 400)
@@ -416,8 +426,9 @@ def upload_recorded():
             ameta.update({"realsense": extra_meta})
             color_asset.metadata_json = ameta
             db.session.commit()
-    except Exception as e:
-        return fail(f"入库失败：{e}", 500)
+    except Exception:
+        logger.exception("RealSense 录制入库失败")
+        return fail("入库失败，请稍后重试", 500)
 
     # 入库后删除录制目录（数据湖已存副本；color.mp4/depth.mp4 已被 AssetService 复制/加密落盘）
     import shutil
