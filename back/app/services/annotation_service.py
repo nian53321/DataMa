@@ -314,13 +314,23 @@ class AnnotationService(BaseService):
 
         created = []
         skipped = []
+        # 一次预取资产与既有任务（批量建任务 2N → 2 条 SQL）
+        asset_map = {
+            a.id: a for a in
+            DataAsset.query.filter(DataAsset.id.in_(asset_ids)).all()
+        }
+        existing_map = {}
+        for t in AnnotationTask.query.filter(
+            AnnotationTask.data_asset_id.in_(asset_ids)
+        ).all():
+            existing_map.setdefault(t.data_asset_id, t)
         for aid in asset_ids:
-            asset = DataAsset.query.get(aid)
+            asset = asset_map.get(aid)
             if not asset:
                 skipped.append({"id": aid, "reason": "资产不存在"})
                 continue
             # 跳过已有非终态（rejected）任务的资产
-            existing = AnnotationTask.query.filter_by(data_asset_id=aid).first()
+            existing = existing_map.get(aid)
             if existing and existing.status != AnnotationStatus.REJECTED:
                 skipped.append({"id": aid, "reason": "已有进行中的标注任务"})
                 continue

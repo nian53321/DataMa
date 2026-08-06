@@ -40,8 +40,21 @@ class DataProcessingService(BaseService):
 
         cleaned = []
         skipped = []
+        # 一次预取全部资产 + 各资产现有版本数（group_by 聚合），避免逐条查询（2N → 2 条 SQL）
+        asset_map = {
+            a.id: a for a in
+            DataAsset.query.filter(DataAsset.id.in_(asset_ids)).all()
+        }
+        version_counts = dict(
+            db.session.query(
+                DataVersion.data_asset_id, db.func.count(DataVersion.id),
+            )
+            .filter(DataVersion.data_asset_id.in_(asset_ids))
+            .group_by(DataVersion.data_asset_id)
+            .all()
+        )
         for aid in asset_ids:
-            asset = DataAsset.query.get(aid)
+            asset = asset_map.get(aid)
             if not asset:
                 skipped.append({"id": aid, "reason": "资产不存在"})
                 continue
@@ -52,7 +65,7 @@ class DataProcessingService(BaseService):
             asset.status = "cleaned"
             asset.layer = DataLayer.CLEANED
             # 创建版本记录
-            version_no = DataVersion.query.filter_by(data_asset_id=aid).count() + 1
+            version_no = version_counts.get(aid, 0) + 1
             self.session.add(DataVersion(
                 data_asset_id=aid,
                 version_no=version_no,
@@ -94,8 +107,21 @@ class DataProcessingService(BaseService):
 
         standardized = []
         skipped = []
+        # 一次预取全部资产 + 各资产现有版本数（group_by 聚合），避免逐条查询（2N → 2 条 SQL）
+        asset_map = {
+            a.id: a for a in
+            DataAsset.query.filter(DataAsset.id.in_(asset_ids)).all()
+        }
+        version_counts = dict(
+            db.session.query(
+                DataVersion.data_asset_id, db.func.count(DataVersion.id),
+            )
+            .filter(DataVersion.data_asset_id.in_(asset_ids))
+            .group_by(DataVersion.data_asset_id)
+            .all()
+        )
         for aid in asset_ids:
-            asset = DataAsset.query.get(aid)
+            asset = asset_map.get(aid)
             if not asset:
                 skipped.append({"id": aid, "reason": "资产不存在"})
                 continue
@@ -110,7 +136,7 @@ class DataProcessingService(BaseService):
             if type_key in rates and rates[type_key]:
                 asset.sample_rate = rates[type_key]
             # 创建版本记录
-            version_no = DataVersion.query.filter_by(data_asset_id=aid).count() + 1
+            version_no = version_counts.get(aid, 0) + 1
             self.session.add(DataVersion(
                 data_asset_id=aid,
                 version_no=version_no,

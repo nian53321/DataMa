@@ -54,6 +54,15 @@ class RoleService(BaseService):
         role_defs = RoleDef.query.order_by(
             RoleDef.sort_order.asc(), RoleDef.id.asc()
         ).all()
+        # 一次 group_by 聚合各角色用户数，避免逐角色 COUNT 查询（N → 1 条 SQL）
+        role_keys = [rd.role_key for rd in role_defs]
+        user_count_rows = (
+            db.session.query(User.role, db.func.count(User.id))
+            .filter(User.role.in_(role_keys))
+            .group_by(User.role)
+            .all()
+        )
+        user_count_map = dict(user_count_rows)
         result = []
         for rd in role_defs:
             result.append({
@@ -65,7 +74,7 @@ class RoleService(BaseService):
                 "sort_order": rd.sort_order or 0,
                 "menus": get_role_menus(rd.role_key),
                 "is_admin": rd.role_key == "admin",
-                "user_count": User.query.filter_by(role=rd.role_key).count(),
+                "user_count": user_count_map.get(rd.role_key, 0),
             })
         return {
             "roles": result,
