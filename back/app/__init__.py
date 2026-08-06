@@ -295,7 +295,11 @@ def create_app(env=None):
     # 全局异常处理
     @app.errorhandler(HTTPException)
     def handle_http_error(e):
-        return jsonify({"code": e.code, "message": e.description, "data": None}), e.code
+        if e.code == 413:
+            message = "上传文件过大（超过 512MB 限制），请拆分后重试"
+        else:
+            message = e.description
+        return jsonify({"code": e.code, "message": message, "data": None}), e.code
 
     # 业务异常：service 层抛 ServiceError 子类，统一转 JSON 响应
     from app.services import ServiceError

@@ -10,8 +10,11 @@
 - 立即扫描失败抛 ServiceError(code=500)
 - 扫描调度（_schedule_next）由路由层在 CRUD 完成后调用，保持 service 独立性
 """
+import logging
 import os
 from typing import List
+
+logger = logging.getLogger(__name__)
 
 from app.extensions import db
 from app.models.scan_config import ScanConfig
@@ -134,7 +137,8 @@ class ScanConfigService(BaseService):
         try:
             result = scan_watch_dir(config)
         except Exception as e:
-            raise ServiceError(f"扫描失败：{e}", code=500)
+            logger.error("立即扫描失败 config_id=%s: %s", config_id, e, exc_info=True)
+            raise ServiceError("扫描失败，请检查监控目录可读性与外部密钥配置", code=500)
         new_count = result.get("new_count", 0)
         failures = result.get("failures", [])
         log_msg = f"手动扫描：{config.name}，新增 {new_count} 个受试者"

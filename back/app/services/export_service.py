@@ -367,10 +367,17 @@ class ExportTaskManager:
                 task["percent"] = 100
                 task["status"] = "success"
                 task["status_text"] = "压缩完成，准备下载"
-            except Exception as e:
+            except ValidationError as e:
+                # 业务校验错误（超限/未选择等）：消息可直接提示用户
                 task["status"] = "failed"
                 task["error"] = str(e)
                 task["status_text"] = f"打包失败：{e}"
+            except Exception as e:
+                # 底层 IO/解析等异常：记录完整信息到服务端日志，前端只返回分类化提示
+                app.logger.error("导出任务 %s 失败: %s", task_id, e, exc_info=True)
+                task["status"] = "failed"
+                task["error"] = "导出失败：服务器内部错误，请查看服务端日志"
+                task["status_text"] = "导出失败，请稍后重试或联系管理员"
             finally:
                 # 释放线程局部的数据库会话
                 try:
