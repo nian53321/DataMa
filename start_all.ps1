@@ -27,6 +27,16 @@ $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
+# 修复 WSL / usbipd 输出中文乱码：这些工具输出 UTF-8，而 Windows PowerShell 5.1
+# 默认控制台代码页是 GBK（936），UTF-8 字节流被按 GBK 解码会显示为乱码，
+# 且会导致中文字符串匹配失败（如 usbipd list 中的"描述符请求失败"）。
+# 将控制台输入/输出编码统一设为 UTF-8，保证中文提示正常显示与匹配。
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { /* 部分宿主（如受限终端）不支持修改编码时静默忽略 */ }
+
 $FrontendPort = 8080
 
 function Write-Step { param($msg) Write-Host "`n[步骤] $msg" -ForegroundColor Cyan }
@@ -112,7 +122,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-OK 'Docker 服务已启动'
 
-# ============ 3. 等待后端健康检查 ============
+# ============ 4. 等待后端健康检查 ============
 Write-Step '等待后端就绪'
 $healthUrl = "http://localhost:$FrontendPort/api/health"
 $healthy = $false
@@ -129,7 +139,7 @@ for ($i = 0; $i -lt 40; $i++) {
 if ($healthy) { Write-OK '后端已就绪' }
 else { Write-Warn '后端 120s 内未通过健康检查，请查看 docker compose logs backend' }
 
-# ============ 4. 完成 ============
+# ============ 5. 完成 ============
 Write-Host ''
 Write-Host '========================================' -ForegroundColor Green
 Write-Host ' 平台已启动' -ForegroundColor Green

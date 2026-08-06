@@ -43,6 +43,19 @@ $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
+# 修复 WSL 输出中文乱码：WSL 内部输出 UTF-8，而 Windows PowerShell 5.1
+# 默认控制台代码页是 GBK（936），UTF-8 字节流被按 GBK 解码会显示为乱码
+#（例如 wsl 提示"检测到 localhost 代理配置"时显示为乱码）。
+# 将控制台输入/输出编码统一设为 UTF-8，保证 wsl 命令的中文提示正常显示。
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { /* 部分宿主（如受限终端）不支持修改编码时静默忽略 */ }
+# WSL 官方支持的环境变量：强制 wsl.exe 以 UTF-8 输出（否则在管道/重定向下
+# 可能输出 UTF-16，同样导致中文乱码），且避免 localhost 代理警告被 GBK 解码
+$env:WSL_UTF8 = '1'
+
 # ---------- 自动提权（usbipd bind/attach 需要管理员） ----------
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)

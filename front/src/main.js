@@ -7,7 +7,12 @@ import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 
 import App from './App.vue'
 import router from './router'
+import { checkDeploymentReset } from '@/utils/auth'
 import './styles/main.scss'
+
+// 在 store/router 初始化前检测：若前端已重新构建/部署，自动清空旧登录缓存
+// （旧 token 由旧 JWT_SECRET_KEY 签发已失效），避免浏览器残留旧信息导致"伪登录"
+checkDeploymentReset()
 
 const app = createApp(App)
 

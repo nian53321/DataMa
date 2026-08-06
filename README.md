@@ -216,6 +216,26 @@ usbipd list
 - 物理拔插摄像头之后（容器内检测不到设备时）
 - `orbbec/status` 返回 `available=false` 时
 
+### 取消透传（将摄像头归还 Windows 本机）
+
+平台透传期间摄像头从 Windows 侧"消失"（被挂到 WSL），如需在 Windows 本机直接使用摄像头
+（如用官方 SDK / 采集软件读取），可运行取消透传脚本：
+
+```powershell
+cd <项目目录>
+.\detach_orbbec_usb.ps1           # 取消透传，设备归还本机（保留共享标记）
+.\detach_orbbec_usb.ps1 -Unbind   # 取消透传并取消共享注册（完全归还本机）
+.\detach_orbbec_usb.ps1 -All      # 取消所有 USB 设备的透传
+```
+
+脚本自动完成：定位 usbipd → 查找深度摄像头（VID 2bc5:066b / 8086）→ detach → 验证。
+
+- **默认（不加参数）**：执行 `detach` 取消透传，设备对 Windows 重新可见，但保留共享标记（`usbipd list` 中仍显示 `Shared`），之后可随时运行 `reset_orbbec_usb.ps1` 恢复容器内透传。
+- **`-Unbind`**：额外执行 `unbind` 取消共享注册，设备完全归还本机（`usbipd list` 中显示 `Not shared`）；若之后需要恢复容器内透传，`reset_orbbec_usb.ps1` 会自动重新 bind + attach。
+- **`-All`**：取消当前所有透传状态的 USB 设备（不限于深度摄像头）。
+
+> 注意：若容器仍在运行且之前已透传，取消透传后容器内深度相机将不可用（`orbbec/status` 返回 `available=false`），这是预期行为；需要时重新运行 `reset_orbbec_usb.ps1` 即可恢复。
+
 ## 部署方式（三步：先装、再透传、后启动）
 
 > 以下命令均在**项目根目录**（docker-compose.yml 所在目录）执行，`<项目目录>` 请替换为项目实际所在路径。
@@ -319,7 +339,7 @@ docker compose up -d --build
 
 首次启动需要拉取镜像 + npm install + pip install，约 5-10 分钟。
 
-首次启动后 `back/keys/master.key` 与 `back/keys/desens.key` 由后端自动生成（挂载目录可读写），请勿删除；备份时随项目目录一并带走。
+首次启动后 `back/keys/master.key` 由后端自动生成（挂载目录可读写），请勿删除；`back/keys/desens.key`（脱敏 HMAC 密钥）在首次执行 hash 脱敏时自动生成。备份时随项目目录一并带走。
 
 ##### 步骤 4：验证
 
@@ -536,12 +556,21 @@ docker compose up -d                      # 启动剩余服务
 - 若提示 WSL 发行版失败：确认已 `wsl --install -d Ubuntu`，或用 `-WslDistro` 指定实际发行版名
 
 ### Q11：修改密钥/重新部署后接口全部返回 422
-- **原因**：`JWT_SECRET_KEY` 变化后，浏览器 localStorage 里的旧 token（旧密钥签名）失效，flask_jwt_extended 对无效 token 默认返回 422，所以部署脚本只能在第一次使用。
-- **解决**：**重新登录一次**即可；若持续出现，确认 `back/.env` 中 `JWT_SECRET_KEY` 的值正确（密钥不要含 `$`——compose 会插值改写；若含 `#` 需放在值中间或加引号，避免行首 `#` 被当注释截断）
+- **原因**：`JWT_SECRET_KEY` 变化后，浏览器 localStorage 里的旧 token（旧密钥签名）失效，flask_jwt_extended 对无效 token 默认返回 422。
+- **解决**：**重新登录一次**即可。新版前端已内置"部署版本检测"（每次构建注入时间戳，页面加载时若检测到部署已更新会自动清空 localStorage 中的 token / userInfo / menus 并跳转登录页），因此**重新部署后首次打开页面会自动清除旧登录缓存，无需手动清浏览器**。若持续出现，确认 `back/.env` 中 `JWT_SECRET_KEY` 的值正确（密钥不要含 `$`——compose 会插值改写；若含 `#` 需放在值中间或加引号，避免行首 `#` 被当注释截断）
 
 ### Q12：backend 日志提示"主密钥初始化失败 / 文件加密不可用"
 - **原因**：旧版本把单文件 `back/master.key` 以 `:ro` 绑定挂载到容器 `/app/master.key`，宿主机文件缺失时 Docker 会创建同名**目录**，后端无法生成密钥文件，文件加密被禁用。
 - **解决**：拉取新版（挂载已改为 `./back/keys:/app/keys` 目录方案）：删除失效目录 `Remove-Item back\master.key -Recurse`，重新 `docker compose up -d --build`，首次启动后自动生成 `back/keys/master.key`。若仍有已加密数据，请先从旧部署备份 `back/master.key` 文件并放入 `back/keys/master.key`。
+
+### Q13：运行 `reset_orbbec_usb.ps1` 时 wsl 输出中文乱码
+- **原因**：WSL 内部输出 UTF-8（如 `wsl: 检测到 localhost 代理配置，但未镜像到 WSL。NAT 模式下的 WSL 不支持 localhost 代理` 的提示），而 Windows PowerShell 5.1 默认控制台代码页是 GBK（936），UTF-8 字节流被按 GBK 解码后显示为乱码；且 wsl 在管道/重定向场景下可能输出 UTF-16 同样导致乱码。
+- **解决**：新版脚本已内置修复——启动时自动将控制台输入/输出编码设为 UTF-8 并设置 `WSL_UTF8=1` 环境变量（强制 wsl.exe 以 UTF-8 输出）。重新拉取最新脚本后运行即可。若自行在 PowerShell 中手动执行 wsl 命令仍出现乱码，可先执行：
+  ```powershell
+  chcp 65001
+  $env:WSL_UTF8 = '1'
+  ```
+  关于 `localhost 代理` 提示本身：它是 WSL 的**警告而非错误**（宿主机配置了系统代理但 WSL 处于 NAT 模式无法自动继承 localhost 代理），不影响 USB 透传功能；如需消除，可在 `%USERPROFILE%\.wslconfig` 中配置 `networkingMode=mirrored`（注意 usbipd-win 5.x 与 mirrored 模式存在已知兼容问题，见 `reset_orbbec_usb.ps1` 内置检查，建议保持默认 NAT 模式并忽略该警告）。
 
 ## 生产环境加固建议
 
@@ -560,19 +589,20 @@ DataManagement/
 ├── deploy.ps1                  # 一键部署脚本（Windows，生成 .env + 构建启动）
 ├── start_all.ps1               # 日常启动脚本（检查摄像头透传 + 启动 Docker）
 ├── reset_orbbec_usb.ps1        # 深度摄像头 USB 透传/恢复脚本（管理员身份运行）
+├── detach_orbbec_usb.ps1       # 深度摄像头取消透传脚本（归还 Windows 本机，管理员身份运行）
+├── reset_orbbec_firmware.ps1   # Orbbec 固件恢复脚本（管理员身份运行）
 ├── README.md                   # 本文档
-├── camera_service/             # 宿主机采集服务（旧架构降级路径，已不再自动启动；主路径是容器内 pyk4a）
-│   ├── orbbec_server.py        # 采集服务源码（录制 .mkv）
-│   └── build_orbbec_server.ps1 # 打包采集服务 exe 的脚本
 ├── back/                       # 后端
 │   ├── Dockerfile
 │   ├── .dockerignore
 │   ├── .env.example            # 环境变量模板
 │   ├── .env                    # 实际环境变量（不入 git）
-│   ├── keys/                   # 加密主密钥 master.key + 脱敏密钥 desens.key（首次启动自动生成，不入 git）
+│   ├── keys/                   # 加密主密钥 master.key（首次启动自动生成，不入 git）
 │   ├── requirements.txt
 │   ├── gunicorn_config.py
 │   ├── run.py                  # Flask 入口
+│   ├── ensure_usb_nodes.py     # 深度摄像头 USB 设备节点创建（容器启动时执行）
+│   ├── wait_for_mysql.py       # 等待 MySQL 就绪（容器启动时执行，避免首次部署重启）
 │   ├── app/
 │   │   ├── __init__.py         # 应用工厂
 │   │   ├── config.py           # 配置（含生产环境校验）
@@ -609,10 +639,7 @@ DataManagement/
 │   │       ├── response.py             # 统一响应格式
 │   │       ├── decorators.py           # role_required / retry_on_deadlock
 │   │       └── ...
-│   ├── migrations/             # Alembic 迁移
-│   ├── scripts/                # 一次性脚本（迁移加密、文件鉴权测试）
-│   ├── tests/                  # pytest 测试套件（326 通过）
-│   └── data_lake/              # 数据湖（运行时挂载为 volume）
+│   └── scripts/                # 摄像头采集子进程脚本（orbbec_camera_proc.py / realsense_child.py）
 └── front/                      # 前端
     ├── Dockerfile              # 多阶段构建
     ├── .dockerignore
@@ -626,3 +653,5 @@ DataManagement/
         ├── App.vue
         └── main.js
 ```
+
+> 说明：`camera_service/`（宿主机采集服务）为旧架构降级路径，已被容器内 pyk4a / pyrealsense2 直连取代，仓库中不再包含；`back/migrations/`、`back/tests/`、`back/data_lake/` 为运行时生成或未纳入 git 管理的目录（数据湖实际存于 Docker volume `backend-data`）。

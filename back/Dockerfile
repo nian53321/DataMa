@@ -50,5 +50,6 @@ RUN mkdir -p /app/orbbec_recordings /app/realsense_recordings
 
 EXPOSE 5000
 
-# 生产环境使用 gunicorn（启动前先创建深度摄像头 USB 设备节点，见 ensure_usb_nodes.py）
-CMD ["sh", "-c", "python ensure_usb_nodes.py && exec gunicorn -c gunicorn_config.py run:app"]
+# 生产环境使用 gunicorn（启动前先创建深度摄像头 USB 设备节点，见 ensure_usb_nodes.py；
+# 再等待 MySQL 就绪，见 wait_for_mysql.py，避免首次部署时 MySQL 未就绪导致反复重启）
+CMD ["sh", "-c", "python ensure_usb_nodes.py && python wait_for_mysql.py && exec gunicorn -c gunicorn_config.py run:app"]

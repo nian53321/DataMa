@@ -24,4 +24,7 @@ celery_app.conf.update(
     enable_utc=False,
     task_track_started=True,
     result_expires=86400,
+    # Celery 5.x 起启动时不再默认重试 broker 连接；显式开启，
+    # 避免 Redis 尚未就绪时 worker 直接退出（Celery 6.0 将强制要求该配置）
+    broker_connection_retry_on_startup=True,
 )

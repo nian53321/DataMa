@@ -42,10 +42,13 @@ services:
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD:-DataMgmt2026Secure}"]
+      # 用 127.0.0.1 强制走 TCP（-h localhost 走 unix socket，MySQL 初始化阶段
+      # temporary server 阶段就会通过，导致 backend 过早启动、连接被拒多次重启）
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${DB_PASSWORD:-DataMgmt2026Secure}"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 20s
     restart: unless-stopped
 
   redis:

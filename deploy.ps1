@@ -378,7 +378,7 @@ Write-Host ''
 Write-Host " 访问地址:  http://localhost:$FrontendPort" -ForegroundColor White
 Write-Host ' 默认账号:  admin / admin123' -ForegroundColor White
 Write-Host " 健康检查:  http://localhost:$FrontendPort/api/health" -ForegroundColor White
-Write-Host ' API 文档:  http://localhost:5000/api/health (直连后端调试)' -ForegroundColor DarkGray
+Write-Host " 后端直连:  http://localhost:$BackendPort/api/health (调试用)" -ForegroundColor DarkGray
 Write-Host ''
 
 if ($dbPassword) {
@@ -400,6 +400,6 @@ Write-Host '   完全卸载:  docker compose down'
 Write-Host ''
 Write-Host ' 安全提醒:' -ForegroundColor Red
 Write-Host '   1. 首次登录后请立即修改 admin 密码'
-Write-Host '   2. 请备份 back/master.key（丢失后所有加密数据无法恢复）'
+Write-Host '   2. 请备份 back/keys/master.key（丢失后所有加密数据无法恢复）'
 Write-Host '   3. 请备份 back/.env（含 DB_PASSWORD 和 JWT_SECRET_KEY）'
 Write-Host ''

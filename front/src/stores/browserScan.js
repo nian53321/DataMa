@@ -15,6 +15,11 @@ import {
   runBrowserScan, loadSubjectCache, loadUploadedMap, saveUploadedMap,
 } from '@/utils/browserScan'
 
+// 用户主动停止标志：持久化到 localStorage。
+// 用户点击"停止监控"后刷新页面，autoResumeIfGranted 检测到该标志将不再自动恢复
+//（目录句柄仍在 IndexedDB 中，但需用户再次点击"开始监控"才恢复）。
+const USER_STOPPED_KEY = 'browser_scan_user_stopped'
+
 export const useBrowserScanStore = defineStore('browserScan', () => {
   const state = reactive({
     supported: supportsFsAccess(),
@@ -62,9 +67,15 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
   /**
    * 权限仍有效则自动恢复监控（刷新页面后调用，无需用户点击）。
    * 仅权限降级（prompt/denied，需用户手势授权）时保留 pendingRestore。
+   * 用户主动点击过"停止监控"时不会自动恢复（保持停止状态）。
    */
   const autoResumeIfGranted = async () => {
     if (!state.handle) return false
+    // 用户主动停止过：刷新后保持停止状态，不自动恢复
+    if (localStorage.getItem(USER_STOPPED_KEY)) {
+      state.pendingRestore = false
+      return false
+    }
     if (state.running || _watchTimer) {
       state.pendingRestore = false
       return true
@@ -86,6 +97,8 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
       _uploadedMap = {}
       saveUploadedMap(_uploadedMap)
       state.pendingRestore = false
+      // 重新选择目录视为新的开始：清除"主动停止"标志
+      localStorage.removeItem(USER_STOPPED_KEY)
       return true
     } catch (e) {
       if (e?.name === 'AbortError') return false
@@ -105,6 +118,8 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
     state.failures = []
     state.pendingRestore = false
     state.lastScanAt = ''
+    // 目录已移除，清除"主动停止"标志（后续选择新目录后刷新可自动恢复）
+    localStorage.removeItem(USER_STOPPED_KEY)
   }
 
   const _doScan = async () => {
@@ -151,6 +166,8 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
     try { await loadSubjectCache() } catch { /* 缓存加载失败不阻断 */ }
     state.running = true
     state.pendingRestore = false
+    // 用户明确重新开始监控：清除"主动停止"标志，允许后续刷新自动恢复
+    localStorage.removeItem(USER_STOPPED_KEY)
     await _doScan()
     const sec = Math.max(1, state.intervalSec)
     _watchTimer = setInterval(_doScan, sec * 1000)
@@ -162,6 +179,8 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
       clearInterval(_watchTimer)
       _watchTimer = null
     }
+    // 持久化"用户主动停止"标志：刷新页面后不再自动恢复监控
+    localStorage.setItem(USER_STOPPED_KEY, '1')
   }
 
   /** 刷新页面后恢复监控（需用户点击触发，FSA 权限需要 user activation） */
