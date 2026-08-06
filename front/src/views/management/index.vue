@@ -334,6 +334,9 @@
         <el-table-column prop="file_format" label="格式" width="80">
           <template #default="{ row }">{{ row.file_format || '—' }}</template>
         </el-table-column>
+        <el-table-column label="文件大小" width="110" align="right">
+          <template #default="{ row }">{{ formatFileSize(row.file_size) }}</template>
+        </el-table-column>
         <el-table-column prop="created_at" label="创建时间" min-width="160">
           <template #default="{ row }">{{ row.created_at || '—' }}</template>
         </el-table-column>
@@ -617,6 +620,9 @@
         <el-table-column prop="layer" label="分层" width="80" />
         <el-table-column prop="file_format" label="格式" width="80">
           <template #default="{ row }">{{ row.file_format || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="文件大小" width="100" align="right">
+          <template #default="{ row }">{{ formatFileSize(row.file_size) }}</template>
         </el-table-column>
         <el-table-column prop="status" label="状态" width="100" />
         <el-table-column label="操作" width="160" fixed="right">
@@ -2232,6 +2238,14 @@ const dataTypeTagType = (t) => ({
   video: 'danger', audio: 'primary', eeg: 'success', ecg: 'warning',
   eye: 'info', gait: 'info', scale: 'success', task: 'warning',
 }[t] || 'info')
+
+// 文件大小格式化：字节 → B/KB/MB/GB/TB
+const formatFileSize = (bytes) => {
+  if (!bytes || bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
+}
 
 const onViewModeChange = (mode) => {
   if (mode === 'type') {

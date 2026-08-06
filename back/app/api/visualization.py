@@ -62,7 +62,9 @@ def timeline(subject_id):
             {"id": a.id, "data_type": a.data_type.value, "file_name": a.file_name,
              "file_url": f"/api/data/assets/{a.id}/file",
              "file_format": a.file_format,
-             "offset_ms": a.align_offset_ms or 0}
+             "offset_ms": a.align_offset_ms or 0,
+             # 附带元数据（含 orbbec 深度视频信息），供前端识别深度视频
+             "metadata": a.metadata_json or {}}
             for a in assets
         ],
     })
@@ -596,6 +598,207 @@ def scale_asset_parse(asset_id):
         if summary:
             result["summary"] = summary
         return success(result)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _probe_video_streams(file_path):
+    """ffprobe 探测视频轨，返回流列表"""
+    import subprocess
+    p = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v",
+         "-show_entries", "stream=index,codec_name,width,height,pix_fmt",
+         "-of", "json", file_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        return (json.loads(p.stdout) or {}).get("streams", [])
+    except Exception:
+        return []
+
+
+def _is_depth_stream(s):
+    """判断视频流是否为深度轨（排除彩色/IR 轨）
+
+    兼容两类录制产物：
+    - 旧方案（pyk4a/k4arecorder）：深度轨 rawvideo（gray16be / rgb555le）；
+    - 新方案（orbbec_camera_proc 双 ffmpeg）：深度轨 ffv1 无损（gray16le/gray16be）。
+    """
+    codec = (s.get("codec_name") or "").lower()
+    pix_fmt = (s.get("pix_fmt") or "").lower()
+    if codec == "rawvideo":
+        return True
+    if codec == "ffv1" and pix_fmt in ("gray16le", "gray16be"):
+        return True
+    return False
+
+
+def _read_depth_frames(file_path, stream_index, w, h, step=1, src_pix_fmt=""):
+    """生成器：ffmpeg 提取深度轨帧，yield 每帧 float32 二维数组（无效像素=0）
+
+    step 为取样步长（select 滤镜每 step 帧取 1 帧），第一遍扫描用大步长提速。
+
+    深度轨 pix_fmt 因录制器而异（实测 pyk4a 写 rgb555le，k4arecorder 写 gray16be）：
+    - rgb555le（16bit 小端，bit15=无效标志，低13位为毫米值）：
+      必须按原格式透传（-pix_fmt rgb555le），若输出 gray16be 会被 ffmpeg 当作
+      RGB555 做色彩转换，彻底破坏深度值；
+    - gray16be/gray16le（16bit 值即深度）：统一输出 gray16be（16bit→16bit 仅换字节序，数值不变）。
+    """
+    import subprocess
+    import numpy as np
+    frame_bytes = w * h * 2
+    is_555 = "555" in (src_pix_fmt or "")
+    out_fmt = "rgb555le" if is_555 else "gray16be"
+    dtype = "<u2" if is_555 else ">u2"
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-i", file_path, "-map", f"0:{stream_index}",
+         "-vf", f"select='not(mod(n,{step}))'",
+         "-f", "rawvideo", "-pix_fmt", out_fmt, "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    try:
+        buf = b""
+        while True:
+            chunk = proc.stdout.read(1024 * 1024)
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= frame_bytes:
+                raw = np.frombuffer(buf[:frame_bytes], dtype=dtype).reshape(h, w)
+                if is_555:
+                    # rgb555le：bit15=1 为无效像素（深度不可信），低 13 位为毫米值
+                    frame = (raw & 0x1FFF).astype(np.float32)
+                    frame[(raw & 0x8000) != 0] = 0
+                else:
+                    frame = raw.astype(np.float32)
+                yield frame
+                buf = buf[frame_bytes:]
+    finally:
+        proc.stdout.close()
+        proc.wait(timeout=30)
+
+
+def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix_fmt=""):
+    """把 mkv 深度轨转码为伪彩色 MP4（H.264），像彩色视频一样可逐帧播放
+
+    两遍处理：第一遍下采样扫描全局深度范围（1%~99% 分位，排除 0 无效值），
+    第二遍逐帧归一化 + jet 伪彩色写入 cv2 中间文件，再用 ffmpeg 转 H.264：
+    浏览器（Chrome/Edge/Firefox）不支持 cv2 mp4v 输出的 MPEG-4 Part 2 编码，
+    仅 H.264 可在线播放；+faststart 让 moov 前置，视频可秒开。
+    """
+    import subprocess
+    import numpy as np
+    import cv2
+
+    # 第一遍：扫描全局深度范围
+    vals = []
+    for arr in _read_depth_frames(file_path, stream_index, w, h, step=30, src_pix_fmt=src_pix_fmt):
+        v = arr[arr > 0]
+        if v.size:
+            vals.append(v)
+    if not vals:
+        return False
+    all_v = np.concatenate(vals)
+    lo = float(np.percentile(all_v, 1))
+    hi = float(np.percentile(all_v, 99))
+    span = (hi - lo) or 1.0
+
+    # 第二遍：逐帧伪彩色写入中间 mp4（MPEG-4 Part 2）
+    tmp_raw = out_path + ".tmp.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(tmp_raw, fourcc, float(fps), (w, h))
+    if not writer.isOpened():
+        return False
+    try:
+        for arr in _read_depth_frames(file_path, stream_index, w, h, step=1, src_pix_fmt=src_pix_fmt):
+            norm = np.zeros((h, w), dtype=np.uint8)
+            mask = arr > 0
+            norm[mask] = np.clip(((arr[mask] - lo) / span * 255), 0, 255).astype(np.uint8)
+            color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+            color[~mask] = (16, 16, 16)  # 无效像素置深灰
+            writer.write(color)
+    finally:
+        writer.release()
+
+    # ffmpeg 转 H.264（浏览器可播）+ faststart（moov 前置，秒开）
+    p = subprocess.run(
+        ["ffmpeg", "-y", "-i", tmp_raw,
+         "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-preset", "medium", "-crf", "23",
+         "-movflags", "+faststart",
+         "-an", out_path],
+        capture_output=True, timeout=600,
+    )
+    try:
+        os.remove(tmp_raw)
+    except OSError:
+        pass
+    if p.returncode != 0:
+        return False
+    return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+
+
+@visualization_bp.route("/depth-video/<int:asset_id>", methods=["GET"])
+@jwt_required()
+def depth_video(asset_id):
+    """深度视频播放：把 mkv 深度轨转码为伪彩色 MP4，浏览器 <video> 直接播放
+
+    首次请求触发转码（耗时较长），结果缓存到临时目录，后续秒开。
+    非深度视频（无深度轨）返回 404。自动处理加密文件解密。
+    """
+    import tempfile
+    from flask import send_file
+
+    asset = DataAsset.query.get(asset_id)
+    if not asset:
+        return fail("数据资产不存在", 404)
+
+    file_path, tmp_path = _get_asset_file_path(asset)
+    if file_path is None:
+        return fail("文件不存在于存储目录", 404)
+    try:
+        streams = _probe_video_streams(file_path)
+        depth_streams = [s for s in streams if _is_depth_stream(s)]
+        if not depth_streams:
+            return fail("非深度视频（无深度轨）", 404)
+        d = depth_streams[0]
+        try:
+            w, h = int(d["width"]), int(d["height"])
+        except (KeyError, TypeError, ValueError):
+            return fail("深度轨分辨率未知", 422)
+        fps = 30.0
+        try:
+            num, den = d.get("r_frame_rate", "30/1").split("/")
+            fps = float(num) / float(den) if float(den) > 0 else 30.0
+        except Exception:
+            pass
+
+        # 转码结果缓存（按资产 ID），避免每次播放都重新转码
+        # v2：修复 rgb555le 深度轨被色彩转换破坏的 bug；
+        # v3：改用 H.264 编码（mp4v/MPEG-4 Part 2 浏览器不支持，会触发 video error）
+        cache = os.path.join(tempfile.gettempdir(), f"depth_video_v3_{asset_id}.mp4")
+        for stale_name in (f"depth_video_{asset_id}.mp4", f"depth_video_v2_{asset_id}.mp4"):
+            stale = os.path.join(tempfile.gettempdir(), stale_name)
+            if os.path.isfile(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+        if not (os.path.isfile(cache) and os.path.getsize(cache) > 0):
+            ok = _transcode_depth_video(file_path, d["index"], w, h, fps, cache,
+                                        src_pix_fmt=d.get("pix_fmt", ""))
+            if not ok:
+                try:
+                    os.remove(cache)
+                except OSError:
+                    pass
+                return fail("深度视频转码失败", 500)
+        return send_file(cache, mimetype="video/mp4", as_attachment=False,
+                         download_name=f"depth_{asset.file_name}.mp4", conditional=True)
     finally:
         if tmp_path:
             try:

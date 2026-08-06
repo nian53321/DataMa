@@ -5,8 +5,11 @@ import os
 
 bind = "0.0.0.0:5000"
 workers = int(os.getenv("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
-worker_class = "sync"
-timeout = 120
+# 默认 sync；启用 Orbbec 深度相机时需设为 gthread（MJPEG 长连接 + USB 单进程多线程）
+worker_class = os.getenv("GUNICORN_WORKER_CLASS", "sync")
+threads = int(os.getenv("GUNICORN_THREADS", 1))
+# 默认 120s；启用 Orbbec 时设为 0（MJPEG 预览流不超时）
+timeout = int(os.getenv("GUNICORN_TIMEOUT", 120))
 keepalive = 5
 max_requests = 1000
 max_requests_jitter = 50

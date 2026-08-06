@@ -5,10 +5,25 @@ services:
       - "5000:5000"
     env_file:
       - ./back/.env
+    environment:
+      # Orbbec/RealSense 深度相机：USB 是独占资源，单 worker + gthread 多线程
+      # gthread 支持 MJPEG 长连接（预览流），多线程避免预览阻塞其他请求；
+      # 线程数给足（预览流为长连接会长期占用线程，卡住的探测也会占线程）
+      - GUNICORN_WORKERS=1
+      - GUNICORN_WORKER_CLASS=gthread
+      - GUNICORN_THREADS=16
+      - GUNICORN_TIMEOUT=0
     volumes:
       - backend-data:/app/data_lake
       - backend-logs:/app/logs
       - ./back/master.key:/app/master.key:ro
+      # 宿主机采集服务录制输出目录（后端需写入预览 mp4，故挂载为读写）
+      - ./output:/app/host_output
+    # 映射 USB 设备到容器（Orbbec Femto Bolt 通过 USB 3.0 连接）
+    # privileged 确保容器有足够权限访问 USB 设备
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
     depends_on:
       mysql:
         condition: service_healthy

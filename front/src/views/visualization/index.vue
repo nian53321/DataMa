@@ -229,6 +229,38 @@
                 </el-tag>
               </p>
             </div>
+            <!-- 深度视频（伪彩色，像彩色视频一样逐帧播放；手动按需加载转码） -->
+            <div v-if="currentVideo" class="depth-video">
+              <el-divider content-position="left"><el-icon><DataAnalysis /></el-icon>&nbsp;深度视频（伪彩色）</el-divider>
+              <div v-if="depthVideoState.status === 'idle'" class="preview-box">
+                <el-button type="primary" plain @click="loadDepthVideo(currentVideo.id)">
+                  <el-icon style="margin-right: 6px"><VideoCamera /></el-icon>加载深度视频
+                </el-button>
+                <p class="sub-tip" style="color: #909399; font-size: 12px; margin-top: 6px">
+                  按需转码，仅当需要可视化深度数据时执行（首次约需数十秒）
+                </p>
+              </div>
+              <div v-else-if="depthVideoState.status === 'failed'" class="preview-box">
+                <el-icon size="40" color="#c0c4cc"><VideoCamera /></el-icon>
+                <p>该视频无深度轨，无法可视化</p>
+              </div>
+              <div v-else class="depth-video-box">
+                <video
+                  :key="depthVideoState.url"
+                  :src="depthVideoState.url"
+                  controls
+                  controlslist="nodownload noremoteplayback"
+                  playsinline
+                  class="depth-video-el"
+                  @loadeddata="onDepthVideoLoaded"
+                  @error="onDepthVideoError"
+                />
+                <div v-if="depthVideoState.status === 'loading'" class="loading-overlay">
+                  <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+                  <p>正在转码深度视频，请稍候（首次约需数十秒）...</p>
+                </div>
+              </div>
+            </div>
           </el-card>
         </el-col>
         <el-col :span="12">
@@ -441,6 +473,38 @@
                   </el-tag>
                 </p>
               </div>
+              <!-- 深度视频（伪彩色，像彩色视频一样逐帧播放；手动按需加载转码） -->
+              <div v-if="selectedAsset" class="depth-video">
+                <el-divider content-position="left"><el-icon><DataAnalysis /></el-icon>&nbsp;深度视频（伪彩色）</el-divider>
+                <div v-if="depthVideoState.status === 'idle'" class="preview-box">
+                  <el-button type="primary" plain @click="loadDepthVideo(selectedAsset.id)">
+                    <el-icon style="margin-right: 6px"><VideoCamera /></el-icon>加载深度视频
+                  </el-button>
+                  <p class="sub-tip" style="color: #909399; font-size: 12px; margin-top: 6px">
+                    按需转码，仅当需要可视化深度数据时执行（首次约需数十秒）
+                  </p>
+                </div>
+                <div v-else-if="depthVideoState.status === 'failed'" class="preview-box">
+                  <el-icon size="40" color="#c0c4cc"><VideoCamera /></el-icon>
+                  <p>该视频无深度轨，无法可视化</p>
+                </div>
+                <div v-else class="depth-video-box">
+                  <video
+                    :key="depthVideoState.url"
+                    :src="depthVideoState.url"
+                    controls
+                    controlslist="nodownload noremoteplayback"
+                    playsinline
+                    class="depth-video-el"
+                    @loadeddata="onDepthVideoLoaded"
+                    @error="onDepthVideoError"
+                  />
+                  <div v-if="depthVideoState.status === 'loading'" class="loading-overlay">
+                    <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+                    <p>正在转码深度视频，请稍候（首次约需数十秒）...</p>
+                  </div>
+                </div>
+              </div>
             </el-card>
           </el-col>
 
@@ -565,10 +629,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import * as echarts from 'echarts'
-import { Aim, RefreshLeft, Download, Loading, User, DataLine, VideoCamera, Headset, Microphone } from '@element-plus/icons-vue'
+import { Aim, RefreshLeft, Download, Loading, User, DataLine, VideoCamera, Headset, Microphone, DataAnalysis } from '@element-plus/icons-vue'
 import { getSubjectOverviewApi, getTimelineApi, alignModalitiesApi, getEegAssetApi, getEcgAssetApi, getEyeAssetApi, getScaleAssetApi } from '@/api/visualization'
 import { getSubjectsApi as getSubjects, getAssetsApi } from '@/api/data'
 import { useUserStore } from '@/stores/user'
@@ -612,6 +676,31 @@ let eyeChart = null
 let gaitChart = null
 let riskPieChart = null
 let assetBarChart = null
+
+// 深度视频播放器（Orbbec 深度轨转码为伪彩色 MP4，像彩色视频一样逐帧播放）
+// 状态机：idle（未请求）→ 点击"加载深度视频" → loading（转码中）→ ready（可播放）或 failed（无深度轨）
+// 手动触发：切换视频仅重置为 idle，不自动请求转码接口，避免无谓的服务器转码开销
+const depthVideoState = reactive({ url: '', status: 'idle' })
+const depthVideoUrlForAsset = (assetId) => {
+  if (!assetId) return ''
+  const token = userStore.token || ''
+  return `/api/visualization/depth-video/${assetId}?access_token=${encodeURIComponent(token)}`
+}
+const resetDepthVideo = () => {
+  depthVideoState.url = ''
+  depthVideoState.status = 'idle'
+}
+const loadDepthVideo = (assetId) => {
+  if (!assetId || depthVideoState.status === 'loading' || depthVideoState.status === 'ready') return
+  depthVideoState.url = depthVideoUrlForAsset(assetId)
+  depthVideoState.status = 'loading'
+}
+const onDepthVideoLoaded = () => { depthVideoState.status = 'ready' }
+const onDepthVideoError = () => {
+  // 非深度视频（无深度轨）后端返回 404，隐藏视频、给出提示
+  depthVideoState.url = ''
+  depthVideoState.status = 'failed'
+}
 
 // 按文件模式
 const viewMode = ref('subject')
@@ -711,6 +800,10 @@ const onVideoSwitch = () => {
     }
   })
 }
+
+// 切换视频/文件时重置深度视频为 idle（不自动请求转码，用户按需点击"加载深度视频"）
+watch(() => (viewMode.value === 'subject' ? currentVideo.value?.id : null), () => resetDepthVideo())
+watch(() => (viewMode.value === 'file' ? selectedAssetId.value : null), () => resetDepthVideo())
 
 const hasModality = (t) => tracks.value.some((tr) => tr.data_type === t)
 const trackOffset = (t) => {
@@ -1484,6 +1577,23 @@ onBeforeUnmount(() => {
   color: #606266;
   margin-bottom: 6px;
   font-weight: 500;
+}
+/* 深度视频（Orbbec 深度轨转码伪彩色，像彩色视频一样播放） */
+.depth-video {
+  margin-top: 4px;
+  .depth-video-box {
+    position: relative;
+    background: #000;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .depth-video-el {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    max-height: 320px;
+    background: #000;
+  }
 }
 .card-title {
   display: flex;

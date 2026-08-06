@@ -58,6 +58,19 @@ capture_screenshots_v2.py
 generate_word_manual.py
 改动需求.md
 
-# ===================== 后端一次性脚本与单元测试（部署非必要）=====================
-back/scripts/
+# ===================== 后端脚本（仅保留部署必需的子进程）=====================
+# back/scripts/ 是部署必要目录（Dockerfile COPY . . 会拷入镜像）：
+# 容器内摄像头子进程 orbbec_camera_proc.py / realsense_child.py 必须纳入版本管理；
+# 其余一次性诊断/调试脚本不纳入。
+back/scripts/*
+!back/scripts/orbbec_camera_proc.py
+!back/scripts/realsense_child.py
 back/tests/
+
+# ===================== 深度摄像头运行数据与旧架构 =====================
+# 录制输出（mkv/zip 体积巨大）与 OrbbecSDK 日志为运行时产物，不入库
+output/
+Log/
+capture/
+# 宿主机采集服务（旧架构降级路径，已被容器内 pyk4a 直连取代，含数百 MB 第三方二进制）
+camera_service/

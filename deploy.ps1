@@ -1,10 +1,11 @@
-﻿﻿﻿﻿<#
+﻿<#
 .SYNOPSIS
     多模态数据标注与分析处理平台 - 一键部署脚本（Windows）
 .DESCRIPTION
     自动完成：检查 Docker 环境 → 生成 .env（含强密码与 JWT 密钥）→ 预拉基础镜像 → 构建并启动所有服务 → 健康检查
 .NOTES
     在项目根目录（docker-compose.yml 所在目录）运行：./deploy.ps1
+    注意：本文件必须为 UTF-8 带 BOM 编码，否则 Windows PowerShell 5.1 会解析中文报错。
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -29,41 +30,52 @@ function Test-Command {
 
 function Get-RandomHex {
     param([int]$Length = 32)
-    # 用 .NET RNGCryptoServiceProvider 生成密码学安全的随机字节
+    # 用 .NET RandomNumberGenerator 生成密码学安全的随机字节
     $bytes = New-Object byte[] $Length
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     return -join ($bytes | ForEach-Object { $_.ToString('x2') })
 }
 
-function Get-StrongPassword {
-    # 生成 24 位强密码：含大小写字母+数字+特殊字符
-    $sets = @(
-        'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
-        'abcdefghijkmnpqrstuvwxyz'.ToCharArray()
-        '23456789'.ToCharArray()
-        '!@#$%^&*()-_=+'.ToCharArray()
-    )
+function Get-RandomIndex {
+    param($Length)
+    # 用 4 字节随机数取模，避免 [ref] 传参问题（旧实现 $rng.GetBytes([ref]$idx) 会抛异常）
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $pwd = @()
-    foreach ($set in $sets) {
-        $idx = [byte]0; $rng.GetBytes([ref]$idx)
-        $pwd += $set[$idx % $set.Length]
+    $buf = New-Object byte[] 4
+    [void]$rng.GetBytes($buf)
+    return [BitConverter]::ToUInt32($buf, 0) % $Length
+}
+
+function Get-StrongPassword {
+    # 生成 24 位强密码：含大小写字母+数字+特殊字符（不含易混淆字符 0O1lI）
+    # 注意：不能包含 $ —— docker compose 解析 .env 时会把 $VAR 当变量插值，
+    # 含 $ 的密码会被静默改写导致 MySQL/后端密码不一致。
+    # 注意：用字符串数组而非 char[]，避免 PowerShell 数组展开（@() 换行分隔会展开嵌套数组）
+    $sets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnpqrstuvwxyz', '23456789', '!@#%^&*()-_=+')
+    $all = $sets -join ''
+    $chars = [System.Collections.Generic.List[char]]::new()
+    # 每个字符集至少取 1 个，保证四类都出现
+    foreach ($s in $sets) {
+        $chars.Add($s[(Get-RandomIndex $s.Length)])
     }
-    $all = $sets | ForEach-Object { $_ } | ForEach-Object { $_ }
-    for ($i = 0; $i -lt 20; $i++) {
-        $idx = [byte]0; $rng.GetBytes([ref]$idx)
-        $pwd += $all[$idx % $all.Length]
+    # 补齐到 24 位
+    while ($chars.Count -lt 24) {
+        $chars.Add($all[(Get-RandomIndex $all.Length)])
     }
-    # 用 Fisher-Yates 洗牌算法打乱顺序（密码学安全）
-    for ($i = $pwd.Count - 1; $i -gt 0; $i--) {
-        $jBytes = New-Object byte[] 4
-        $rng.GetBytes($jBytes)
-        $j = [BitConverter]::ToUInt32($jBytes, 0) % ($i + 1)
-        $tmp = $pwd[$i]
-        $pwd[$i] = $pwd[$j]
-        $pwd[$j] = $tmp
+    # Fisher-Yates 洗牌（密码学安全随机）
+    for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+        $j = Get-RandomIndex ($i + 1)
+        $tmp = $chars[$i]
+        $chars[$i] = $chars[$j]
+        $chars[$j] = $tmp
     }
-    return -join $pwd
+    return -join $chars
+}
+
+# 以无 BOM 的 UTF-8 写入文件（避免 Set-Content -Encoding UTF8 在 PS5.1 下写 BOM）
+function Write-EnvFile {
+    param([string]$Path, [string]$Content)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
 }
 
 # ============ 1. 检查 Docker 环境 ============
@@ -161,19 +173,30 @@ if ($needGenerate) {
     $dbPassword = Get-StrongPassword
     $jwtSecret = Get-RandomHex 32
 
-    # 读取并替换
+    # 读取并替换（值用双引号包裹：防止密码以 # 开头时被 dotenv/compose 当成注释；
+    # 密码已不含 $，compose 不会插值）
     $content = Get-Content $envFile -Raw -Encoding UTF8
-    $content = $content -replace 'DB_PASSWORD=.*', "DB_PASSWORD=$dbPassword"
-    $content = $content -replace 'JWT_SECRET_KEY=.*', "JWT_SECRET_KEY=$jwtSecret"
-    Set-Content -Path $envFile -Value $content -Encoding UTF8 -NoNewline
+    $content = $content -replace 'DB_PASSWORD=.*', "DB_PASSWORD=`"$dbPassword`""
+    $content = $content -replace 'JWT_SECRET_KEY=.*', "JWT_SECRET_KEY=`"$jwtSecret`""
+    Write-EnvFile -Path $envFile -Content $content
 
-    Write-OK "已生成 DB_PASSWORD: $dbPassword"
+    Write-OK "已生成 DB_PASSWORD（已脱敏显示）"
     Write-OK "已生成 JWT_SECRET_KEY: $($jwtSecret.Substring(0,8))...（已脱敏显示）"
 } else {
-    # 从已有 .env 读取密码（用于同步根目录 .env）
+    # 从已有 .env 读取密码（用于同步根目录 .env；兼容带引号/不带引号两种写法）
     $content = Get-Content $envFile -Raw -Encoding UTF8
-    $m = [regex]::Match($content, 'DB_PASSWORD=([^\r\n]+)')
+    $m = [regex]::Match($content, 'DB_PASSWORD="?([^"\r\n]+)"?')
     if ($m.Success) { $dbPassword = $m.Groups[1].Value.Trim() }
+    # 检测旧版本生成的含 $ 密码（compose 会插值改写，需重新生成）
+    if ($dbPassword -match '\$') {
+        Write-Warn2 '检测到 back/.env 中 DB_PASSWORD 含有 $ 字符（docker compose 会将其插值改写导致密码不一致）'
+        $dbPassword = Get-StrongPassword
+        $jwtSecret = Get-RandomHex 32
+        $content = $content -replace 'DB_PASSWORD=.*', "DB_PASSWORD=`"$dbPassword`""
+        $content = $content -replace 'JWT_SECRET_KEY=.*', "JWT_SECRET_KEY=`"$jwtSecret`""
+        Write-EnvFile -Path $envFile -Content $content
+        Write-OK '已重新生成不含 $ 字符的 DB_PASSWORD（已脱敏显示）'
+    }
 }
 
 # ============ 4. 同步根目录 .env（供 docker-compose.yml 读取 ${DB_PASSWORD}） ============
@@ -181,17 +204,17 @@ Write-Step '同步根目录 .env（供 docker-compose.yml 读取）'
 
 $rootEnv = Join-Path $ProjectRoot '.env'
 if ($dbPassword) {
-    # 写入或更新根目录 .env
-    $rootContent = "DB_PASSWORD=$dbPassword`n"
+    # 写入或更新根目录 .env（值用双引号包裹，保持与 back/.env 完全一致）
+    $rootContent = "DB_PASSWORD=`"$dbPassword`"`n"
     if (Test-Path $rootEnv) {
         $existing = Get-Content $rootEnv -Raw -Encoding UTF8
         if ($existing -match 'DB_PASSWORD=') {
-            $rootContent = $existing -replace 'DB_PASSWORD=[^\r\n]*', "DB_PASSWORD=$dbPassword"
+            $rootContent = $existing -replace 'DB_PASSWORD=[^\r\n]*', "DB_PASSWORD=`"$dbPassword`""
         } else {
-            $rootContent = $existing.TrimEnd() + "`nDB_PASSWORD=$dbPassword`n"
+            $rootContent = $existing.TrimEnd() + "`nDB_PASSWORD=`"$dbPassword`"`n"
         }
     }
-    Set-Content -Path $rootEnv -Value $rootContent -Encoding UTF8 -NoNewline
+    Write-EnvFile -Path $rootEnv -Content $rootContent
     Write-OK "根目录 .env 已同步 DB_PASSWORD"
 } else {
     Write-Warn2 '未能从 back/.env 读取 DB_PASSWORD，请手动确保根目录 .env 中有 DB_PASSWORD 配置'

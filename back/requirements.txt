@@ -12,5 +12,15 @@ redis==5.0.7
 Werkzeug==3.0.3
 imageio-ffmpeg==0.6.0
 gunicorn==23.0.0
+requests==2.32.3
 pytest==8.2.2
 pytest-flask==1.3.0
+# 深度摄像头（Orbbec Femto Bolt / Azure Kinect DK via K4A Wrapper）
+# pyk4a 源码编译，需 g++ + K4A SDK 头文件（Dockerfile 中已安装）
+# opencv-python-headless: 无 GUI 依赖，适合容器环境
+pyk4a
+opencv-python-headless
+# pyk4a 录制 mkv(彩色+深度+IR 多轨)依赖 PyAV
+av
+# Intel RealSense（D455f 等 D400 系）Python SDK：pip wheel 自带动态库，无需系统依赖
+pyrealsense2

@@ -55,9 +55,17 @@
 
 ### 必装软件
 
-| 软件 | 版本 | 用途 | 下载 |
-|---|---|---|---|
-| Docker Desktop | ≥ 4.30 | 容器运行时 | https://www.docker.com/products/docker-desktop/ |
+| 软件 | 用途 | 安装方式 |
+|---|---|---|
+| Docker Desktop（≥ 4.30） | 容器运行时（WSL2 后端） | 官网下载 https://www.docker.com/products/docker-desktop/ |
+| usbipd-win | 把 USB 设备透传给 WSL2（**深度摄像头必需**） | `winget install dorssel.usbipd-win` |
+| Ubuntu（WSL 发行版） | usbip 客户端，负责识别/挂载摄像头（**深度摄像头必需**） | `wsl --install -d Ubuntu` |
+
+> **为什么深度摄像头必须装 usbipd-win + Ubuntu？**
+> Docker Desktop（WSL2 后端）的 Linux 容器无法直接访问 Windows 宿主机 USB 设备。
+> 平台用 **usbipd-win** 把 Femto Bolt 透传给 WSL2，再由 **Ubuntu 发行版**（usbip 客户端）
+> 把设备挂到 WSL 共享内核上，容器（与 docker-desktop 共享内核）才能看到并访问摄像头。
+> 因此没有 Ubuntu + usbipd-win，**深度相机无法工作**（普通摄像头不受影响）。
 
 ### 安装 Docker Desktop 步骤
 
@@ -74,6 +82,31 @@
    ```
 
    三条命令都有正常输出即代表 Docker 环境就绪。
+
+### 安装 usbipd-win 与 Ubuntu（深度摄像头必做）
+
+以普通 PowerShell 执行：
+
+```powershell
+# 1. 安装 usbipd-win（装完后重新打开 PowerShell 生效）
+winget install dorssel.usbipd-win
+
+# 2. 安装 Ubuntu WSL 发行版（首次会要求设置 Linux 用户名/密码，可跳过直接完成）
+wsl --install -d Ubuntu
+
+# 3. 验证两个依赖就绪
+wsl -l -v          # 应能看到 Ubuntu 发行版
+usbipd --version   # 应能输出版本号
+```
+
+> **关于 Ubuntu 用户名/密码**：本平台只用 Ubuntu 作为 usbip 客户端挂载摄像头，不涉及登录密码——
+> - WSL 发行版的**默认用户通常是 root（无密码）**，直接 `wsl -d ubuntu` 即以 root 进入，部署无需输入密码
+> - 安装时若设置了普通用户名，请自行记好；忘记了可用 root 重置：`wsl -d ubuntu -e passwd <用户名>`
+> - 对部署脚本而言，只需要 Windows 侧 usbipd-win 的管理员权限，Ubuntu 侧无额外凭据要求
+
+> 若 `wsl --install` 报错，先执行 `wsl --update` 再重试。
+> Ubuntu 发行版名如果不是 `ubuntu`（例如 `Ubuntu-22.04`），运行 `reset_orbbec_usb.ps1` 时加参数：
+> `./reset_orbbec_usb.ps1 -WslDistro Ubuntu-22.04`
 
 ### 系统要求
 
@@ -114,33 +147,126 @@ docker pull mysql:8.0
 docker pull redis:7-alpine
 ```
 
-## 部署方式
+## 深度摄像头（Orbbec Femto Bolt / Intel RealSense D455f）USB 透传
 
-### 方式 A：一键脚本部署（推荐）
+平台支持两类深度摄像头，均通过 USB 3.0 连接、经 usbipd-win 透传到 WSL2 容器后由容器内 SDK 直连：
+
+| 设备 | SDK | USB VID | 页面设备源 |
+|---|---|---|---|
+| Orbbec Femto Bolt | pyk4a（K4A Wrapper） | 2bc5 | Orbbec 深度相机 |
+| Intel RealSense D455f 等 D400 系 | pyrealsense2（librealsense） | 8086 | RealSense 深度相机 |
+
+> D455f 是 Intel RealSense D400 系列（立体深度相机），官方 SDK 为 librealsense，Python 绑定
+> `pyrealsense2`（PyPI 支持 Python 3.9–3.14，容器 python:3.13 直接 `pip install pyrealsense2` 即可，
+> wheel 自带动态库，无需额外系统依赖）。容器内 USB 透传机制与 Orbbec 完全相同。
+
+D455F 关键规格（官方 datasheet）：
+
+| 项 | 参数 |
+|---|---|
+| 深度 | 最高 1280×720 @ 90fps；FOV 87°×58°；理想量程 0.6–6 m；Min-Z ≈ 52 cm；<2% @ 4 m |
+| 深度镜头 | 带 750 nm IR Pass 近红外滤光（降低反光/重复图案误检），全局快门 |
+| RGB | 最高 1280×800（1 MP）@ 60fps；FOV 87°×62°；全局快门；IR Cut |
+| 接口 | USB-C 3.1 Gen 1；USB VID 8086，D455=0x0B5C / D455F=0x0B5D |
+| 模块 | RealSense Module D450 + Vision Processor D4 |
+
+采集约定（与 Orbbec 一致，**只采集彩色 + 深度，不启用红外流**）：
+
+- 默认流配置：彩色 1280×800 + 深度 1280×720 @ 30fps（D455F 原生分辨率优先；
+  usbip 透传带宽不足时自动协商降级到 1280×720 → 848×480 → 640×480，帧率 60→30→15→5）。
+- 录制产物：`color.mp4`（彩色 H.264，libx264 直接编码）+ `depth.mp4`（深度 jet 伪彩色 H.264，0.2–8 m 归一化）
+  + `depth_raw.mkv`（原始深度 ffv1 无损，z16 16 位精度完整保留，供分析）+ `meta.json`
+  （含设备型号 / 固件版本 / 深度分辨率 / 深度缩放 depth_units_mm / 帧时间戳 / 编码信息），入库字段与 Orbbec 对齐。
+  编码说明：录制时直接以 ffmpeg 实时编码（彩色 libx264 CRF 18、深度伪彩色 CRF 23、原始深度 ffv1 无损），
+  不再经过 MJPG 写盘 + 二次转码（消除双重有损，深度精度无损保留）。
+- 页面状态栏会显示设备实际型号（如 `Intel RealSense D455F`）与固件版本，便于确认兼容性。
+
+### 执行脚本（管理员身份，项目根目录）
 
 ```powershell
-# 1. 将整个项目目录拷贝到目标设备（如 D:\DataManagement）
-# 2. 在项目根目录（docker-compose.yml 所在目录）打开 PowerShell
-cd D:\DataManagement
+cd <项目目录>
+.\reset_orbbec_usb.ps1
+```
 
-# 3. 执行一键部署脚本
+脚本自动完成：查找设备（VID 2bc5:066b）→ bind（标记可共享）→ attach 到 WSL → 重启 backend 容器 → 容器内验证设备。
+
+运行结果两种：
+
+```
+[OK] 深度摄像头已恢复: OK 1 CL8H363008G   ← 成功，刷新页面即可使用
+```
+
+```
+[X] 容器内仍未检测到设备                 ← 失败，按下面排查
+```
+
+### 验证摄像头是否已透传
+
+```powershell
+usbipd list
+# usbipd-win 5.x 中 attach 成功后设备会从 Windows 侧列表消失（挂到 WSL 的 vhci 上），
+# 所以"列表里找不到摄像头"通常意味着已透传（或未插/未 bind）；若仍显示 Shared/Not shared 则未透传。
+```
+
+页面验证：登录后打开 **数据管理 → 视频采集**，设备源应出现对应的深度相机选项（Orbbec / RealSense）且显示序列号。
+
+### 什么时候需要重新运行
+
+- 首次部署
+- 物理拔插摄像头之后（容器内检测不到设备时）
+- `orbbec/status` 返回 `available=false` 时
+
+## 部署方式（三步：先装、再透传、后启动）
+
+> 以下命令均在**项目根目录**（docker-compose.yml 所在目录）执行，`<项目目录>` 请替换为项目实际所在路径。
+
+### 第一步：安装依赖软件（仅新设备，按上面"部署前置要求"）
+
+1. 安装 Docker Desktop 并重启，配置镜像加速
+2. `winget install dorssel.usbipd-win`
+3. `wsl --install -d Ubuntu`
+
+### 第二步：摄像头 USB 透传（有深度摄像头时）
+
+```powershell
+cd <项目目录>
+.\reset_orbbec_usb.ps1        # 管理员身份；成功后重启容器并验证
+```
+
+### 第三步：启动平台
+
+#### 方式 A：一键脚本启动（推荐，日常使用）
+
+```powershell
+cd <项目目录>
+.\start_all.ps1
+```
+
+脚本自动完成：检查摄像头透传状态（未透传时提示运行 `reset_orbbec_usb.ps1`）→ `docker compose up -d --build` → 等待后端健康检查。深度摄像头由容器内 pyk4a / pyrealsense2 直连 USB（usbipd-win 5.x 共享内核 vhci 透传），宿主机无需运行任何采集进程（`camera_service/` 旧架构降级服务不再自动启动）。
+
+> 首次部署会构建镜像（需 5-10 分钟）。若 `back/.env` 不存在（首次部署），先运行一次 `.\deploy.ps1` 生成 `back/.env` 与根目录 `.env`（自动生成强密码 + JWT 密钥，值带引号写入），之后日常启动用 `.\start_all.ps1` 即可。
+
+#### 方式 B：一键部署脚本（仅首次部署/重新部署，会拉镜像+构建）
+
+```powershell
+cd <项目目录>
 .\deploy.ps1
 ```
 
-脚本会自动完成：
+脚本自动完成：
 - 检查 Docker 环境
-- 生成 `back/.env`（自动生成强密码和 JWT 密钥）
+- 生成 `back/.env`（自动生成强密码和 JWT 密钥；密码不含 `$`，值带引号写入防止 `#` 被当注释）
 - 同步根目录 `.env`（供 docker-compose.yml 读取 DB_PASSWORD）
 - 拉镜像 + 构建镜像 + 启动所有服务
 - 等待后端健康检查通过
 - 打印访问信息和默认账号
 
-### 方式 B：手动部署
+#### 方式 C：手动部署
 
-#### 步骤 1：配置环境变量
+##### 步骤 1：配置环境变量
 
 ```powershell
-cd D:\DataManagement\back
+cd <项目目录>\back
 Copy-Item .env.example .env
 ```
 
@@ -152,27 +278,28 @@ Copy-Item .env.example .env
 | `JWT_SECRET_KEY` | JWT 签名密钥 | `python -c "import secrets;print(secrets.token_hex(32))"` |
 
 **注意**：保持 `DB_HOST=mysql`、`CELERY_BROKER_URL=redis://redis:6379/0`、`CELERY_RESULT_BACKEND=redis://redis:6379/1` 不要改回 localhost，这是容器间服务名通信的必需配置。
+**注意**：`.env` 中密码/密钥**不要包含 `$` 字符**——docker compose 解析 `.env` 时会把 `$VAR` 当作变量插值改写，导致 MySQL 与后端密码不一致（双引号包裹也无法避免）。建议直接使用 `python -c "import secrets;print(secrets.token_hex(16))"` 生成的 32 位 hex 密码，或使用 `.\deploy.ps1` 自动生成。
 
-#### 步骤 2：同步根目录 .env
+##### 步骤 2：同步根目录 .env
 
-在 `docker-compose.yml` 同级目录（项目根目录）创建 `.env` 文件，写入：
+在 `docker-compose.yml` 同级目录（项目根目录）创建 `.env` 文件，写入（值与 back/.env 完全一致，同样加引号）：
 
 ```
-DB_PASSWORD=与back/.env中相同的密码
+DB_PASSWORD="与back/.env中相同的密码"
 ```
 
 这是为了让 mysql 容器初始化时使用相同的 root 密码。
 
-#### 步骤 3：启动服务
+##### 步骤 3：启动服务
 
 ```powershell
-cd D:\DataManagement
+cd <项目目录>
 docker compose up -d --build
 ```
 
 首次启动需要拉取镜像 + npm install + pip install，约 5-10 分钟。
 
-#### 步骤 4：验证
+##### 步骤 4：验证
 
 ```powershell
 # 查看服务状态
@@ -180,7 +307,7 @@ docker compose ps
 
 # 健康检查（通过 nginx 反代）
 curl http://localhost:8080/api/health
-# 期望返回: {"code":200,"message":"ok","data":{"status":"ok",...}}
+# 期望返回: {"status":"ok","service":"data-management-backend"}
 
 # 直连后端（调试用）
 curl http://localhost:5000/api/health
@@ -191,6 +318,8 @@ docker compose logs -f frontend
 ```
 
 浏览器访问 **http://localhost:8080** → 默认账号 `admin / admin123`（首次登录后请立即改密码）。
+
+> **注意**：修改过 `JWT_SECRET_KEY` 或重新部署后，若页面接口全部返回 422，说明浏览器里还存着旧 token（旧密钥签名已失效），**重新登录一次即可**。
 
 ## 配置项说明
 
@@ -210,7 +339,7 @@ docker compose logs -f frontend
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker（容器部署保持 redis） |
 | `CELERY_RESULT_BACKEND` | `redis://redis:6379/1` | Celery 结果后端 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
-| `GUNICORN_WORKERS` | `4` | Gunicorn worker 数量 |
+| `GUNICORN_WORKERS` | `4` | Gunicorn worker 数量（**docker-compose 中已覆盖为 1**，深度相机 USB 由容器内独占采集，多 worker 会导致 USB 竞争冲突） |
 
 > **未在 .env 中列出但代码会读取的配置**（一般用默认值即可，详见 [back/app/config.py](file:///d:/Py_Project/DataManagement/back/app/config.py)）：
 > - `BASE_DIR`、`DATA_LAKE_DIR`、`MASTER_KEY_PATH`：数据湖与主密钥路径
@@ -317,7 +446,7 @@ docker run --rm -v datamanagement_backend-data:/data -v ${PWD}:/backup alpine ta
 #    - data_lake.tar.gz
 
 # 3. 在新设备部署
-cd D:\DataManagement
+cd <项目目录>
 docker compose up -d mysql redis        # 先起 mysql 和 redis
 docker compose exec -T mysql mysql -uroot -p<DB_PASSWORD> data_management < backup.sql
 docker run --rm -v datamanagement_backend-data:/data -v ${PWD}:/backup alpine tar xzf /backup/data_lake.tar.gz -C /data
@@ -372,6 +501,20 @@ docker compose up -d                      # 启动剩余服务
   docker compose up -d --build
   ```
 
+### Q10：深度摄像头检测不到（页面显示"未检测到深度相机"）
+- **原因**：摄像头未透传给 WSL2（未装 usbipd-win / Ubuntu，或拔插后透传失效）
+- **解决**：
+  ```powershell
+  usbipd list          # 已透传则列表里找不到摄像头（5.x attach 后设备从 Windows 侧消失）；仍显示 Shared/Not shared 则未透传
+  .\reset_orbbec_usb.ps1   # 管理员身份运行，重新透传并重启容器
+  ```
+- 若提示未找到 usbipd：`winget install dorssel.usbipd-win` 后重开 PowerShell
+- 若提示 WSL 发行版失败：确认已 `wsl --install -d Ubuntu`，或用 `-WslDistro` 指定实际发行版名
+
+### Q11：修改密钥/重新部署后接口全部返回 422
+- **原因**：`JWT_SECRET_KEY` 变化后，浏览器 localStorage 里的旧 token（旧密钥签名）失效，flask_jwt_extended 对无效 token 默认返回 422，所以部署脚本只能在第一次使用。
+- **解决**：**重新登录一次**即可；若持续出现，确认 `back/.env` 中 `JWT_SECRET_KEY` 的值正确（密钥不要含 `$`——compose 会插值改写；若含 `#` 需放在值中间或加引号，避免行首 `#` 被当注释截断）
+
 ## 生产环境加固建议
 
 1. **改默认 admin 密码**：登录后立即在用户管理中修改
@@ -386,8 +529,13 @@ docker compose up -d                      # 启动剩余服务
 ```
 DataManagement/
 ├── docker-compose.yml          # 容器编排
-├── deploy.ps1                  # 一键部署脚本（Windows）
+├── deploy.ps1                  # 一键部署脚本（Windows，生成 .env + 构建启动）
+├── start_all.ps1               # 日常启动脚本（检查摄像头透传 + 启动 Docker）
+├── reset_orbbec_usb.ps1        # 深度摄像头 USB 透传/恢复脚本（管理员身份运行）
 ├── README.md                   # 本文档
+├── camera_service/             # 宿主机采集服务（旧架构降级路径，已不再自动启动；主路径是容器内 pyk4a）
+│   ├── orbbec_server.py        # 采集服务源码（录制 .mkv）
+│   └── build_orbbec_server.ps1 # 打包采集服务 exe 的脚本
 ├── back/                       # 后端
 │   ├── Dockerfile
 │   ├── .dockerignore

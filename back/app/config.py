@@ -93,16 +93,16 @@ class ProductionConfig(BaseConfig):
 
     @classmethod
     def validate(cls):
-        """生产环境配置校验：禁止使用默认密钥与弱密码"""
-        # JWT 密钥不能是默认值
-        if cls.JWT_SECRET_KEY == "change-me-in-production":
+        """生产环境配置校验：禁止使用默认密钥、弱密码与占位符"""
+        # JWT 密钥不能是默认值或占位符
+        if cls.JWT_SECRET_KEY in ("change-me-in-production", "请使用随机生成的强密钥"):
             raise RuntimeError(
-                "生产环境 JWT_SECRET_KEY 不能使用默认值，请配置随机强密钥"
+                "生产环境 JWT_SECRET_KEY 不能使用默认值或占位符，请配置随机强密钥"
             )
-        # 数据库密码不能是弱密码 123456
-        if cls.DB_PASSWORD == "123456":
+        # 数据库密码不能是弱密码或占位符
+        if cls.DB_PASSWORD in ("123456", "请使用强密码"):
             raise RuntimeError(
-                "生产环境 DB_PASSWORD 不能使用弱密码 123456，请更换为强密码"
+                "生产环境 DB_PASSWORD 不能使用弱密码 123456 或占位符，请更换为强密码"
             )
 
 

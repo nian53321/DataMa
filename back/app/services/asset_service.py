@@ -28,7 +28,9 @@ from app.models import DataAsset, DataType, DataLayer, Subject, VIDEO_TYPES
 from app.services.base import (
     BaseService, ValidationError, NotFoundError, OperationNotAllowedError,
 )
-from app.services.subject_service import _purge_asset_records, _purge_asset_files, _remove_file_safely
+from app.services.subject_service import (
+    _purge_asset_records, _purge_asset_files, _remove_file_safely, _collect_asset_file_paths,
+)
 from app.utils.audit import log_operation, snapshot_update, snapshot_delete
 from app.models.data_snapshot import save_snapshot
 from app.utils.crypto import (

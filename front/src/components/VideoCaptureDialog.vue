@@ -3,8 +3,8 @@
     :model-value="modelValue"
     @update:model-value="$emit('update:modelValue', $event)"
     title="视频采集"
-    width="920px"
-    top="5vh"
+    width="1280px"
+    top="4vh"
     :close-on-click-modal="false"
     @open="onOpen"
     @closed="onClosed"
@@ -38,19 +38,73 @@
           :label="t.value"
         >
           {{ t.label }}
-          <el-tag v-if="hasVideoType(t.value)" type="warning" size="small" style="margin-left: 4px">
-            重采
-          </el-tag>
         </el-radio-button>
       </el-radio-group>
       <span v-if="hasVideoType(currentVideoType)" style="margin-left: 12px; color: #e6a23c; font-size: 12px">
-        当前类型已有视频，上传后将替换
+        该类型已有视频，本次采集将替换旧视频
       </span>
     </div>
 
+    <!-- 设备源选择：普通摄像头 / Orbbec 深度相机 -->
+    <div class="source-bar">
+      <span class="type-label">设备源：</span>
+      <el-radio-group v-model="deviceSource" size="small" @change="onDeviceSourceChange">
+        <el-radio-button label="webcam">普通摄像头</el-radio-button>
+        <el-radio-button label="orbbec" :disabled="!orbbecAvailable">
+          Orbbec 深度相机
+        </el-radio-button>
+        <el-radio-button label="realsense" :disabled="!realSenseAvailable">
+          RealSense 深度相机
+        </el-radio-button>
+      </el-radio-group>
+      <el-tag v-if="deviceSource === 'orbbec'" size="small" type="success" style="margin-left: 8px">
+        序列号：{{ orbbecSerial || '—' }}
+      </el-tag>
+      <el-tag v-if="deviceSource === 'realsense'" size="small" type="success" style="margin-left: 8px">
+        序列号：{{ realSenseSerial || '—' }}
+      </el-tag>
+      <el-tag v-if="orbbecChecked && !orbbecAvailable" size="small" type="info" style="margin-left: 8px">
+        Orbbec 深度相机未检测到
+      </el-tag>
+      <el-tag v-if="realSenseChecked && !realSenseAvailable" size="small" type="info" style="margin-left: 8px">
+        RealSense 深度相机未检测到
+      </el-tag>
+      <!-- 普通摄像头：设备选择（深度相机 RGB 亦作为普通摄像头列出） -->
+      <template v-if="deviceSource === 'webcam'">
+        <el-divider direction="vertical" />
+        <span class="type-label">摄像头：</span>
+        <el-select
+          v-model="selectedDeviceId"
+          size="small"
+          style="width: 280px"
+          placeholder="选择摄像头"
+          :disabled="phase === 'recording' || phase === 'paused'"
+          @change="onDeviceChange"
+        >
+          <el-option
+            v-for="d in cameraOptions"
+            :key="d.deviceId"
+            :label="cameraLabel(d)"
+            :value="d.deviceId"
+          />
+        </el-select>
+      </template>
+      <!-- Orbbec 模式：彩色+深度同时显示（上下拼接，不再单选切换） -->
+      <template v-if="deviceSource === 'orbbec'">
+        <el-divider direction="vertical" />
+        <span class="type-label">画面：</span>
+        <span style="font-size: 13px; color: #606266">彩色 + 深度（同时显示）</span>
+      </template>
+    </div>
+
     <!-- 视频区 -->
-    <div class="video-stage">
+    <div
+      class="video-stage"
+      :class="{ 'is-orbbec': deviceSource === 'orbbec', 'is-realsense': deviceSource === 'realsense' }"
+    >
+      <!-- 普通摄像头：video 元素 -->
       <video
+        v-if="deviceSource === 'webcam'"
         ref="videoRef"
         class="video-el"
         :class="{ recording: phase === 'recording', paused: phase === 'paused' }"
@@ -60,6 +114,63 @@
         playsinline
       />
 
+      <!-- Orbbec 深度相机：采集前与录制中显示实时画面(MJPEG 流)，完成后播放预览视频 -->
+      <template v-else-if="deviceSource === 'orbbec'">
+        <!-- 采集前/录制中：实时预览画面（录制中与录制共用相机会话，画面不断流） -->
+        <img
+          v-if="(phase === 'idle' || phase === 'recording') && orbbecLiveUrl"
+          :src="orbbecLiveUrl"
+          class="video-el"
+          alt="实时预览"
+        />
+        <!-- 录制完成/裁剪中：播放预览视频（后端从 mkv 提取的 H.264 彩色轨；editing 态必须保留元素供裁剪源绘制） -->
+        <video
+          v-else-if="(phase === 'done' || phase === 'editing') && orbbecPreviewUrl"
+          ref="orbbecVideoRef"
+          :src="orbbecPreviewUrl"
+          class="video-el"
+          controls
+          autoplay
+          muted
+          loop
+        />
+        <div v-else class="placeholder">
+          <el-icon v-if="orbbecStarting" class="is-loading" :size="40"><Loading /></el-icon>
+          <el-icon v-else :size="48"><VideoCamera /></el-icon>
+          <div style="margin-top: 12px; color: #909399">
+            {{ orbbecStarting ? '正在启动摄像头，请稍候几秒…' : orbbecMessage }}
+          </div>
+        </div>
+      </template>
+
+      <!-- RealSense 深度相机：采集前与录制中显示实时画面(MJPEG 流)，完成后播放预览视频 -->
+      <template v-else-if="deviceSource === 'realsense'">
+        <!-- 采集前/录制中：实时预览画面（录制中与录制共用相机会话，画面不断流） -->
+        <img
+          v-if="(phase === 'idle' || phase === 'recording') && realSenseLiveUrl"
+          :src="realSenseLiveUrl"
+          class="video-el"
+          alt="实时预览"
+        />
+        <!-- 录制完成：播放预览视频（后端提取的 H.264 彩色轨） -->
+        <video
+          v-else-if="phase === 'done' && realSensePreviewUrl"
+          :src="realSensePreviewUrl"
+          class="video-el"
+          controls
+          autoplay
+          muted
+          loop
+        />
+        <div v-else class="placeholder">
+          <el-icon v-if="realSenseStarting" class="is-loading" :size="40"><Loading /></el-icon>
+          <el-icon v-else :size="48"><VideoCamera /></el-icon>
+          <div style="margin-top: 12px; color: #909399">
+            {{ realSenseStarting ? '正在启动摄像头，请稍候几秒…' : realSenseMessage }}
+          </div>
+        </div>
+      </template>
+
       <!-- 录制指示器 -->
       <div v-if="phase === 'recording' || phase === 'paused'" class="rec-indicator">
         <span class="rec-dot" :class="{ blink: phase === 'recording' }" />
@@ -68,7 +179,7 @@
       </div>
 
       <!-- 未授权占位 -->
-      <div v-if="phase === 'idle' && !stream" class="placeholder">
+      <div v-if="phase === 'idle' && !stream && deviceSource === 'webcam'" class="placeholder">
         <el-icon :size="48"><VideoCamera /></el-icon>
         <div style="margin-top: 12px; color: #909399">{{ initMessage }}</div>
       </div>
@@ -76,61 +187,136 @@
 
     <!-- 控制区 -->
     <div class="controls">
-      <!-- 空闲态：有摄像头 -->
-      <template v-if="phase === 'idle' && stream">
-        <el-button type="danger" :icon="VideoPlay" @click="startRecording">开始采集</el-button>
+      <!-- Orbbec 模式 -->
+      <template v-if="deviceSource === 'orbbec'">
+        <template v-if="phase === 'idle'">
+          <el-button
+            type="danger"
+            :icon="VideoPlay"
+            :disabled="!orbbecAvailable"
+            @click="startOrbbecRecord"
+          >开始采集</el-button>
+        </template>
+        <template v-else-if="phase === 'recording'">
+          <el-button type="warning" :icon="CircleClose" :loading="stoppingOrbbec" @click="stopOrbbecRecord">停止采集</el-button>
+        </template>
+        <template v-else-if="phase === 'done' || phase === 'editing'">
+          <span style="color: #909399; font-size: 13px; margin-right: 8px">
+            {{ sourceLabel }}：{{ formatTime(orbbecRecordMeta?.duration_sec || 0) }}
+          </span>
+          <el-button :icon="RefreshLeft" @click="resetOrbbecCapture">重新采集</el-button>
+          <el-button
+            v-if="phase === 'done'"
+            type="warning"
+            :icon="Scissor"
+            :disabled="!orbbecPreviewReady"
+            @click="enterOrbbecEditMode"
+          >裁剪片段</el-button>
+          <el-button
+            v-if="phase === 'editing'"
+            :icon="RefreshLeft"
+            @click="exitOrbbecEditMode"
+          >退出裁剪</el-button>
+          <el-button
+            v-if="phase === 'editing'"
+            type="success"
+            :icon="Check"
+            :disabled="trimming"
+            :loading="trimming"
+            @click="applyOrbbecTrim"
+          >应用裁剪</el-button>
+          <el-button type="primary" :icon="Upload" :loading="uploading" @click="uploadOrbbecRecord">
+            {{ hasVideoType(currentVideoType) ? '替换上传' : '上传保存' }}
+          </el-button>
+        </template>
       </template>
 
-      <!-- 空闲态：无摄像头（提供备选方案） -->
-      <template v-else-if="phase === 'idle' && !stream">
-        <el-button :icon="Upload" @click="pickVideoFile">选择视频文件</el-button>
-        <el-button type="primary" :icon="Refresh" @click="initCamera">重试获取摄像头</el-button>
+      <!-- RealSense 模式（精简版：无裁剪，仅采集/预览/上传） -->
+      <template v-else-if="deviceSource === 'realsense'">
+        <template v-if="phase === 'idle'">
+          <el-button
+            type="danger"
+            :icon="VideoPlay"
+            :disabled="!realSenseAvailable"
+            @click="startRealSenseRecord"
+          >开始采集</el-button>
+        </template>
+        <template v-else-if="phase === 'recording'">
+          <el-button type="warning" :icon="CircleClose" :loading="stoppingRealSense" @click="stopRealSenseRecord">停止采集</el-button>
+        </template>
+        <template v-else-if="phase === 'done'">
+          <span style="color: #909399; font-size: 13px; margin-right: 8px">
+            {{ sourceLabel }}：{{ formatTime(realSenseRecordMeta?.duration_sec || 0) }}
+          </span>
+          <el-button :icon="RefreshLeft" @click="resetRealSenseCapture">重新采集</el-button>
+          <el-button
+            type="primary"
+            :icon="Upload"
+            :loading="uploading"
+            :disabled="!realSensePreviewReady"
+            @click="uploadRealSenseRecord"
+          >{{ hasVideoType(currentVideoType) ? '替换上传' : '上传保存' }}</el-button>
+        </template>
       </template>
 
-      <!-- 录制中 / 暂停态 -->
-      <template v-else-if="phase === 'recording' || phase === 'paused'">
-        <el-button
-          v-if="phase === 'recording'"
-          :icon="VideoPause"
-          @click="pauseRecording"
-        >暂停</el-button>
-        <el-button
-          v-else
-          type="success"
-          :icon="VideoPlay"
-          @click="resumeRecording"
-        >继续</el-button>
-        <el-button type="warning" :icon="CircleClose" @click="stopRecording">停止采集</el-button>
-      </template>
+      <!-- 普通摄像头模式（原有逻辑） -->
+      <template v-else>
+        <!-- 空闲态：有摄像头 -->
+        <template v-if="phase === 'idle' && stream">
+          <el-button type="danger" :icon="VideoPlay" @click="startRecording">开始采集</el-button>
+        </template>
 
-      <!-- 已完成态：预览 + 裁剪 + 上传 -->
-      <template v-else-if="phase === 'done' || phase === 'editing'">
-        <span style="color: #909399; font-size: 13px; margin-right: 8px">
-          {{ sourceLabel }}：{{ formatTime(currentDurationSec) }}（{{ formatFileSize(blobSize) }}）
-        </span>
-        <el-button :icon="RefreshLeft" @click="resetCapture">{{ stream ? '重新采集' : '重新选择' }}</el-button>
-        <el-button
-          v-if="phase === 'done'"
-          type="warning"
-          :icon="Scissor"
-          @click="enterEditMode"
-        >裁剪片段</el-button>
-        <el-button
-          v-if="phase === 'editing'"
-          :icon="RefreshLeft"
-          @click="exitEditMode"
-        >退出裁剪</el-button>
-        <el-button
-          v-if="phase === 'editing'"
-          type="success"
-          :icon="Check"
-          :disabled="trimming"
-          :loading="trimming"
-          @click="applyTrim"
-        >应用裁剪</el-button>
-        <el-button type="primary" :icon="Upload" :loading="uploading" @click="handleUpload">
-          {{ hasVideoType(currentVideoType) ? '替换上传' : '上传保存' }}
-        </el-button>
+        <!-- 空闲态：无摄像头（提供备选方案） -->
+        <template v-else-if="phase === 'idle' && !stream">
+          <el-button :icon="Upload" @click="pickVideoFile">选择视频文件</el-button>
+          <el-button type="primary" :icon="Refresh" @click="initCamera">重试获取摄像头</el-button>
+        </template>
+
+        <!-- 录制中 / 暂停态 -->
+        <template v-else-if="phase === 'recording' || phase === 'paused'">
+          <el-button
+            v-if="phase === 'recording'"
+            :icon="VideoPause"
+            @click="pauseRecording"
+          >暂停</el-button>
+          <el-button
+            v-else
+            type="success"
+            :icon="VideoPlay"
+            @click="resumeRecording"
+          >继续</el-button>
+          <el-button type="warning" :icon="CircleClose" @click="stopRecording">停止采集</el-button>
+        </template>
+
+        <!-- 已完成态：预览 + 裁剪 + 上传 -->
+        <template v-else-if="phase === 'done' || phase === 'editing'">
+          <span style="color: #909399; font-size: 13px; margin-right: 8px">
+            {{ sourceLabel }}：{{ formatTime(currentDurationSec) }}（{{ formatFileSize(blobSize) }}）
+          </span>
+          <el-button :icon="RefreshLeft" @click="resetCapture">{{ stream ? '重新采集' : '重新选择' }}</el-button>
+          <el-button
+            v-if="phase === 'done'"
+            type="warning"
+            :icon="Scissor"
+            @click="enterEditMode"
+          >裁剪片段</el-button>
+          <el-button
+            v-if="phase === 'editing'"
+            :icon="RefreshLeft"
+            @click="exitEditMode"
+          >退出裁剪</el-button>
+          <el-button
+            v-if="phase === 'editing'"
+            type="success"
+            :icon="Check"
+            :disabled="trimming"
+            :loading="trimming"
+            @click="applyTrim"
+          >应用裁剪</el-button>
+          <el-button type="primary" :icon="Upload" :loading="uploading" @click="handleUpload">
+            {{ hasVideoType(currentVideoType) ? '替换上传' : '上传保存' }}
+          </el-button>
+        </template>
       </template>
 
       <div style="flex: 1" />
@@ -213,10 +399,20 @@ import { ref, computed, onBeforeUnmount, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   VideoPlay, VideoPause, CircleClose, RefreshLeft, Upload, Refresh,
-  Scissor, Check, Aim,
+  Scissor, Check, Aim, Loading,
 } from '@element-plus/icons-vue'
 import { VideoCamera } from '@element-plus/icons-vue'
 import { uploadAssetApi } from '@/api/data'
+import {
+  getOrbbecStatusApi, startOrbbecRecordApi, stopOrbbecRecordApi,
+  uploadOrbbecRecordApi, getOrbbecRecordStatusApi,
+  startOrbbecPreviewApi, stopOrbbecPreviewApi,
+} from '@/api/orbbec'
+import {
+  getRealSenseStatusApi, startRealSenseRecordApi, stopRealSenseRecordApi,
+  uploadRealSenseRecordApi, getRealSenseRecordStatusApi,
+  startRealSensePreviewApi, stopRealSensePreviewApi,
+} from '@/api/realsense'
 
 // 视频类型定义（与后端 VIDEO_TYPES 对应）
 const VIDEO_TYPE_OPTIONS = [
@@ -240,6 +436,36 @@ const fileInputRef = ref(null)       // 文件选择 input
 const canvasRef = ref(null)          // 裁剪用 canvas
 const initMessage = ref('正在请求摄像头权限...')
 const sourceLabel = ref('录制完成')  // 录制完成 / 已选文件 / 裁剪片段
+
+// 设备源：webcam（普通摄像头）/ orbbec（Orbbec 深度相机）
+const deviceSource = ref('webcam')
+// 普通摄像头设备列表（enumerateDevices 的 videoinput，含深度相机 RGB，仅作普通摄像头使用）
+const cameraDevices = ref([])
+const selectedDeviceId = ref('')
+// Orbbec 设备状态
+const orbbecAvailable = ref(false)
+const orbbecChecked = ref(false)
+const orbbecSerial = ref('')
+const orbbecMessage = ref('正在检测深度相机...')
+// Orbbec 录制状态
+const orbbecRecordMeta = ref(null)      // { path, meta: {duration_sec, device_serial, ...} }
+const orbbecPreviewReady = ref(false)   // 预览视频是否已生成(录制后后台异步生成)
+const orbbecVideoRef = ref(null)        // Orbbec 录制完成后预览视频元素(裁剪用)
+const orbbecTrimmedUrl = ref('')        // 裁剪后的预览(本地 blob,仅预览展示,上传仍用原始 mkv)
+const stoppingOrbbec = ref(false)       // 停止采集中的 loading 状态
+const orbbecPreviewing = ref(false)     // 实时预览会话是否已启动(MJPEG 流)
+let orbbecRecordTimerId = null
+// RealSense 设备状态
+const realSenseAvailable = ref(false)
+const realSenseChecked = ref(false)
+const realSenseSerial = ref('')
+const realSenseMessage = ref('正在检测深度相机...')
+// RealSense 录制状态
+const realSenseRecordMeta = ref(null)      // { path, preview_rel, meta, duration_sec }
+const realSensePreviewReady = ref(false)   // 预览视频是否已生成(录制后后台异步生成)
+const stoppingRealSense = ref(false)       // 停止采集中的 loading 状态
+const realSensePreviewing = ref(false)     // 实时预览会话是否已启动(MJPEG 流)
+let realSenseRecordTimerId = null
 
 // 当前采集的视频类型：face / body / gait（默认 face）
 const currentVideoType = ref('face')
@@ -271,6 +497,7 @@ const trimStartSec = ref(0)
 const trimEndSec = ref(0)
 const trimming = ref(false)
 const trimProgress = ref(0)
+const orbbecTrimmed = ref(false)  // 是否已裁剪（上传时把裁剪区间传给后端对 mkv 双轨生效）
 
 // ==================== 计算属性 ====================
 const formattedDuration = computed(() => formatTime(durationMs.value / 1000))
@@ -279,19 +506,607 @@ const canSeek = computed(() => phase.value === 'done' || phase.value === 'editin
 
 // ==================== 生命周期 ====================
 const onOpen = async () => {
+  // 并行检测两种深度相机（互不依赖，各自后端 status 均已子进程化、有超时），
+  // 避免串行等待拖慢弹窗打开/页面卡顿
+  await Promise.all([checkOrbbecStatus(), checkRealSenseStatus()])
+  // 记住上次设备源：上传成功后界面关闭、相机可能仍开着，
+  // 重开时若上次用 Orbbec 且设备可用，自动恢复并直接出画面（无需手动切换）
+  const lastSource = localStorage.getItem('orbbec_last_source') || 'webcam'
+  if (lastSource === 'orbbec' && orbbecAvailable.value) {
+    deviceSource.value = 'orbbec'
+    if (orbbecBackendPreviewing.value) {
+      // 后端相机会话仍开着（上次 stop 被忽略/未执行），直接复用，秒出画面
+      orbbecPreviewing.value = true
+    } else {
+      startOrbbecLive()
+    }
+    return
+  }
   await initCamera()
 }
 
 const onClosed = () => {
   releaseCamera()
+  releaseOrbbec()
+  releaseRealSense()
   resetState()
 }
 
 onBeforeUnmount(() => {
   releaseCamera()
+  releaseOrbbec()
+  releaseRealSense()
 })
 
+// ==================== Orbbec 设备管理 ====================
+const orbbecBackendPreviewing = ref(false)  // 后端相机会话是否还开着（status.previewing）
+const checkOrbbecStatus = async () => {
+  orbbecChecked.value = false
+  orbbecMessage.value = '正在检测深度相机...'
+  try {
+    const res = await getOrbbecStatusApi()
+    const d = res.data || {}
+    // available=true 仅代表后端可用；count>0 才代表接上了相机
+    orbbecAvailable.value = !!d.available && (d.count || 0) > 0
+    orbbecSerial.value = d.serial || ''
+    // 仅容器内直连（无宿主机降级），后端恒返回 container 模式
+    orbbecBackendPreviewing.value = !!d.previewing
+    if (orbbecAvailable.value) {
+      orbbecMessage.value = `已检测到深度相机（序列号：${d.serial || '—'}）`
+    } else if (d.available && (d.count || 0) === 0) {
+      orbbecMessage.value = '深度相机驱动正常，但未检测到设备（请检查 USB 连接）'
+    } else {
+      orbbecMessage.value = d.message || '未检测到深度相机'
+    }
+  } catch (e) {
+    orbbecAvailable.value = false
+    orbbecMessage.value = '深度相机检测失败'
+  } finally {
+    orbbecChecked.value = true
+  }
+}
+
+// ==================== RealSense 设备管理 ====================
+const checkRealSenseStatus = async () => {
+  realSenseChecked.value = false
+  realSenseMessage.value = '正在检测深度相机...'
+  try {
+    const res = await getRealSenseStatusApi()
+    const d = res.data || {}
+    // available=true 仅代表 pyrealsense2 库可用；count>0 才代表真正接上了相机
+    realSenseAvailable.value = !!d.available && (d.count || 0) > 0
+    realSenseSerial.value = d.serial || ''
+    if (realSenseAvailable.value) {
+      realSenseMessage.value = `已检测到深度相机（型号：${d.name || 'RealSense'}，序列号：${d.serial || '—'}）`
+    } else if (d.available && (d.count || 0) === 0) {
+      realSenseMessage.value = '深度相机驱动正常，但未检测到设备（请检查 USB 连接）'
+    } else {
+      realSenseMessage.value = d.message || '未检测到深度相机'
+    }
+  } catch (e) {
+    realSenseAvailable.value = false
+    realSenseMessage.value = '深度相机检测失败'
+  } finally {
+    realSenseChecked.value = true
+  }
+}
+
+// 切换设备源
+const onDeviceSourceChange = (val) => {
+  // 切到 orbbec 时若不可用，回退 webcam
+  if (val === 'orbbec' && !orbbecAvailable.value) {
+    ElMessage.warning('未检测到深度相机，已回退普通摄像头')
+    deviceSource.value = 'webcam'
+    return
+  }
+  // 切到 realsense 时若不可用，回退 webcam
+  if (val === 'realsense' && !realSenseAvailable.value) {
+    ElMessage.warning('未检测到 RealSense 深度相机，已回退普通摄像头')
+    deviceSource.value = 'webcam'
+    return
+  }
+  // 记住当前设备源，下次打开对话框自动恢复
+  localStorage.setItem('orbbec_last_source', val)
+  resetState()
+  if (val === 'orbbec') {
+    // 深度模式：启动实时预览(MJPEG 流)。切回普通摄像头时停止预览释放设备
+    stopRealSenseLive()
+    releaseCamera()
+    startOrbbecLive()
+  } else if (val === 'realsense') {
+    // RealSense 模式：与 orbbec 相同，启动实时预览(MJPEG 流)
+    stopOrbbecLive()
+    releaseCamera()
+    startRealSenseLive()
+  } else {
+    stopOrbbecLive()
+    stopRealSenseLive()
+    selectedDeviceId.value = ''
+    setTimeout(() => initCamera(), 600)
+  }
+}
+
+const releaseOrbbec = () => {
+  if (orbbecRecordTimerId) {
+    clearInterval(orbbecRecordTimerId)
+    orbbecRecordTimerId = null
+  }
+  stopOrbbecLive()
+  // 录制中关闭弹窗：通知后端停止录制，避免相机会话/录制进程泄漏
+  if (phase.value === 'recording') {
+    stopOrbbecRecordApi().catch(() => {})
+  }
+}
+
+const releaseRealSense = () => {
+  if (realSenseRecordTimerId) {
+    clearInterval(realSenseRecordTimerId)
+    realSenseRecordTimerId = null
+  }
+  stopRealSenseLive()
+  // 录制中关闭弹窗：通知后端停止录制子进程，避免进程泄漏
+  if (phase.value === 'recording') {
+    stopRealSenseRecordApi().catch(() => {})
+  }
+}
+
+// 录制完成后的预览视频 URL(后端从 mkv 提取的彩色轨 mp4;裁剪后优先显示本地裁剪版)
+const orbbecPreviewUrl = computed(() => {
+  if (orbbecTrimmedUrl.value) return orbbecTrimmedUrl.value
+  const rel = orbbecRecordMeta.value?.preview_rel
+  if (!rel) return ''
+  const base = import.meta.env.VITE_API_BASE_URL || '/api'
+  const token = localStorage.getItem('token') || ''
+  return `${base}/orbbec/preview?path=${encodeURIComponent(rel)}&access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
+})
+
+// 实时预览 MJPEG 流 URL(<img> 直接播放;img 无法带请求头,鉴权走 access_token query)
+const orbbecLiveUrl = computed(() => {
+  if (!orbbecPreviewing.value) return ''
+  const base = import.meta.env.VITE_API_BASE_URL || '/api'
+  const token = localStorage.getItem('token') || ''
+  return `${base}/orbbec/preview/stream?access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
+})
+
+// ==================== RealSense 计算属性 ====================
+// 录制完成后的预览视频 URL(后端提取的 H.264 彩色轨 mp4)
+const realSensePreviewUrl = computed(() => {
+  const rel = realSenseRecordMeta.value?.preview_rel
+  if (!rel) return ''
+  const base = import.meta.env.VITE_API_BASE_URL || '/api'
+  const token = localStorage.getItem('token') || ''
+  return `${base}/realsense/preview?path=${encodeURIComponent(rel)}&access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
+})
+
+// 实时预览 MJPEG 流 URL(<img> 直接播放;img 无法带请求头,鉴权走 access_token query)
+const realSenseLiveUrl = computed(() => {
+  if (!realSensePreviewing.value) return ''
+  const base = import.meta.env.VITE_API_BASE_URL || '/api'
+  const token = localStorage.getItem('token') || ''
+  return `${base}/realsense/preview/stream?access_token=${encodeURIComponent(token)}&_t=${Date.now()}`
+})
+
+// 启动实时预览会话(与录制共用相机会话;开始采集无需停预览)
+let orbbecStartSeq = 0          // 竞态序号:防止"start 返回时已被 stop"导致状态错乱
+const orbbecStarting = ref(false)  // 相机启动中(首次启动约需几秒),用于画面区提示
+const startOrbbecLive = async () => {
+  const seq = ++orbbecStartSeq
+  if (orbbecPreviewing.value) return
+  orbbecStarting.value = true
+  try {
+    await startOrbbecPreviewApi()
+    if (seq !== orbbecStartSeq) return  // 期间被停止/重开,以后端状态为准
+    orbbecPreviewing.value = true
+  } catch (e) {
+    if (seq !== orbbecStartSeq) return
+    orbbecPreviewing.value = false
+    ElMessage.warning(e?.response?.data?.message || '实时预览启动失败')
+  } finally {
+    if (seq === orbbecStartSeq) orbbecStarting.value = false
+  }
+}
+
+// 停止实时预览会话,释放设备
+const stopOrbbecLive = async () => {
+  ++orbbecStartSeq
+  if (!orbbecPreviewing.value) return
+  orbbecPreviewing.value = false
+  try { await stopOrbbecPreviewApi() } catch { /* 忽略 */ }
+}
+
+// ==================== RealSense 实时预览 ====================
+// 启动实时预览会话(与录制共用相机会话;开始采集无需停预览)
+let realSenseStartSeq = 0          // 竞态序号:防止"start 返回时已被 stop"导致状态错乱
+const realSenseStarting = ref(false)  // 相机启动中(首次启动约需几秒),用于画面区提示
+const startRealSenseLive = async () => {
+  const seq = ++realSenseStartSeq
+  if (realSensePreviewing.value) return
+  realSenseStarting.value = true
+  try {
+    await startRealSensePreviewApi()
+    if (seq !== realSenseStartSeq) return  // 期间被停止/重开,以后端状态为准
+    realSensePreviewing.value = true
+  } catch (e) {
+    if (seq !== realSenseStartSeq) return
+    realSensePreviewing.value = false
+    ElMessage.warning(e?.response?.data?.message || '实时预览启动失败')
+  } finally {
+    if (seq === realSenseStartSeq) realSenseStarting.value = false
+  }
+}
+
+// 停止实时预览会话,释放设备
+const stopRealSenseLive = async () => {
+  ++realSenseStartSeq
+  if (!realSensePreviewing.value) return
+  realSensePreviewing.value = false
+  try { await stopRealSensePreviewApi() } catch { /* 忽略 */ }
+}
+
+// ==================== Orbbec 录制 ====================
+const startOrbbecRecord = async () => {
+  if (!orbbecAvailable.value) {
+    ElMessage.warning('深度相机未就绪')
+    return
+  }
+  // 乐观进入录制中：相机已在实时预览会话上运行，record/start 秒开
+  phase.value = 'recording'
+  sourceLabel.value = '录制完成'
+  durationMs.value = 0
+  orbbecRecordMeta.value = null
+  orbbecPreviewReady.value = false
+  orbbecTrimmedUrl.value = ''
+  orbbecTrimmed.value = false
+  try {
+    await startOrbbecRecordApi({
+      color_res: '1080P',
+      depth_mode: 'NFOV_UNBINNED',
+      fps: 30,
+    })
+    // 计时器
+    const startTs = Date.now()
+    if (orbbecRecordTimerId) clearInterval(orbbecRecordTimerId)
+    orbbecRecordTimerId = setInterval(() => {
+      durationMs.value = Date.now() - startTs
+    }, 200)
+    ElMessage.success('录制已开始')
+  } catch (e) {
+    phase.value = 'idle'
+    ElMessage.error(e?.response?.data?.message || '启动录制失败')
+  }
+}
+
+const stopOrbbecRecord = async () => {
+  if (stoppingOrbbec.value) return
+  stoppingOrbbec.value = true
+  if (orbbecRecordTimerId) {
+    clearInterval(orbbecRecordTimerId)
+    orbbecRecordTimerId = null
+  }
+  try {
+    const res = await stopOrbbecRecordApi()
+    orbbecRecordMeta.value = res.data
+    // 后端录制结束已自动关闭相机会话（SDK k4a.stop()），实时预览流随之断开
+    orbbecPreviewing.value = false
+    phase.value = 'done'
+    ElMessage.success('录制已停止，正在生成预览...')
+    // 预览由后端 ffmpeg 后台生成，轮询就绪后显示
+    pollOrbbecPreview()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '停止录制失败')
+    phase.value = 'idle'
+  } finally {
+    stoppingOrbbec.value = false
+  }
+}
+
+// 轮询录制后处理状态（预览生成），最多约 90s
+const pollOrbbecPreview = async () => {
+  orbbecPreviewReady.value = false
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 1500))
+    try {
+      const res = await getOrbbecRecordStatusApi()
+      const d = res.data || {}
+      if (d.done) {
+        if (d.preview_rel && orbbecRecordMeta.value) {
+          orbbecRecordMeta.value.preview_rel = d.preview_rel
+          // 后台剥离 IR 后原 mkv 被删除，path 更新为最终 *_cd.mkv（上传用）
+          if (d.mkv) orbbecRecordMeta.value.path = d.mkv
+          if (d.meta) {
+            orbbecRecordMeta.value.meta = d.meta
+            // 时长优先用 ffprobe 读出的预览视频真实时长（与播放器一致）；
+            // 无则回退开始/结束时间差（该差值包含录制器启动/保存开销，会偏大）
+            if (d.meta.duration_sec && isFinite(d.meta.duration_sec)) {
+              orbbecRecordMeta.value.duration_sec = d.meta.duration_sec
+            } else if (d.meta.start_time && d.meta.end_time) {
+              const s = new Date(d.meta.start_time).getTime()
+              const e = new Date(d.meta.end_time).getTime()
+              if (e > s) orbbecRecordMeta.value.duration_sec = Math.round((e - s) / 1000)
+            }
+          }
+          orbbecPreviewReady.value = true
+          ElMessage.success('预览已生成')
+        } else {
+          orbbecPreviewReady.value = false
+          ElMessage.warning('预览生成失败，仍可上传录制数据')
+        }
+        return
+      }
+    } catch { /* 继续轮询 */ }
+  }
+  ElMessage.warning('预览生成超时，仍可上传录制数据')
+}
+
+const resetOrbbecCapture = () => {
+  if (orbbecTrimmedUrl.value) {
+    URL.revokeObjectURL(orbbecTrimmedUrl.value)
+    orbbecTrimmedUrl.value = ''
+  }
+  orbbecTrimmed.value = false
+  orbbecRecordMeta.value = null
+  orbbecPreviewReady.value = false
+  durationMs.value = 0
+  phase.value = 'idle'
+  // 相机会话已在录制结束时自动关闭，重新采集需重新启动实时预览
+  startOrbbecLive()
+}
+
+// ==================== Orbbec 预览裁剪（仅影响预览展示，上传仍用原始 mkv） ====================
+const enterOrbbecEditMode = () => {
+  if (!orbbecVideoRef.value) {
+    ElMessage.warning('预览视频未就绪，暂不支持裁剪')
+    return
+  }
+  phase.value = 'editing'
+  const v = orbbecVideoRef.value
+  v.loop = false
+  v.pause()
+  const d = v.duration
+  if (d && isFinite(d)) {
+    trimStartSec.value = 0
+    trimEndSec.value = Math.floor(d * 10) / 10
+    currentDurationSec.value = d
+  }
+}
+
+const exitOrbbecEditMode = () => {
+  phase.value = 'done'
+  const v = orbbecVideoRef.value
+  if (v) {
+    v.loop = true
+    v.currentTime = 0
+    v.play().catch(() => {})
+  }
+}
+
+const applyOrbbecTrim = async () => {
+  const v = orbbecVideoRef.value
+  if (!v) return
+  const start = trimStartSec.value
+  const end = trimEndSec.value
+  if (!start && !end) { ElMessage.warning('请先设置裁剪范围'); return }
+  if (end - start < 0.1) { ElMessage.warning('裁剪区间过短'); return }
+  trimming.value = true
+  trimProgress.value = 0
+  try {
+    const canvas = canvasRef.value
+    const w = v.videoWidth || 1280
+    const h = v.videoHeight || 720
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    const canvasStream = canvas.captureStream(30)
+    const mime = getSupportedMime() || 'video/webm'
+    const rec = new MediaRecorder(canvasStream, { mimeType: mime })
+    const parts = []
+    rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) parts.push(e.data) }
+    rec.onstop = () => {
+      const blob = new Blob(parts, { type: mime })
+      if (orbbecTrimmedUrl.value) URL.revokeObjectURL(orbbecTrimmedUrl.value)
+      orbbecTrimmedUrl.value = URL.createObjectURL(blob)
+      orbbecTrimmed.value = true  // 标记已裁剪：上传时后端按此区间裁剪 mkv（彩色+深度同步）
+      phase.value = 'done'
+      trimming.value = false
+      trimProgress.value = 100
+      ElMessage.success(`已裁剪 ${formatTime(end - start)} 片段（上传时将生效）`)
+    }
+    v.pause()
+    v.loop = false
+    await seekTo(v, start)
+    rec.start(200)
+    v.play().catch(() => {})
+    const t0 = Date.now()
+    const totalMs = (end - start) * 1000
+    const onTimeUpdate = () => {
+      if (v.currentTime >= end - 0.05) {
+        v.pause()
+        v.removeEventListener('timeupdate', onTimeUpdate)
+        if (rec.state !== 'inactive') rec.stop()
+        canvasStream.getTracks().forEach(t => t.stop())
+        return
+      }
+      ctx.drawImage(v, 0, 0, w, h)
+      trimProgress.value = Math.min(99, Math.round(((Date.now() - t0) / totalMs) * 100))
+    }
+    v.addEventListener('timeupdate', onTimeUpdate)
+    const drawFrame = () => {
+      if (!v.paused) ctx.drawImage(v, 0, 0, w, h)
+      if (rec.state === 'recording') requestAnimationFrame(drawFrame)
+    }
+    requestAnimationFrame(drawFrame)
+  } catch (e) {
+    trimming.value = false
+    ElMessage.error(`裁剪失败：${e.message || e}`)
+  }
+}
+
+const uploadOrbbecRecord = async () => {
+  if (!orbbecRecordMeta.value?.path) {
+    ElMessage.warning('无录制内容')
+    return
+  }
+  if (!props.subject?.id) {
+    ElMessage.warning('受试者信息缺失')
+    return
+  }
+  uploading.value = true
+  uploadProgress.value = 0
+  try {
+    const payload = {
+      path: orbbecRecordMeta.value.path,
+      subject_id: props.subject.id,
+      video_type: currentVideoType.value,
+      meta: orbbecRecordMeta.value.meta || {},
+    }
+    // 已裁剪：把区间传给后端，对原始 mkv 彩色+深度双轨同步裁剪后再入库
+    if (orbbecTrimmed.value) {
+      payload.trim_start = trimStartSec.value
+      payload.trim_end = trimEndSec.value
+    }
+    await uploadOrbbecRecordApi(payload)
+    const typeLabel = VIDEO_TYPE_OPTIONS.find(t => t.value === currentVideoType.value)?.label || currentVideoType.value
+    ElMessage.success(`${typeLabel}视频已上传${hasVideoType(currentVideoType.value) ? '（已替换原视频）' : ''}`)
+    emit('success')
+    emit('update:modelValue', false)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '上传失败')
+  } finally {
+    uploading.value = false
+  }
+}
+
+// ==================== RealSense 录制（精简版：无裁剪） ====================
+const startRealSenseRecord = async () => {
+  if (!realSenseAvailable.value) {
+    ElMessage.warning('深度相机未就绪')
+    return
+  }
+  // 乐观进入录制中：相机已在实时预览会话上运行，record/start 秒开
+  phase.value = 'recording'
+  sourceLabel.value = '录制完成'
+  durationMs.value = 0
+  realSenseRecordMeta.value = null
+  realSensePreviewReady.value = false
+  try {
+    await startRealSenseRecordApi({ fps: 30 })
+    // 后端 record/start 会先停预览子进程（录制与预览互斥），实时流已断开
+    realSensePreviewing.value = false
+    // 计时器
+    const startTs = Date.now()
+    if (realSenseRecordTimerId) clearInterval(realSenseRecordTimerId)
+    realSenseRecordTimerId = setInterval(() => {
+      durationMs.value = Date.now() - startTs
+    }, 200)
+    ElMessage.success('录制已开始')
+  } catch (e) {
+    phase.value = 'idle'
+    ElMessage.error(e?.response?.data?.message || '启动录制失败')
+  }
+}
+
+const stopRealSenseRecord = async () => {
+  if (stoppingRealSense.value) return
+  stoppingRealSense.value = true
+  if (realSenseRecordTimerId) {
+    clearInterval(realSenseRecordTimerId)
+    realSenseRecordTimerId = null
+  }
+  try {
+    const res = await stopRealSenseRecordApi()
+    realSenseRecordMeta.value = res.data
+    phase.value = 'done'
+    ElMessage.success('录制已停止，正在生成预览...')
+    // 预览由后端 ffmpeg 后台生成，轮询就绪后显示
+    pollRealSensePreview()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '停止录制失败')
+    phase.value = 'idle'
+  } finally {
+    stoppingRealSense.value = false
+  }
+}
+
+// 轮询录制后处理状态（预览生成），最多约 90s
+const pollRealSensePreview = async () => {
+  realSensePreviewReady.value = false
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 1500))
+    try {
+      const res = await getRealSenseRecordStatusApi()
+      const d = res.data || {}
+      if (d.done) {
+        if (d.preview_rel && realSenseRecordMeta.value) {
+          realSenseRecordMeta.value.preview_rel = d.preview_rel
+          if (d.meta) {
+            realSenseRecordMeta.value.meta = d.meta
+            // 时长优先用 ffprobe 读出的预览视频真实时长（与播放器一致）；
+            // 无则回退开始/结束时间差（该差值包含录制器启动/保存开销，会偏大）
+            if (d.meta.duration_sec && isFinite(d.meta.duration_sec)) {
+              realSenseRecordMeta.value.duration_sec = d.meta.duration_sec
+            } else if (d.meta.start_time && d.meta.end_time) {
+              const s = new Date(d.meta.start_time).getTime()
+              const e = new Date(d.meta.end_time).getTime()
+              if (e > s) realSenseRecordMeta.value.duration_sec = Math.round((e - s) / 1000)
+            }
+          }
+          realSensePreviewReady.value = true
+          ElMessage.success('预览已生成')
+        } else {
+          realSensePreviewReady.value = false
+          ElMessage.warning('预览生成失败，仍可上传')
+        }
+        return
+      }
+    } catch { /* 继续轮询 */ }
+  }
+  ElMessage.warning('预览生成超时，仍可上传录制数据')
+}
+
+const resetRealSenseCapture = () => {
+  realSenseRecordMeta.value = null
+  realSensePreviewReady.value = false
+  durationMs.value = 0
+  phase.value = 'idle'
+  // 子进程随录制结束已退出（相机自动关闭），重新采集需重新启动实时预览
+  startRealSenseLive()
+}
+
+const uploadRealSenseRecord = async () => {
+  if (!realSenseRecordMeta.value?.path) {
+    ElMessage.warning('无录制内容')
+    return
+  }
+  if (!props.subject?.id) {
+    ElMessage.warning('受试者信息缺失')
+    return
+  }
+  uploading.value = true
+  uploadProgress.value = 0
+  try {
+    await uploadRealSenseRecordApi({
+      dir: realSenseRecordMeta.value.path,
+      subject_id: props.subject.id,
+      video_type: currentVideoType.value,
+    })
+    const typeLabel = VIDEO_TYPE_OPTIONS.find(t => t.value === currentVideoType.value)?.label || currentVideoType.value
+    ElMessage.success(`${typeLabel}视频已上传${hasVideoType(currentVideoType.value) ? '（已替换原视频）' : ''}`)
+    // 上传成功后清空状态并提示（重置后画面恢复实时预览）
+    resetRealSenseCapture()
+    emit('success')
+    emit('update:modelValue', false)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '上传失败')
+  } finally {
+    uploading.value = false
+  }
+}
+
 // ==================== 摄像头初始化 ====================
+// 深度相机（Femto Bolt）的 RGB 接口是标准 UVC 摄像头，浏览器可直接作为
+// 普通摄像头使用。这里枚举所有 videoinput 设备并支持选择，保证：
+//  - 只插深度相机时，普通摄像头模式也能正常出彩色画面
+//  - 同时插多个摄像头时，可手动选择用哪个
 const initCamera = async () => {
   phase.value = 'idle'
   initMessage.value = '正在请求摄像头权限...'
@@ -300,15 +1115,107 @@ const initCamera = async () => {
     return
   }
   try {
+    // 先请求授权（任意设备），授权后 enumerateDevices 才能拿到设备名称
     const s = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 1280 }, height: { ideal: 720 } },
       audio: true,
     })
     stream.value = s
-    await playPreview(s)
+    await refreshDeviceList()
+
+    // 选择设备：沿用上次选择 > 第一个设备（深度相机 RGB 亦作普通摄像头）
+    const valid = cameraOptions.value.some(d => d.deviceId === selectedDeviceId.value)
+    if (!valid) {
+      selectedDeviceId.value = cameraOptions.value[0]?.deviceId || ''
+    }
+    // 若当前实际使用的设备与所选不一致，切换过去
+    if (selectedDeviceId.value && getStreamDeviceId(s) !== selectedDeviceId.value) {
+      await switchToDevice(selectedDeviceId.value)
+    } else {
+      await playPreview(s)
+    }
+    initMessage.value = ''
   } catch (e) {
     initMessage.value = `无法访问摄像头：${e.name === 'NotAllowedError' ? '已拒绝授权，请在浏览器设置中允许摄像头' : e.message}`
   }
+}
+
+// 摄像头下拉选项 = 枚举到的 UVC 设备（含深度相机 RGB，均作为普通摄像头使用）
+const cameraOptions = computed(() => [...cameraDevices.value])
+
+// 枚举视频输入设备（需在授权后调用才有名称）
+const refreshDeviceList = async () => {
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices()
+    const inputs = all.filter(d => d.kind === 'videoinput')
+    // 去重：同一物理设备常以多种格式暴露多个 deviceId 且同名，
+    // 界面只保留一个，避免出现"两个一样的摄像头"
+    const seen = new Set()
+    const unique = []
+    for (const d of inputs) {
+      const key = (d.label || '').trim().toLowerCase()
+      if (key) {
+        if (seen.has(key)) continue
+        seen.add(key)
+      }
+      unique.push(d)
+    }
+    cameraDevices.value = unique
+  } catch {
+    cameraDevices.value = []
+  }
+}
+
+// 设备显示名（label 可能为空）
+const cameraLabel = (d) => {
+  const label = d.label?.trim()
+  if (label) return label
+  return `摄像头 ${String(d.deviceId).slice(0, 8)}`
+}
+
+// 获取当前媒体流的视频设备 id
+const getStreamDeviceId = (s) => {
+  const track = s?.getVideoTracks?.()[0]
+  try {
+    return track?.getSettings?.()?.deviceId || ''
+  } catch {
+    return ''
+  }
+}
+
+// 仅停止媒体流的所有轨道（不清理 UI/计时器，供切换时复用）
+const stopStream = (s) => {
+  if (s) {
+    s.getTracks().forEach(t => t.stop())
+  }
+}
+
+// 切换到指定设备：先获取新流，成功后再停旧流；失败保留原摄像头
+const switchToDevice = async (deviceId) => {
+  if (!deviceId) return
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: { exact: deviceId },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: true,
+    })
+    stopStream(stream.value)
+    stream.value = s
+    initMessage.value = ''
+    await playPreview(s)
+  } catch (e) {
+    // 新设备不可用：旧流保持不动，仅提示
+    initMessage.value = `无法使用所选摄像头：${e.message}`
+  }
+}
+
+// 下拉选择变化
+const onDeviceChange = (deviceId) => {
+  if (!deviceId || deviceId === getStreamDeviceId(stream.value)) return
+  switchToDevice(deviceId)
 }
 
 const playPreview = async (s) => {
@@ -458,6 +1365,14 @@ const onVideoFileChange = (e) => {
 }
 
 // ==================== 裁剪功能 ====================
+// 获取当前激活的视频元素：Orbbec 用 orbbecVideoRef，普通摄像头用 videoRef。
+// 裁剪控制区是共用的，而两种模式的 video 元素 ref 不同，直接取 videoRef 在
+// Orbbec 模式下为 null 会导致"定位/预览片段"失效。
+const getActiveVideo = () => {
+  if (deviceSource.value === 'orbbec') return orbbecVideoRef.value
+  return videoRef.value
+}
+
 const enterEditMode = () => {
   if (!currentDurationSec.value) {
     ElMessage.warning('无法获取视频时长，不支持裁剪')
@@ -482,8 +1397,9 @@ const exitEditMode = () => {
 
 // 将当前播放位置设为裁剪起点
 const setTrimStartToCurrent = () => {
-  if (!videoRef.value) return
-  const t = videoRef.value.currentTime
+  const v = getActiveVideo()
+  if (!v) return
+  const t = v.currentTime
   trimStartSec.value = Math.min(t, (trimEndSec.value || currentDurationSec.value) - 0.1)
   // 如果起点 >= 结束，往后推结束
   if (trimStartSec.value >= trimEndSec.value) {
@@ -493,8 +1409,9 @@ const setTrimStartToCurrent = () => {
 
 // 将当前播放位置设为裁剪终点
 const setTrimEndToCurrent = () => {
-  if (!videoRef.value) return
-  const t = videoRef.value.currentTime
+  const v = getActiveVideo()
+  if (!v) return
+  const t = v.currentTime
   trimEndSec.value = Math.max(t, (trimStartSec.value || 0) + 0.1)
   if (trimEndSec.value > currentDurationSec.value) {
     trimEndSec.value = currentDurationSec.value
@@ -503,17 +1420,18 @@ const setTrimEndToCurrent = () => {
 
 // 预览裁剪区间
 const previewTrim = () => {
-  if (!videoRef.value) return
-  videoRef.value.currentTime = trimStartSec.value
-  videoRef.value.play().catch(() => {})
+  const v = getActiveVideo()
+  if (!v) return
+  v.currentTime = trimStartSec.value
+  v.play().catch(() => {})
   // 到达结束时间自动暂停
   const onTimeUpdate = () => {
-    if (videoRef.value.currentTime >= trimEndSec.value) {
-      videoRef.value.pause()
-      videoRef.value.removeEventListener('timeupdate', onTimeUpdate)
+    if (v.currentTime >= trimEndSec.value) {
+      v.pause()
+      v.removeEventListener('timeupdate', onTimeUpdate)
     }
   }
-  videoRef.value.addEventListener('timeupdate', onTimeUpdate)
+  v.addEventListener('timeupdate', onTimeUpdate)
 }
 
 const resetTrimRange = () => {
@@ -725,13 +1643,22 @@ const releaseCamera = () => {
     videoRef.value.src = ''
   }
   if (stream.value) {
-    stream.value.getTracks().forEach(t => t.stop())
+    stopStream(stream.value)
     stream.value = null
   }
 }
 </script>
 
 <style scoped>
+/* 视频采集对话框：内容超高时内部滚动，避免超出屏幕 */
+:deep(.el-dialog) {
+  max-height: 94vh;
+  display: flex;
+  flex-direction: column;
+}
+:deep(.el-dialog__body) {
+  overflow-y: auto;
+}
 .subject-bar {
   display: flex;
   align-items: center;
@@ -760,6 +1687,18 @@ const releaseCamera = () => {
   border-radius: 4px;
 }
 
+.source-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: #ecf5ff;
+  border: 1px solid #d9ecff;
+  border-radius: 4px;
+  flex-wrap: wrap;
+}
+
 .type-label {
   color: #606266;
   font-size: 13px;
@@ -775,6 +1714,12 @@ const releaseCamera = () => {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* 深度相机模式（Orbbec / RealSense）：与普通摄像头一致 16:9 满宽，画面无黑边 */
+.video-stage.is-orbbec,
+.video-stage.is-realsense {
+  height: auto;
 }
 
 .video-el {
