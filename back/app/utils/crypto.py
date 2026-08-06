@@ -16,6 +16,7 @@
 """
 import os
 import tempfile
+import threading
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
@@ -29,8 +30,14 @@ GCM_TAG_SIZE = 16                     # GCM 认证标签
 ENC_DEK_SIZE = DEK_SIZE + GCM_TAG_SIZE  # 加密后的 DEK（密文 + tag）= 48
 HEADER_SIZE = 4 + 1 + NONCE_SIZE + ENC_DEK_SIZE + NONCE_SIZE  # 77
 
-# 主密钥缓存（进程级）
+# 主密钥缓存（进程级）：(文件 mtime_ns, 密钥字节)
+# 每次调用 stat 一次 master.key，文件 mtime 变化即重载 → 多 worker 轮换/导入后
+# 其他 worker 自动拿到新密钥，避免进程缓存不一致导致"用旧密钥加密、新密钥解不开"。
 _master_key_cache = None
+# 过渡期密钥缓存（master.key.previous，轮换/导入期间存在）：(mtime_ns, 密钥字节)
+_previous_key_cache = None
+# 进程内互斥锁：防止同一进程内并发加载/创建/轮换主密钥
+_MASTER_KEY_LOCK = threading.Lock()
 
 
 def _master_key_path():
@@ -40,49 +47,126 @@ def _master_key_path():
         current_app.config["BASE_DIR"], "master.key")
 
 
-def _load_or_create_master_key():
-    """加载主密钥文件；不存在则生成 32 字节随机密钥并写入（权限 600）"""
-    path = _master_key_path()
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            key = f.read()
-        if len(key) == DEK_SIZE:
-            return key
-        # 文件存在但长度异常，视为损坏（不自动覆盖，避免误删）
-        raise RuntimeError(f"主密钥文件已存在但长度异常: {path}（期望 {DEK_SIZE} 字节）")
-    # 生成新主密钥
-    key = AESGCM.generate_key(bit_length=256)
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    # 以 0600 权限写入（仅所有者可读写）
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _master_key_st_mtime():
+    """主密钥文件 mtime_ns；文件不存在返回 None"""
     try:
-        os.write(fd, key)
-    finally:
-        os.close(fd)
-    return key
+        return os.stat(_master_key_path()).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _normalize_key_bytes(raw):
+    """规范化密钥字节；兼容 Windows 文本模式写入导致的 \r\n 字节膨胀
+
+    旧版本在 Windows 上使用 os.open（默认文本模式）写入 master.key，
+    密钥中的 \n 被转换为 \r\n，导致文件长度 > DEK_SIZE。剥除 \r 后
+    恰好为 DEK_SIZE 的视为文本模式膨胀，返回规范化后的密钥；其余情况
+    （真实损坏）返回 None，由调用方按异常处理。
+    """
+    if len(raw) == DEK_SIZE:
+        return raw
+    stripped = raw.replace(b"\r\n", b"\n")
+    if len(stripped) == DEK_SIZE:
+        return stripped
+    return None
+
+
+def _load_or_create_master_key():
+    """加载主密钥文件；不存在则生成 32 字节随机密钥并写入（权限 600）
+
+    并发安全：使用 O_CREAT|O_EXCL 原子创建。多 worker 同时首次启动时，
+    只有一个进程能创建成功，其余进程读取已创建的文件，保证所有进程使用同一密钥。
+    """
+    with _MASTER_KEY_LOCK:
+        path = _master_key_path()
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                raw = f.read()
+            key = _normalize_key_bytes(raw)
+            if key is not None:
+                return key
+            # 文件存在但长度异常，视为损坏（不自动覆盖，避免误删）
+            raise RuntimeError(f"主密钥文件已存在但长度异常: {path}（期望 {DEK_SIZE} 字节）")
+        # 生成新主密钥
+        key = AESGCM.generate_key(bit_length=256)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # 0600 权限 + O_EXCL 原子创建（O_BINARY 防止 Windows 文本模式换行转换）
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+        except FileExistsError:
+            # 竞态：另一进程刚创建成功，读取其密钥，避免出现两份不一致的密钥
+            with open(path, "rb") as f:
+                raw = f.read()
+            key = _normalize_key_bytes(raw)
+            if key is None:
+                raise RuntimeError(
+                    f"主密钥文件已存在但长度异常: {path}（期望 {DEK_SIZE} 字节）")
+            return key
+        try:
+            os.write(fd, key)
+        finally:
+            os.close(fd)
+        return key
 
 
 def get_master_key():
-    """获取主密钥（进程级缓存，首次访问时加载/生成）"""
+    """获取主密钥（进程级缓存 + 文件 mtime 失效检查）
+
+    每次调用 stat 一次 master.key（微秒级开销）；文件被其他 worker 轮换/导入后
+    mtime 变化 → 自动重载，保证多进程缓存一致性。
+    """
     global _master_key_cache
-    if _master_key_cache is None:
-        _master_key_cache = _load_or_create_master_key()
-    return _master_key_cache
+    mtime = _master_key_st_mtime()
+    if _master_key_cache is not None:
+        cached_mtime, cached_key = _master_key_cache
+        if cached_mtime == mtime:
+            return cached_key
+    key = _load_or_create_master_key()
+    _master_key_cache = (_master_key_st_mtime(), key)
+    return key
+
+
+def _get_previous_key():
+    """读取过渡期备用密钥（master.key.previous，轮换/导入期间存在）
+
+    返回 None 表示无过渡密钥（正常状态）。
+    """
+    global _previous_key_cache
+    path = _master_key_path() + ".previous"
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        _previous_key_cache = None
+        return None
+    if _previous_key_cache is not None:
+        cached_mtime, cached_key = _previous_key_cache
+        if cached_mtime == mtime:
+            return cached_key
+    with open(path, "rb") as f:
+        raw = f.read()
+    key = _normalize_key_bytes(raw)
+    if key is None:
+        _previous_key_cache = None
+        return None
+    _previous_key_cache = (mtime, key)
+    return key
 
 
 def reset_master_key_cache():
     """清除主密钥缓存（测试用）"""
-    global _master_key_cache
+    global _master_key_cache, _previous_key_cache
     _master_key_cache = None
+    _previous_key_cache = None
 
 
 # ==================== 字节级加解密 ====================
 
-def encrypt_bytes(plaintext: bytes) -> bytes:
-    """加密字节流：返回 [header][encrypted_content]"""
-    mk = get_master_key()
+def _encrypt_bytes_with_key(plaintext: bytes, mk: bytes) -> bytes:
+    """用指定主密钥加密字节流：返回 [header][encrypted_content]
+    （供密钥轮换/导入使用，避免依赖进程级缓存，保证新旧密钥可显式指定）
+    """
     # 1. 生成独立 DEK
     dek = AESGCM.generate_key(bit_length=256)
     # 2. 用 MK 加密 DEK（AAD = MAGIC，防止头篡改）
@@ -96,8 +180,8 @@ def encrypt_bytes(plaintext: bytes) -> bytes:
     return MAGIC + bytes([VERSION]) + dek_nonce + enc_dek + content_nonce + enc_content
 
 
-def decrypt_bytes(data: bytes) -> bytes:
-    """解密字节流：输入 [header][encrypted_content]，返回明文"""
+def _parse_header(data: bytes):
+    """解析 DMEC 文件头，返回 (dek_nonce, enc_dek, content_nonce, enc_content)"""
     if len(data) < HEADER_SIZE:
         raise ValueError("文件过短，不是有效的加密文件")
     if data[:4] != MAGIC:
@@ -112,8 +196,48 @@ def decrypt_bytes(data: bytes) -> bytes:
     offset += ENC_DEK_SIZE
     content_nonce = data[offset:offset + NONCE_SIZE]
     offset += NONCE_SIZE
-    enc_content = data[offset:]
-    mk = get_master_key()
+    return dek_nonce, enc_dek, content_nonce, data[offset:]
+
+
+def _rewrap_dek(data: bytes, old_mk: bytes, new_mk: bytes) -> bytes:
+    """DEK 重包裹：用 old_mk 解开 DEK，再用 new_mk 重新加密（生成新 dek_nonce）
+
+    内容密文与 content_nonce 保持不变 → 轮换/导入后文件内容字节不变，仅头部变化。
+    用于密钥轮换：比"整体解密再重加密"更快且不引入内容重加密的失败面。
+    """
+    dek_nonce, enc_dek, content_nonce, enc_content = _parse_header(data)
+    try:
+        dek = AESGCM(old_mk).decrypt(dek_nonce, enc_dek, associated_data=MAGIC)
+    except InvalidTag:
+        raise ValueError("DEK 解密失败：主密钥不匹配或文件头已损坏")
+    new_dek_nonce = os.urandom(NONCE_SIZE)
+    new_enc_dek = AESGCM(new_mk).encrypt(new_dek_nonce, dek, associated_data=MAGIC)
+    return MAGIC + bytes([VERSION]) + new_dek_nonce + new_enc_dek + content_nonce + enc_content
+
+
+def _rewrap_file_dek(data: bytes, old_mk: bytes, new_mk: bytes) -> bytes:
+    """将单个加密文件的 DEK 从 old_mk 重包裹为 new_mk（内容不变）
+
+    兼容轮换崩溃恢复：若 old_mk 已解不开该文件（文件在之前一次中断的轮换中
+    已被其他密钥重包裹），依次回退尝试 master.key.previous 中的过渡密钥，
+    最后尝试 new_mk 本身（文件已被本次轮换重包裹的情况）。
+    """
+    try:
+        return _rewrap_dek(data, old_mk, new_mk)
+    except ValueError:
+        pass
+    prev = _get_previous_key()
+    if prev is not None and prev != old_mk and prev != new_mk:
+        try:
+            return _rewrap_dek(data, prev, new_mk)
+        except ValueError:
+            pass
+    return _rewrap_dek(data, new_mk, new_mk)
+
+
+def _decrypt_bytes_with_key(data: bytes, mk: bytes) -> bytes:
+    """用指定主密钥解密字节流：输入 [header][encrypted_content]，返回明文"""
+    dek_nonce, enc_dek, content_nonce, enc_content = _parse_header(data)
     try:
         dek = AESGCM(mk).decrypt(dek_nonce, enc_dek, associated_data=MAGIC)
     except InvalidTag:
@@ -123,6 +247,29 @@ def decrypt_bytes(data: bytes) -> bytes:
                                    associated_data=MAGIC + bytes([VERSION]))
     except InvalidTag:
         raise ValueError("内容解密失败：文件已损坏或被篡改")
+
+
+def encrypt_bytes(plaintext: bytes) -> bytes:
+    """加密字节流：返回 [header][encrypted_content]（使用进程级主密钥缓存）"""
+    return _encrypt_bytes_with_key(plaintext, get_master_key())
+
+
+def decrypt_bytes(data: bytes) -> bytes:
+    """解密字节流：输入 [header][encrypted_content]，返回明文（使用进程级主密钥缓存）
+
+    密钥轮换/导入过渡期内（master.key 已切换但文件尚未全部重包裹），当前主密钥
+    解不开的文件自动回退尝试 master.key.previous 中的过渡密钥，保证全程可读。
+    仅当报错为"主密钥不匹配"时回退；内容 GCM tag 校验失败（真实损坏）不回退。
+    """
+    try:
+        return _decrypt_bytes_with_key(data, get_master_key())
+    except ValueError as e:
+        if "主密钥不匹配" not in str(e):
+            raise
+        prev = _get_previous_key()
+        if prev is not None:
+            return _decrypt_bytes_with_key(data, prev)
+        raise
 
 
 # ==================== 文件级加解密 ====================
@@ -217,12 +364,11 @@ def get_key_info():
     return info
 
 
-def count_encrypted_files(data_lake_dir):
-    """统计数据湖中已加密的文件数量"""
-    count = 0
-    total_size = 0
+def _collect_encrypted_files(data_lake_dir):
+    """遍历数据湖，收集所有 DMEC 加密文件路径（跳过 .transcodes 转码缓存）"""
+    result = []
     if not os.path.isdir(data_lake_dir):
-        return {"encrypted_count": 0, "total_size": 0}
+        return result
     for root, dirs, files in os.walk(data_lake_dir):
         # 跳过转码缓存目录（.transcodes 内为派生临时文件，不加密）
         if ".transcodes" in dirs:
@@ -231,86 +377,202 @@ def count_encrypted_files(data_lake_dir):
             fpath = os.path.join(root, fname)
             try:
                 if is_encrypted_file(fpath):
-                    count += 1
-                    total_size += os.path.getsize(fpath)
+                    result.append(fpath)
             except OSError:
                 pass
+    return result
+
+
+def count_encrypted_files(data_lake_dir):
+    """统计数据湖中已加密的文件数量"""
+    count = 0
+    total_size = 0
+    for fpath in _collect_encrypted_files(data_lake_dir):
+        count += 1
+        try:
+            total_size += os.path.getsize(fpath)
+        except OSError:
+            pass
     return {"encrypted_count": count, "total_size": total_size}
 
 
-def rotate_master_key(data_lake_dir):
-    """轮换主密钥：生成新密钥，重新加密所有已加密文件
+def _acquire_key_operation_lock():
+    """获取跨进程密钥操作互斥锁（防止并发轮换/导入）
+
+    锁文件：master.key.lock。跨平台实现：
+      - Windows: msvcrt.locking（文件需至少有 1 字节才能锁定）
+      - Linux/macOS: fcntl.flock
+    返回锁 fd；调用方必须在 finally 中调用 _release_key_operation_lock。
+    """
+    path = _master_key_path() + ".lock"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_BINARY, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\x00")  # 保证至少有 1 字节可锁定
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            os.lseek(fd, 0, os.SEEK_SET)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        pass  # 锁定失败不阻塞（best-effort），进程内 _MASTER_KEY_LOCK 仍有兜底
+    return fd
+
+
+def _release_key_operation_lock(fd):
+    """释放密钥操作互斥锁"""
+    if fd is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _swap_master_key(old_mk, new_mk, data_lake_dir, old_fp):
+    """用 new_mk 替换 old_mk 的公共流程（轮换与导入共用）
+
+    安全顺序（重排 + 备份）：
+      1. 备份旧密钥 → master.key.bak-<时间戳>（0600）
+      2. 发布新密钥到 master.key.previous（过渡期解密回退）
+      3. 逐文件 DEK 重包裹（master.key 仍是旧密钥；全部成功才进入第 4 步）
+      4. 全部成功后原子替换 master.key
+      5. 删除 master.key.previous + 刷新进程缓存
+
+    失败安全：任一步失败，master.key 要么保持旧密钥（第 3 步失败），要么处于
+    过渡态（.previous 存在，新旧文件都可被读取），数据不会丢失，重试即可；
+    备份文件用于极端情况的恢复。
+
     返回 (old_fingerprint, new_fingerprint, reencrypted_count)
     """
-    old_mk = get_master_key()
-    old_fp = get_key_fingerprint(old_mk)
+    global _master_key_cache, _previous_key_cache
+    path = _master_key_path()
 
-    # 1. 收集所有已加密文件
-    encrypted_files = []
-    if os.path.isdir(data_lake_dir):
-        for root, dirs, files in os.walk(data_lake_dir):
-            if ".transcodes" in dirs:
-                dirs.remove(".transcodes")
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                try:
-                    if is_encrypted_file(fpath):
-                        encrypted_files.append(fpath)
-                except OSError:
-                    pass
+    # 1. 备份旧密钥（时间戳含毫秒，避免同秒重复）
+    backup_path = f"{path}.bak-{time.strftime('%Y%m%d%H%M%S')}{int(time.time() * 1000) % 1000:03d}"
+    with open(path, "rb") as f:
+        old_key_bytes = _normalize_key_bytes(f.read())
+    bfd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+    try:
+        os.write(bfd, old_key_bytes)
+    finally:
+        os.close(bfd)
 
-    # 2. 用旧密钥解密所有文件内容（暂存内存）
-    decrypted_data = []
+    # 2. 过渡密钥管理：
+    #    若 .previous 已存在（上次轮换中断的崩溃恢复），保留其中密钥供重包裹循环
+    #    回退使用，避免数据被多种密钥分散包裹；否则发布新密钥到 .previous，
+    #    保证循环期间"新重包裹的文件"始终可读。
+    prev_path = path + ".previous"
+    if not os.path.exists(prev_path):
+        pfd = os.open(prev_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY, 0o600)
+        try:
+            os.write(pfd, new_mk)
+        finally:
+            os.close(pfd)
+
+    # 3. 逐文件 DEK 重包裹（原子写回；任一文件失败即中止，master.key 不变）
+    encrypted_files = _collect_encrypted_files(data_lake_dir)
     for fpath in encrypted_files:
         with open(fpath, "rb") as f:
             data = f.read()
-        plaintext = decrypt_bytes(data)
-        decrypted_data.append((fpath, plaintext))
+        rewrapped = _rewrap_file_dek(data, old_mk, new_mk)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(fpath), prefix=".rewrap-")
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(rewrapped)
+            os.replace(tmp_path, fpath)  # 原子替换，读方永远看到完整旧头或完整新头
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
-    # 3. 生成新主密钥并写入文件
-    path = _master_key_path()
-    new_mk = AESGCM.generate_key(bit_length=256)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # 4. 全部成功后原子替换 master.key
+    #    先刷新 .previous 为新密钥，封口"已重包裹文件"的读取间隙，再替换 master.key。
+    pfd = os.open(prev_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY, 0o600)
     try:
-        os.write(fd, new_mk)
+        os.write(pfd, new_mk)
     finally:
-        os.close(fd)
+        os.close(pfd)
+    mk_tmp_fd, mk_tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".mk-")
+    try:
+        with os.fdopen(mk_tmp_fd, "wb") as f:
+            f.write(new_mk)
+        os.chmod(mk_tmp_path, 0o600)
+        os.replace(mk_tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(mk_tmp_path)
+        except OSError:
+            pass
+        raise
 
-    # 4. 更新缓存
-    global _master_key_cache
-    _master_key_cache = new_mk
-
-    # 5. 用新密钥重新加密所有文件
-    for fpath, plaintext in decrypted_data:
-        encrypted = encrypt_bytes(plaintext)
-        with open(fpath, "wb") as f:
-            f.write(encrypted)
+    # 5. 清理过渡密钥 + 刷新缓存
+    try:
+        os.remove(prev_path)
+    except OSError:
+        pass
+    _master_key_cache = (_master_key_st_mtime(), new_mk)
+    _previous_key_cache = None
 
     new_fp = get_key_fingerprint(new_mk)
     return old_fp, new_fp, len(encrypted_files)
 
 
+def rotate_master_key(data_lake_dir):
+    """轮换主密钥：生成新密钥，重新加密所有已加密文件（DEK 重包裹，内容不变）
+
+    安全顺序（重排 + 备份）：
+      - 先备份旧密钥，再逐文件用新密钥重包裹，全部成功后才原子替换 master.key。
+      - 任一步失败 master.key 不更新（或保持过渡态可读），数据不会丢失。
+      - 崩溃恢复：若存在 master.key.previous（上次轮换中断），沿用其中的密钥
+        继续完成轮换，避免数据被多种密钥分散包裹。
+
+    返回 (old_fingerprint, new_fingerprint, reencrypted_count)
+    """
+    lock_fd = _acquire_key_operation_lock()
+    try:
+        old_mk = get_master_key()
+        old_fp = get_key_fingerprint(old_mk)
+        prev = _get_previous_key()
+        new_mk = prev if prev is not None else AESGCM.generate_key(bit_length=256)
+        return _swap_master_key(old_mk, new_mk, data_lake_dir, old_fp)
+    finally:
+        _release_key_operation_lock(lock_fd)
+
+
 def verify_key_integrity(data_lake_dir):
     """验证主密钥完整性：尝试解密全部已加密文件，检查密钥是否匹配"""
-    if not os.path.isdir(data_lake_dir):
+    encrypted_files = _collect_encrypted_files(data_lake_dir)
+    if not encrypted_files:
         return {"valid": True, "checked": 0, "message": "数据湖目录为空，无需验证"}
 
     checked = 0
     failed = 0
     failed_files = []
-    for root, dirs, files in os.walk(data_lake_dir):
-        if ".transcodes" in dirs:
-            dirs.remove(".transcodes")
-        for fname in files:
-            fpath = os.path.join(root, fname)
-            try:
-                if is_encrypted_file(fpath):
-                    decrypt_file(fpath)
-                    checked += 1
-            except Exception:
-                failed += 1
-                checked += 1
-                failed_files.append(fpath)
+    for fpath in encrypted_files:
+        try:
+            decrypt_file(fpath)
+            checked += 1
+        except Exception:
+            failed += 1
+            checked += 1
+            failed_files.append(fpath)
 
     if failed == 0:
         return {"valid": True, "checked": checked, "message": f"已验证全部 {checked} 个加密文件，主密钥匹配正常"}
@@ -328,7 +590,9 @@ def export_master_key():
 
 
 def import_master_key(key_bytes, data_lake_dir):
-    """导入/替换主密钥：用新密钥重新加密所有已加密文件
+    """导入/替换主密钥：用新密钥重新加密所有已加密文件（DEK 重包裹）
+
+    与 rotate_master_key 相同的安全顺序（备份 → 发布 → 重包裹 → 原子替换 → 清理）。
     参数：
       key_bytes: 新主密钥字节（必须 32 字节）
       data_lake_dir: 数据湖目录
@@ -337,46 +601,13 @@ def import_master_key(key_bytes, data_lake_dir):
     if not isinstance(key_bytes, bytes) or len(key_bytes) != DEK_SIZE:
         raise ValueError(f"密钥文件无效：必须为 {DEK_SIZE} 字节的二进制数据")
 
-    old_mk = get_master_key()
-    old_fp = get_key_fingerprint(old_mk)
-
-    # 1. 收集所有已加密文件并用旧密钥解密
-    decrypted_data = []
-    if os.path.isdir(data_lake_dir):
-        for root, dirs, files in os.walk(data_lake_dir):
-            if ".transcodes" in dirs:
-                dirs.remove(".transcodes")
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                try:
-                    if is_encrypted_file(fpath):
-                        with open(fpath, "rb") as f:
-                            data = f.read()
-                        plaintext = decrypt_bytes(data)
-                        decrypted_data.append((fpath, plaintext))
-                except Exception:
-                    pass  # 跳过无法解密的文件
-
-    # 2. 写入新主密钥
-    path = _master_key_path()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    lock_fd = _acquire_key_operation_lock()
     try:
-        os.write(fd, key_bytes)
+        old_mk = get_master_key()
+        old_fp = get_key_fingerprint(old_mk)
+        return _swap_master_key(old_mk, key_bytes, data_lake_dir, old_fp)
     finally:
-        os.close(fd)
-
-    # 3. 更新缓存
-    global _master_key_cache
-    _master_key_cache = key_bytes
-
-    # 4. 用新密钥重新加密所有文件
-    for fpath, plaintext in decrypted_data:
-        encrypted = encrypt_bytes(plaintext)
-        with open(fpath, "wb") as f:
-            f.write(encrypted)
-
-    new_fp = get_key_fingerprint(key_bytes)
-    return old_fp, new_fp, len(decrypted_data)
+        _release_key_operation_lock(lock_fd)
 
 
 # ==================== 外部加密格式适配（AES-256-CBC） ====================

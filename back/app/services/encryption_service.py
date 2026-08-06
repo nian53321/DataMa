@@ -10,8 +10,11 @@
 - 所有操作记录操作日志（target_type='master_key'）
 """
 import io
+import logging
 from datetime import datetime
 from typing import Tuple
+
+logger = logging.getLogger(__name__)
 
 from app.extensions import db
 from app.models import User
@@ -56,8 +59,13 @@ class EncryptionService(BaseService):
         self._verify_password(confirm_password)
         try:
             old_fp, new_fp, count = rotate_master_key(self.data_lake_dir)
+        except ValueError as e:
+            # 业务性 ValueError（DEK 解密失败等）消息可直接提示用户
+            raise ValidationError(str(e))
         except Exception as e:
-            raise ValidationError(f"密钥轮换失败：{e}")
+            # 底层 IO/权限等异常：记录完整信息到服务端日志，前端只返回分类化提示
+            logger.error("主密钥轮换失败: %s", e, exc_info=True)
+            raise ValidationError("密钥轮换失败，请检查数据湖目录权限与文件完整性")
         log_operation(
             "rotate", "master_key", 0,
             f"轮换主密钥（旧指纹: {old_fp[:17]}... → 新指纹: {new_fp[:17]}...，重加密 {count} 个文件）",
@@ -109,9 +117,12 @@ class EncryptionService(BaseService):
         try:
             old_fp, new_fp, count = import_master_key(key_bytes, self.data_lake_dir)
         except ValueError as e:
+            # 业务性 ValueError（密钥长度非法 / DEK 解密失败）消息可直接提示用户
             raise ValidationError(str(e))
         except Exception as e:
-            raise ValidationError(f"密钥导入失败：{e}")
+            # 底层 IO/权限等异常：记录完整信息到服务端日志，前端只返回分类化提示
+            logger.error("主密钥导入失败: %s", e, exc_info=True)
+            raise ValidationError("密钥导入失败，请检查密钥文件有效性与数据湖目录权限")
         log_operation(
             "import", "master_key", 0,
             f"导入/替换主密钥（旧指纹: {old_fp[:17]}... → 新指纹: {new_fp[:17]}...，重加密 {count} 个文件）",

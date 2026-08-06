@@ -6,12 +6,13 @@
   mask_head   替换前 N 位（keep_head 控制替换位数）
   mask_tail   替换后 N 位（keep_tail 控制替换位数，0 则全部替换为单个 mask_char）
   mask_email  邮箱专用：@ 前部分做 mask_middle
-  hash        HMAC-SHA256 前 8 位（未配置 DESENS_HMAC_KEY 时回退无盐 SHA256）
+  hash        HMAC-SHA256 前 8 位（密钥自动生成并持久化；极端情况回退无盐 SHA256）
   redact      替换为 [REDACTED]
 """
 import hashlib
 import hmac
 import logging
+import os
 import threading
 
 
@@ -29,8 +30,65 @@ _cache = {
 _hmac_warned = False
 
 
+def _load_or_create_desens_key():
+    """加载或自动生成脱敏 HMAC 密钥文件（默认 BASE_DIR/desens.key，0600）
+
+    密钥为 32 字节随机数（hex 编码 64 字符 ASCII 存储）。
+    - 持久化保证重启后同一值的 hash 脱敏结果稳定一致
+    - O_EXCL 原子创建，多进程并发首启时只有一方生成，其余读取
+    - 仅在 app context 下工作；无 context（纯函数调用）返回 None
+
+    :returns: 32 字节密钥；不可用时返回 None
+    """
+    try:
+        from flask import current_app
+        path = current_app.config.get("DESENS_KEY_PATH") or os.path.join(
+            current_app.config["BASE_DIR"], "desens.key")
+    except Exception:
+        return None
+
+    def _read(path):
+        with open(path, "r", encoding="ascii") as f:
+            text = f.read().strip()
+        key = bytes.fromhex(text)
+        return key if len(key) == 32 else None
+
+    try:
+        if os.path.exists(path):
+            key = _read(path)
+            if key is not None:
+                return key
+            _logger.warning("脱敏密钥文件长度异常，将重新生成: %s", path)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        key = os.urandom(32)
+        fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+        try:
+            os.write(fd, key.hex().encode("ascii"))
+        finally:
+            os.close(fd)
+        return key
+    except FileExistsError:
+        # 竞态：另一进程刚生成，读取其密钥，避免多份不一致密钥
+        try:
+            return _read(path)
+        except Exception:
+            return None
+    except Exception as e:
+        _logger.warning("脱敏密钥文件加载/生成失败，hash 回退无盐 SHA256: %s", e)
+        return None
+
+
 def _get_hmac_key():
-    """获取脱敏 HMAC 密钥（未配置则返回 None，回退无盐 SHA256）"""
+    """获取脱敏 HMAC 密钥（bytes）
+
+    优先级：
+    1. 环境变量 DESENS_HMAC_KEY（显式配置，多实例部署时共享）
+    2. 自动生成并持久化的密钥文件（DESENS_KEY_PATH / BASE_DIR/desens.key）
+    3. 均不可用 → None（回退无盐 SHA256，仅记录警告）
+    """
     try:
         from flask import current_app
         key = current_app.config.get("DESENS_HMAC_KEY", "")
@@ -38,7 +96,7 @@ def _get_hmac_key():
             return key.encode("utf-8")
     except Exception:
         pass
-    return None
+    return _load_or_create_desens_key()
 
 
 def _load_config():
@@ -106,12 +164,12 @@ def mask_value(value, algorithm, keep_head=0, keep_tail=0, mask_char="*"):
         if hmac_key is not None:
             # HMAC-SHA256，取前 8 位十六进制（保持与旧版输出长度一致）
             return hmac.new(hmac_key, s_bytes, hashlib.sha256).hexdigest()[:8]
-        # 未配置 HMAC 密钥：回退现有无盐 SHA256 行为，首次记录警告
+        # 密钥不可用（无 app context / 密钥文件生成失败）：回退无盐 SHA256，首次记录警告
         global _hmac_warned
         if not _hmac_warned:
             _logger.warning(
-                "DESENS_HMAC_KEY 未配置，脱敏 hash 算法回退为无盐 SHA256，"
-                "存在彩虹表攻击风险。建议在环境变量中配置 DESENS_HMAC_KEY。"
+                "脱敏 HMAC 密钥不可用（未配置 DESENS_HMAC_KEY 且无法生成密钥文件），"
+                "hash 算法回退为无盐 SHA256，存在彩虹表攻击风险。"
             )
             _hmac_warned = True
         return hashlib.sha256(s_bytes).hexdigest()[:8]

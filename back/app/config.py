@@ -73,8 +73,12 @@ class BaseConfig:
     LOGIN_MAX_FAILS = int(os.getenv("LOGIN_MAX_FAILS", "5"))
     LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "900"))  # 15 分钟
 
-    # 脱敏 HMAC 密钥（未配置时回退到无盐 SHA256，仅记录警告日志）
+    # 脱敏 HMAC 密钥：优先使用环境变量 DESENS_HMAC_KEY（显式配置，可多实例共享）；
+    # 未配置时自动生成并持久化到 DESENS_KEY_PATH（默认 BASE_DIR/desens.key，0600），
+    # 保证同一部署内 hash 脱敏结果稳定（避免回退无盐 SHA256 的彩虹表攻击风险）
     DESENS_HMAC_KEY = os.getenv("DESENS_HMAC_KEY", "")
+    DESENS_KEY_PATH = os.getenv(
+        "DESENS_KEY_PATH", os.path.join(BASE_DIR, "desens.key"))
 
     # 日志配置
     LOG_DIR = os.path.join(BASE_DIR, "logs")

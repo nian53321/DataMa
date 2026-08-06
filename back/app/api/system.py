@@ -392,7 +392,15 @@ def verify_external_key(key_id):
     # 支持相对路径（相对于 DATA_LAKE_DIR）
     if not os.path.isabs(file_path):
         file_path = os.path.join(current_app.config["DATA_LAKE_DIR"], file_path)
-    result = _svc_external_key().verify_key_with_file(key_id, file_path)
+    # 路径安全：仅允许 DATA_LAKE_DIR 内的 .enc 文件（realpath 前缀校验），
+    # 防止伪造路径读取服务器任意文件
+    _lake_dir = os.path.realpath(current_app.config["DATA_LAKE_DIR"])
+    _real_path = os.path.realpath(file_path)
+    if not (_real_path == _lake_dir or _real_path.startswith(_lake_dir + os.sep)):
+        return fail("无效的验证路径（仅允许数据湖内文件）", 422)
+    if not _real_path.lower().endswith(".enc"):
+        return fail("无效的验证路径（仅支持 .enc 加密文件）", 422)
+    result = _svc_external_key().verify_key_with_file(key_id, _real_path)
     return success(result, message=result["message"])
 
 

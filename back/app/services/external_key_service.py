@@ -18,8 +18,11 @@
 - scanner 解密过程对其他角色透明
 """
 import base64
+import logging
 import os
 from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 
 from app.extensions import db
 from app.models import ExternalKey
@@ -274,6 +277,9 @@ class ExternalKeyService(BaseService):
         key = self._get_or_404(ExternalKey, key_id, "外部密钥不存在")
         if not os.path.isfile(encrypted_file_path):
             raise ValidationError("待验证的加密文件不存在")
+        # 防大文件整读 OOM：验证场景仅需较小的样本加密文件
+        if os.path.getsize(encrypted_file_path) > 256 * 1024 * 1024:
+            raise ValidationError("待验证文件过大（>256MB），请选择较小的样本文件")
 
         try:
             key_bytes = base64.b64decode(key.key_b64)
@@ -293,15 +299,16 @@ class ExternalKeyService(BaseService):
                 "plaintext_size": len(plaintext),
             }
         except Exception as e:
+            logger.warning("外部密钥验证失败 key_id=%s: %s", key.id, e)
             log_operation(
                 "verify", "external_key", key.id,
-                f"验证外部密钥「{key.name}」对文件 {os.path.basename(encrypted_file_path)}：失败（{e}）",
+                f"验证外部密钥「{key.name}」对文件 {os.path.basename(encrypted_file_path)}：失败",
                 operator=self._operator_user(),
             )
             self._commit()
             return {
                 "valid": False,
-                "message": f"密钥不匹配：{e}",
+                "message": "密钥不匹配，请检查密钥与 IV 是否正确",
                 "plaintext_size": 0,
             }
 
