@@ -1,12 +1,16 @@
 import { defineStore } from 'pinia'
 import { loginApi, getMeApi } from '@/api/auth'
+import {
+  getToken, getRefreshToken, setToken, setRefreshToken,
+  setUserInfo, getStoredUserInfo, setMenus, getStoredMenus, clearAuth,
+} from '@/utils/auth'
 
 export const useUserStore = defineStore('user', {
   state: () => ({
-    token: localStorage.getItem('token') || '',
-    refreshToken: localStorage.getItem('refresh_token') || '',
-    userInfo: JSON.parse(localStorage.getItem('userInfo') || 'null'),
-    menus: JSON.parse(localStorage.getItem('menus') || '[]'),
+    token: getToken(),
+    refreshToken: getRefreshToken(),
+    userInfo: getStoredUserInfo(),
+    menus: getStoredMenus(),
   }),
   getters: {
     isLogin: (state) => !!state.token,
@@ -25,20 +29,18 @@ export const useUserStore = defineStore('user', {
       this.refreshToken = res.data.refresh_token || ''
       this.userInfo = res.data.user
       this.menus = res.data.menus || []
-      localStorage.setItem('token', this.token)
-      if (this.refreshToken) {
-        localStorage.setItem('refresh_token', this.refreshToken)
-      }
-      localStorage.setItem('userInfo', JSON.stringify(this.userInfo))
-      localStorage.setItem('menus', JSON.stringify(this.menus))
+      setToken(this.token)
+      setRefreshToken(this.refreshToken)
+      setUserInfo(this.userInfo)
+      setMenus(this.menus)
       return res
     },
     async fetchMe() {
       const res = await getMeApi()
       this.userInfo = res.data
       this.menus = res.data.menus || []
-      localStorage.setItem('userInfo', JSON.stringify(this.userInfo))
-      localStorage.setItem('menus', JSON.stringify(this.menus))
+      setUserInfo(this.userInfo)
+      setMenus(this.menus)
       return res
     },
     logout() {
@@ -46,10 +48,7 @@ export const useUserStore = defineStore('user', {
       this.refreshToken = ''
       this.userInfo = null
       this.menus = []
-      localStorage.removeItem('token')
-      localStorage.removeItem('refresh_token')
-      localStorage.removeItem('userInfo')
-      localStorage.removeItem('menus')
+      clearAuth()
     },
   },
 })

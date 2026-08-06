@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '@/router'
+import { getToken, getRefreshToken, setToken, clearAuth } from '@/utils/auth'
 
 const service = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
@@ -10,7 +11,7 @@ const service = axios.create({
 // 请求拦截：携带 token
 service.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('token')
+    const token = getToken()
     if (token) {
       config.headers.Authorization = `Bearer ${token}`
     }
@@ -31,6 +32,11 @@ const processQueue = (error, token = null) => {
     }
   })
   failedQueue = []
+}
+
+const redirectToLogin = () => {
+  clearAuth()
+  router.push('/login')
 }
 
 // 响应拦截：统一处理业务码与 token 刷新
@@ -59,20 +65,20 @@ service.interceptors.response.use(
       isRefreshing = false
       processQueue(new Error('refresh failed'), null)
       ElMessage.error('登录已过期，请重新登录')
-      localStorage.removeItem('token')
-      localStorage.removeItem('refresh_token')
-      localStorage.removeItem('userInfo')
-      router.push('/login')
+      redirectToLogin()
       return Promise.reject(error)
     }
 
     // 其他 401：尝试用 refresh token 刷新
     if (status === 401 && !originalRequest._retry) {
       if (isRefreshing) {
-        // 已有刷新请求进行中，排队等待
+        // 已有刷新请求进行中，排队等待；刷新失败时排队链同步失败
         return new Promise((resolve, reject) => {
-          failedQueue.push({ resolve, reject, originalRequest })
+          failedQueue.push({ resolve, reject })
         }).then((token) => {
+          if (typeof token !== 'string' || !token) {
+            return Promise.reject(new Error('token 刷新失败'))
+          }
           originalRequest.headers.Authorization = `Bearer ${token}`
           return service(originalRequest)
         })
@@ -82,7 +88,7 @@ service.interceptors.response.use(
       isRefreshing = true
 
       try {
-        const refreshToken = localStorage.getItem('refresh_token')
+        const refreshToken = getRefreshToken()
         if (!refreshToken) {
           throw new Error('no refresh token')
         }
@@ -91,18 +97,18 @@ service.interceptors.response.use(
           {},
           { headers: { Authorization: `Bearer ${refreshToken}` } }
         )
-        const newToken = res.data.data.token
-        localStorage.setItem('token', newToken)
+        const newToken = res?.data?.data?.token
+        if (typeof newToken !== 'string' || !newToken) {
+          throw new Error('刷新响应缺少 token')
+        }
+        setToken(newToken)
         processQueue(null, newToken)
         originalRequest.headers.Authorization = `Bearer ${newToken}`
         return service(originalRequest)
       } catch (refreshError) {
         processQueue(refreshError, null)
         ElMessage.error('登录已过期，请重新登录')
-        localStorage.removeItem('token')
-        localStorage.removeItem('refresh_token')
-        localStorage.removeItem('userInfo')
-        router.push('/login')
+        redirectToLogin()
         return Promise.reject(refreshError)
       } finally {
         isRefreshing = false

@@ -63,11 +63,10 @@ const userStore = useUserStore()
 const formRef = ref()
 const loading = ref(false)
 
-// 仅开发环境预填默认账号（生产环境留空）
-const isDev = import.meta.env.DEV
+// 登录表单默认留空，不预填任何凭据（避免默认口令被自动化工具/他人利用）
 const form = reactive({
-  username: isDev ? 'admin' : '',
-  password: isDev ? '123456' : '',
+  username: '',
+  password: '',
 })
 
 const rules = {
