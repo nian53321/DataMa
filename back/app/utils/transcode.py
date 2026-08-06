@@ -39,6 +39,13 @@ def is_native_audio(file_format):
     return (file_format or "").lower() in NATIVE_AUDIO
 
 
+def _cleanup(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def transcode_to_mp4(src_path, dst_path):
     """将源视频转码为 H.264 + AAC 的 MP4（浏览器可直接播放）
     返回 (成功?, 错误信息)
@@ -49,18 +56,28 @@ def transcode_to_mp4(src_path, dst_path):
     if not os.path.exists(src_path):
         return False, "源文件不存在"
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    # 并发安全：先写临时文件再原子 rename 到目标缓存路径。多个请求并发首次
+    # 转码同一资产时各写各的临时文件，最后 rename 原子覆盖——结果始终是完整
+    # 文件，不会出现并发写同一路径互相截断导致缓存损坏、之后所有播放都失败。
+    tmp_path = dst_path + ".tmp"
     # -y 覆盖；-c:v libx264 H.264；-preset fast 速度优先；-crf 23 质量；-c:a aac 音频；-movflags +faststart 支持流式播放
     cmd = [
         ffmpeg, "-y", "-i", src_path,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
-        dst_path,
+        tmp_path,
     ]
     try:
         subprocess.run(cmd, capture_output=True, timeout=600, check=True)
+        os.replace(tmp_path, dst_path)
         return True, None
     except subprocess.CalledProcessError as e:
+        _cleanup(tmp_path)
         return False, e.stderr.decode("utf-8", errors="ignore")[:500]
     except subprocess.TimeoutExpired:
+        _cleanup(tmp_path)
         return False, "转码超时（文件过大）"
+    except OSError:
+        _cleanup(tmp_path)
+        return False, "转码文件写入失败"

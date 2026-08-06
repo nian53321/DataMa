@@ -13,6 +13,7 @@ from app.api import visualization_bp
 from app.models import Subject, DataAsset, DataType
 from app.utils.response import success, fail
 from app.utils.time import to_local_str
+from app.utils.media_auth import media_auth_required
 from app.services.asset_service import _decrypt_for_serving
 
 
@@ -112,7 +113,8 @@ def _parse_eeg_edf(asset):
         with open(file_path, "rb") as f:
             raw = f.read()
     except OSError as e:
-        return fail(f"EDF 文件读取失败: {str(e)}", 422)
+        current_app.logger.warning("EDF 文件读取失败: %s", e)
+        return fail("EDF 文件读取失败，文件可能被占用或已损坏", 422)
     finally:
         if tmp_path:
             try:
@@ -226,7 +228,8 @@ def _parse_eeg_edf(asset):
             "channels": channels,
         })
     except (ValueError, struct.error, IndexError) as e:
-        return fail(f"EDF 解析失败: {str(e)}", 422)
+        current_app.logger.warning("EDF 解析失败: %s", e)
+        return fail("EDF 文件解析失败，格式可能不符合 EDF 规范", 422)
 
 
 def _parse_eeg_csv(text):
@@ -379,7 +382,8 @@ def eeg_asset_parse(asset_id):
                 return _parse_eeg_csv(text)
             return fail(f"不支持的脑电文件格式: {fmt or '未知'}，支持 CSV/JSON/EDF", 422)
     except (json.JSONDecodeError, ValueError, IndexError) as e:
-        return fail(f"脑电文件解析失败: {str(e)}", 422)
+        current_app.logger.warning("脑电文件解析失败: %s", e)
+        return fail("脑电文件解析失败，文件格式不受支持或已损坏", 422)
     finally:
         if tmp_path:
             try:
@@ -469,7 +473,8 @@ def ecg_asset_parse(asset_id):
             "data": downsampled,
         })
     except (ValueError, IndexError) as e:
-        return fail(f"心电文件解析失败: {str(e)}", 422)
+        current_app.logger.warning("心电文件解析失败: %s", e)
+        return fail("心电文件解析失败，文件格式不受支持或已损坏", 422)
     finally:
         if tmp_path:
             try:
@@ -708,10 +713,17 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
     span = (hi - lo) or 1.0
 
     # 第二遍：逐帧伪彩色写入中间 mp4（MPEG-4 Part 2）
-    tmp_raw = out_path + ".tmp.mp4"
+    # 中间文件唯一化：并发请求首次访问同一资产时各写各的临时文件，避免互相截断
+    import tempfile as _tf
+    _fd, tmp_raw = _tf.mkstemp(suffix=".tmp.mp4", dir=os.path.dirname(out_path))
+    os.close(_fd)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(tmp_raw, fourcc, float(fps), (w, h))
     if not writer.isOpened():
+        try:
+            os.remove(tmp_raw)
+        except OSError:
+            pass
         return False
     try:
         for arr in _read_depth_frames(file_path, stream_index, w, h, step=1, src_pix_fmt=src_pix_fmt):
@@ -725,12 +737,14 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
         writer.release()
 
     # ffmpeg 转 H.264（浏览器可播）+ faststart（moov 前置，秒开）
+    # 先写临时文件，成功后原子 rename 到缓存路径：并发首次访问不会互相截断损坏缓存
+    tmp_h264 = out_path + ".h264.tmp"
     p = subprocess.run(
         ["ffmpeg", "-y", "-i", tmp_raw,
          "-c:v", "libx264", "-pix_fmt", "yuv420p",
          "-preset", "medium", "-crf", "23",
          "-movflags", "+faststart",
-         "-an", out_path],
+         "-an", tmp_h264],
         capture_output=True, timeout=600,
     )
     try:
@@ -738,15 +752,21 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
     except OSError:
         pass
     if p.returncode != 0:
+        try:
+            os.remove(tmp_h264)
+        except OSError:
+            pass
         return False
+    os.replace(tmp_h264, out_path)
     return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
 
 
 @visualization_bp.route("/depth-video/<int:asset_id>", methods=["GET"])
-@jwt_required()
+@media_auth_required("depth_video", resource_key="asset_id")
 def depth_video(asset_id):
     """深度视频播放：把 mkv 深度轨转码为伪彩色 MP4，浏览器 <video> 直接播放
 
+    鉴权：优先 ?media_token=<短期签名>，兼容 JWT（header / access_token query）。
     首次请求触发转码（耗时较长），结果缓存到临时目录，后续秒开。
     非深度视频（无深度轨）返回 404。自动处理加密文件解密。
     """

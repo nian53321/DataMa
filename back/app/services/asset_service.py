@@ -277,10 +277,15 @@ class AssetService(BaseService):
 
         # 幂等检查：同受试者+同模态+同原始文件名+同原始大小（视频还需 video_type 一致）
         # 视为重复上传（前端定时扫描场景）。命名规范会改写存储文件名，所以用原始文件名作为去重 key
-        existing = DataAsset.query.filter_by(
-            subject_id=subject_id,
-            data_type=dt,
-        ).all()
+        # 只取必要列（id/file_name/metadata_json），避免每次上传全量拉取该受试者同模态的所有资产
+        existing = (
+            DataAsset.query
+            .filter_by(subject_id=subject_id, data_type=dt)
+            .with_entities(
+                DataAsset.id, DataAsset.file_name, DataAsset.metadata_json,
+            )
+            .all()
+        )
         for ex in existing:
             meta = ex.metadata_json or {}
             if (meta.get("original_filename") == original_name
@@ -291,13 +296,11 @@ class AssetService(BaseService):
                               f"重复上传跳过（命中既有资产 {ex.file_name}）{original_ref} 到 {subject.pseudo_id}/{data_type}",
                               operator=self._operator_user())
                 self._commit()
-                return ex, True  # (asset, is_duplicate) 命中既有资产
+                # 命中既有资产：补查完整模型实例返回（调用方需 to_dict）
+                return DataAsset.query.get(ex.id), True  # (asset, is_duplicate)
 
-        # 视频重采：删除受试者名下同 video_type 的旧视频资产（不影响其他类型）
-        # 这是新规则：每个受试者可同时存在 face/body/gait 三类视频，重采只替换同类型
-        if dt == DataType.VIDEO and video_type:
-            self._purge_subject_video_by_type(subject_id, video_type, storage_root=None)
-
+        # 视频重采不在此处删旧：必须等新文件成功落盘入库后再删（见下方 _commit 之后），
+        # 保证"先写新、后删旧"，新文件失败时旧视频仍保留，避免重采造成数据丢失。
         # 应用命名规范：查询启用的命名规范并生成规范化文件名
         # 外部加密文件传剥离 .enc 后的文件名，确保扩展名是真实类型（wav 而非 enc）
         # 视频传 video_type 用于命名区分（face/body/gait）
@@ -412,6 +415,13 @@ class AssetService(BaseService):
                       operator=self._operator_user())
         # 业务数据 + 快照 + 日志一次性原子提交（避免双 commit 中途失败导致审计日志丢失）
         self._commit()
+        # 视频重采：新文件已成功入库后再删除同 video_type 的旧视频资产。
+        # 顺序必须"先写新后删旧"：若新文件落盘/入库失败，旧视频仍保留，避免重采造成数据丢失。
+        # exclude_asset_id=asset.id 排除刚上传的新视频，只删同类型的其他旧视频。
+        if dt == DataType.VIDEO and video_type:
+            self._purge_subject_video_by_type(
+                subject_id, video_type, storage_root=None, exclude_asset_id=asset.id,
+            )
         return asset, False  # (asset, is_duplicate) 新建资产
 
     # ==================== 文件服务（下载/播放） ====================
@@ -511,10 +521,13 @@ class AssetService(BaseService):
         return User.query.get(self.operator_id)
 
     def _purge_subject_video_by_type(self, subject_id: int, video_type: str,
-                                     storage_root: Optional[str] = None):
-        """删除受试者名下指定 video_type 的视频资产（重采前调用）
+                                     storage_root: Optional[str] = None,
+                                     exclude_asset_id: Optional[int] = None):
+        """删除受试者名下指定 video_type 的视频资产（重采完成后调用）
 
         仅删除同类型视频，保留其他类型（face/body/gait 互不影响）。
+        exclude_asset_id 传新建资产的 id 时，跳过该资产（重采场景新文件已入库，
+        避免把刚上传的新视频一并删除）。
         删除顺序：先留档 + 收集关联记录 → DB commit → 删磁盘文件（best-effort）。
         """
         from app.services.subject_service import _purge_asset_records, _collect_asset_file_paths
@@ -531,6 +544,7 @@ class AssetService(BaseService):
         to_delete = [
             a for a in candidates
             if (a.metadata_json or {}).get("video_type") == video_type
+            and (exclude_asset_id is None or a.id != exclude_asset_id)
         ]
         if not to_delete:
             return

@@ -11,6 +11,7 @@
 import os
 import re
 import json
+import logging
 import threading
 from datetime import datetime
 
@@ -18,6 +19,8 @@ from app.extensions import db
 from app.models.subject import Subject
 from app.models.scan_config import ScanConfig
 from app.models.data import DataAsset, DataType, DataLayer
+
+logger = logging.getLogger(__name__)
 from app.utils.crypto import (
     encrypt_bytes, is_encrypted_file,
     is_external_encrypted_file,
@@ -34,6 +37,8 @@ from app.utils.scale_adapter import (
 # 全局定时器引用
 _scan_timer = None
 _lock = threading.Lock()
+# 扫描执行互斥锁：防止手动"立即扫描"与定时扫描并发执行同一目录
+_scan_run_lock = threading.Lock()
 
 # 伪ID合法格式：3-64位字母/数字/下划线/短横线，不以 .~$ 开头
 _PSEUDO_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{3,64}$")
@@ -337,81 +342,88 @@ def scan_watch_dir(config):
     if not os.path.isdir(watch_dir):
         return result
 
-    new_count = 0
-    skipped = 0
+    # 扫描互斥：手动"立即扫描"与定时器并发时，后到者直接跳过本次，避免并发
+    # add Subject 撞唯一索引 / 并发写同一数据湖文件互相覆盖损坏
+    if not _scan_run_lock.acquire(blocking=False):
+        return result
     try:
-        entries = sorted(os.listdir(watch_dir))
-        for entry in entries:
-            sub_dir = os.path.join(watch_dir, entry)
-            if not os.path.isdir(sub_dir):
-                continue
-            pseudo_id = entry.strip()
-            if not pseudo_id:
-                continue
-            # 伪ID格式校验
-            if not _validate_pseudo_id(pseudo_id):
-                skipped += 1
-                continue
-            # 检查是否已存在
-            existing = Subject.query.filter_by(pseudo_id=pseudo_id).first()
-            if existing:
-                # 受试者已存在：检查是否有未导入的新类型文件（增量导入）
+        new_count = 0
+        skipped = 0
+        try:
+            entries = sorted(os.listdir(watch_dir))
+            for entry in entries:
+                sub_dir = os.path.join(watch_dir, entry)
+                if not os.path.isdir(sub_dir):
+                    continue
+                pseudo_id = entry.strip()
+                if not pseudo_id:
+                    continue
+                # 伪ID格式校验
+                if not _validate_pseudo_id(pseudo_id):
+                    skipped += 1
+                    continue
+                # 检查是否已存在
+                existing = Subject.query.filter_by(pseudo_id=pseudo_id).first()
+                if existing:
+                    # 受试者已存在：检查是否有未导入的新类型文件（增量导入）
+                    if config.auto_upload_files:
+                        existing_types = {
+                            a.data_type.value for a in
+                            DataAsset.query.filter_by(subject_id=existing.id).all()
+                        }
+                        _import_files_for_subject(
+                            sub_dir, existing,
+                            skip_data_types=existing_types,
+                            failure_collector=result["failures"],
+                        )
+                    continue
+                # 创建新受试者
+                subject = Subject(
+                    pseudo_id=pseudo_id,
+                    status="collecting",
+                )
+                # 应用扫描配置的默认批次/场景（作为兜底，userInfo.json 字段优先）
+                if getattr(config, "collection_batch", None):
+                    subject.collection_batch = config.collection_batch
+                if getattr(config, "collection_scene", None):
+                    subject.collection_scene = config.collection_scene
+                # 解析 userInfo.json 填充元数据（支持明文 / 外部加密 / DMEC 加密三种形态）
+                _, fields = _find_user_info(
+                    sub_dir, failure_collector=result["failures"],
+                )
+                if fields:
+                    for k, v in fields.items():
+                        # pseudo_id 以目录名为准（目录是用户组织数据的结构），不覆盖
+                        if k == "pseudo_id":
+                            continue
+                        setattr(subject, k, v)
+
+                # 眼动评估数据 sync_data.json 仅解析存储为 DataAsset（data_type=eye, layer=feature），
+                # 不映射字段到 Subject，也不自动划分风险分级
+                db.session.add(subject)
+                db.session.flush()  # 获取 id
+
+                # 可选：自动上传文件
                 if config.auto_upload_files:
-                    existing_types = {
-                        a.data_type.value for a in
-                        DataAsset.query.filter_by(subject_id=existing.id).all()
-                    }
                     _import_files_for_subject(
-                        sub_dir, existing,
-                        skip_data_types=existing_types,
+                        sub_dir, subject,
                         failure_collector=result["failures"],
                     )
-                continue
-            # 创建新受试者
-            subject = Subject(
-                pseudo_id=pseudo_id,
-                status="collecting",
-            )
-            # 应用扫描配置的默认批次/场景（作为兜底，userInfo.json 字段优先）
-            if getattr(config, "collection_batch", None):
-                subject.collection_batch = config.collection_batch
-            if getattr(config, "collection_scene", None):
-                subject.collection_scene = config.collection_scene
-            # 解析 userInfo.json 填充元数据（支持明文 / 外部加密 / DMEC 加密三种形态）
-            _, fields = _find_user_info(
-                sub_dir, failure_collector=result["failures"],
-            )
-            if fields:
-                for k, v in fields.items():
-                    # pseudo_id 以目录名为准（目录是用户组织数据的结构），不覆盖
-                    if k == "pseudo_id":
-                        continue
-                    setattr(subject, k, v)
 
-            # 眼动评估数据 sync_data.json 仅解析存储为 DataAsset（data_type=eye, layer=feature），
-            # 不映射字段到 Subject，也不自动划分风险分级
-            db.session.add(subject)
-            db.session.flush()  # 获取 id
+                new_count += 1
 
-            # 可选：自动上传文件
-            if config.auto_upload_files:
-                _import_files_for_subject(
-                    sub_dir, subject,
-                    failure_collector=result["failures"],
-                )
+            config.last_scan_at = datetime.utcnow()
+            config.last_scan_count = new_count
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            raise e
 
-            new_count += 1
-
-        config.last_scan_at = datetime.utcnow()
-        config.last_scan_count = new_count
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        raise e
-
-    result["new_count"] = new_count
-    result["skipped"] = skipped
-    return result
+        result["new_count"] = new_count
+        result["skipped"] = skipped
+        return result
+    finally:
+        _scan_run_lock.release()
 
 
 def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_collector=None):
@@ -508,9 +520,22 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
         dst_path = os.path.join(target_dir, new_name)
         # 读取源文件明文（自动适配 DMEC / 外部 AES-CBC / 明文三种格式）
         # 失败时记录到 failure_collector 并跳过该文件
-        plaintext = _read_file_plaintext(
-            src_path, failure_collector=failure_collector,
-        )
+        try:
+            plaintext = _read_file_plaintext(
+                src_path, failure_collector=failure_collector,
+            )
+        except Exception as e:
+            # 文件 IO/解析失败（权限不足、文件正被占用、读取期间被删除等）：
+            # 记录后跳过该文件，不中断整批扫描（与解密失败的处理一致）
+            if failure_collector is not None:
+                failure_collector.append({
+                    "file": src_path,
+                    "reason": "文件读取失败（IO/权限错误），已跳过该文件",
+                    "last_error": str(e),
+                })
+            else:
+                raise
+            continue
         if plaintext is None:
             continue  # 解密失败已记录，跳过此文件
 
@@ -572,7 +597,7 @@ def run_scan_once():
             total_new += result.get("new_count", 0)
             all_failures.extend(result.get("failures", []))
         except Exception:
-            pass
+            logger.exception("扫描配置异常：%s", config.handle)
     return {"new_count": total_new, "failures": all_failures}
 
 
@@ -607,7 +632,7 @@ def _scan_tick(app):
         try:
             run_scan_once()
         except Exception:
-            pass
+            logger.exception("定时扫描执行失败")
     # 安排下一次
     _schedule_next(app)
 
