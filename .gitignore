@@ -57,6 +57,8 @@ capture_screenshots.py
 capture_screenshots_v2.py
 generate_word_manual.py
 改动需求.md
+*.tmp.py
+.usb_check_tmp.py
 
 # ===================== 后端脚本（仅保留部署必需的子进程）=====================
 # back/scripts/ 是部署必要目录（Dockerfile COPY . . 会拷入镜像）：
