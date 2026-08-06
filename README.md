@@ -255,7 +255,7 @@ cd <项目目录>
 
 脚本自动完成：
 - 检查 Docker 环境
-- 生成 `back/.env`（自动生成强密码和 JWT 密钥；密码不含 `$`，值带引号写入防止 `#` 被当注释）
+- 生成 `back/.env`（自动生成强密码和 JWT 密钥；密码仅含 `!*()-_=+` 等 URL 安全字符，值带引号写入）
 - 同步根目录 `.env`（供 docker-compose.yml 读取 DB_PASSWORD）
 - 拉镜像 + 构建镜像 + 启动所有服务
 - 等待后端健康检查通过
@@ -278,7 +278,8 @@ Copy-Item .env.example .env
 | `JWT_SECRET_KEY` | JWT 签名密钥 | `python -c "import secrets;print(secrets.token_hex(32))"` |
 
 **注意**：保持 `DB_HOST=mysql`、`CELERY_BROKER_URL=redis://redis:6379/0`、`CELERY_RESULT_BACKEND=redis://redis:6379/1` 不要改回 localhost，这是容器间服务名通信的必需配置。
-**注意**：`.env` 中密码/密钥**不要包含 `$` 字符**——docker compose 解析 `.env` 时会把 `$VAR` 当作变量插值改写，导致 MySQL 与后端密码不一致（双引号包裹也无法避免）。建议直接使用 `python -c "import secrets;print(secrets.token_hex(16))"` 生成的 32 位 hex 密码，或使用 `.\deploy.ps1` 自动生成。
+**注意**：`.env` 中密码/密钥**不要包含 `$` 字符**——docker compose 解析 `.env` 时会把 `$VAR` 当作变量插值改写，导致 MySQL 与后端密码不一致（双引号包裹也无法避免）。
+**注意**：密码**不要包含 `@` 字符**——后端 SQLAlchemy 数据库连接串会把第一个 `@` 当作 userinfo 分隔符，`@` 后面的内容会拼进 host 导致连接失败（如报 `Can't connect to MySQL server on 'xxx@mysql'`）。后端已对密码做 URL 编码，手工填写含 `@` 的密码也能正常工作；`deploy.ps1` 生成的密码仅使用 `!*()-_=+` 等 URL 安全字符。建议直接使用 `python -c "import secrets;print(secrets.token_hex(16))"` 生成的 32 位 hex 密码，或使用 `.\deploy.ps1` 自动生成。
 
 ##### 步骤 2：同步根目录 .env
 
@@ -298,6 +299,8 @@ docker compose up -d --build
 ```
 
 首次启动需要拉取镜像 + npm install + pip install，约 5-10 分钟。
+
+首次启动后 `back/keys/master.key` 与 `back/keys/desens.key` 由后端自动生成（挂载目录可读写），请勿删除；备份时随项目目录一并带走。
 
 ##### 步骤 4：验证
 
@@ -339,10 +342,12 @@ docker compose logs -f frontend
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker（容器部署保持 redis） |
 | `CELERY_RESULT_BACKEND` | `redis://redis:6379/1` | Celery 结果后端 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
+| `MASTER_KEY_PATH` | `/app/keys/master.key` | 主密钥文件路径（容器内；宿主机对应 `back/keys/master.key`，首次启动自动生成） |
+| `DESENS_KEY_PATH` | `/app/keys/desens.key` | 脱敏 HMAC 密钥文件路径（容器内；宿主机对应 `back/keys/desens.key`） |
 | `GUNICORN_WORKERS` | `4` | Gunicorn worker 数量（**docker-compose 中已覆盖为 1**，深度相机 USB 由容器内独占采集，多 worker 会导致 USB 竞争冲突） |
 
 > **未在 .env 中列出但代码会读取的配置**（一般用默认值即可，详见 [back/app/config.py](file:///d:/Py_Project/DataManagement/back/app/config.py)）：
-> - `BASE_DIR`、`DATA_LAKE_DIR`、`MASTER_KEY_PATH`：数据湖与主密钥路径
+> - `BASE_DIR`、`DATA_LAKE_DIR`：数据湖路径；`MASTER_KEY_PATH` / `DESENS_KEY_PATH`：主密钥与脱敏密钥路径（容器内 `/app/keys/*.key`，宿主机 `back/keys/` 目录挂载）
 > - `ENCRYPTION_ENABLED`：是否启用文件加密（默认启用）
 > - `MAX_UPLOAD_SIZE`：上传大小限制
 > - `JWT_ACCESS_TOKEN_EXPIRES` / `JWT_REFRESH_TOKEN_EXPIRES`：token 过时间
@@ -402,7 +407,7 @@ docker compose exec mysql mysql -uroot -p
 |---|---|---|
 | MySQL 数据 | `mysql-data` volume | 业务数据全丢 |
 | 数据湖文件 | `backend-data` volume | 所有原始数据全丢 |
-| `master.key` | `back/master.key` | **加密文件永久无法解密** |
+| `master.key` | `back/keys/master.key` | **加密文件永久无法解密** |
 | 外部密钥 | MySQL 中的 `external_key` 表 | 外部加密文件无法解密 |
 
 ### 备份 MySQL 数据（含外部密钥）
@@ -426,10 +431,10 @@ docker run --rm -v datamanagement_backend-data:/data -v ${PWD}:/backup alpine `
 ### 备份 master.key（**关键！丢失后所有加密数据无法恢复**）
 
 ```powershell
-Copy-Item back\master.key back\master.key.backup
+Copy-Item back\keys\master.key back\keys\master.key.backup
 ```
 
-> **重要**：`master.key` 是信封加密的主密钥，丢失后数据湖中所有加密文件将永久无法解密。请妥善备份，建议同时存放到独立的加密存储中。
+> **重要**：`master.key` 是信封加密的主密钥（位于 `back/keys/master.key`），丢失后数据湖中所有加密文件将永久无法解密。请妥善备份，建议同时存放到独立的加密存储中。`back/keys/` 目录不入 git，请随项目目录一并备份。
 
 ### 迁移到新设备完整流程
 
@@ -440,7 +445,7 @@ docker run --rm -v datamanagement_backend-data:/data -v ${PWD}:/backup alpine ta
 
 # 2. 拷贝到新设备（需要带走的文件）
 #    - 整个项目源码（可删 front/dist、front/node_modules、back/__pycache__）
-#    - back/master.key
+#    - back/keys/（内含 master.key）
 #    - back/.env
 #    - backup.sql
 #    - data_lake.tar.gz
@@ -515,6 +520,10 @@ docker compose up -d                      # 启动剩余服务
 - **原因**：`JWT_SECRET_KEY` 变化后，浏览器 localStorage 里的旧 token（旧密钥签名）失效，flask_jwt_extended 对无效 token 默认返回 422，所以部署脚本只能在第一次使用。
 - **解决**：**重新登录一次**即可；若持续出现，确认 `back/.env` 中 `JWT_SECRET_KEY` 的值正确（密钥不要含 `$`——compose 会插值改写；若含 `#` 需放在值中间或加引号，避免行首 `#` 被当注释截断）
 
+### Q12：backend 日志提示"主密钥初始化失败 / 文件加密不可用"
+- **原因**：旧版本把单文件 `back/master.key` 以 `:ro` 绑定挂载到容器 `/app/master.key`，宿主机文件缺失时 Docker 会创建同名**目录**，后端无法生成密钥文件，文件加密被禁用。
+- **解决**：拉取新版（挂载已改为 `./back/keys:/app/keys` 目录方案）：删除失效目录 `Remove-Item back\master.key -Recurse`，重新 `docker compose up -d --build`，首次启动后自动生成 `back/keys/master.key`。若仍有已加密数据，请先从旧部署备份 `back/master.key` 文件并放入 `back/keys/master.key`。
+
 ## 生产环境加固建议
 
 1. **改默认 admin 密码**：登录后立即在用户管理中修改
@@ -541,7 +550,7 @@ DataManagement/
 │   ├── .dockerignore
 │   ├── .env.example            # 环境变量模板
 │   ├── .env                    # 实际环境变量（不入 git）
-│   ├── master.key              # 加密主密钥（首次启动自动生成）
+│   ├── keys/                   # 加密主密钥 master.key + 脱敏密钥 desens.key（首次启动自动生成，不入 git）
 │   ├── requirements.txt
 │   ├── gunicorn_config.py
 │   ├── run.py                  # Flask 入口

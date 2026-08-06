@@ -15,6 +15,9 @@ import logging
 import os
 import threading
 
+# os.O_BINARY 仅存在于 Windows，Unix 缺失时置 0 兼容
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 
 _logger = logging.getLogger(__name__)
 
@@ -64,7 +67,7 @@ def _load_or_create_desens_key():
             os.makedirs(parent, exist_ok=True)
         key = os.urandom(32)
         fd = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
         try:
             os.write(fd, key.hex().encode("ascii"))
         finally:

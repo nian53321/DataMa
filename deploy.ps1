@@ -49,8 +49,11 @@ function Get-StrongPassword {
     # 生成 24 位强密码：含大小写字母+数字+特殊字符（不含易混淆字符 0O1lI）
     # 注意：不能包含 $ —— docker compose 解析 .env 时会把 $VAR 当变量插值，
     # 含 $ 的密码会被静默改写导致 MySQL/后端密码不一致。
+    # 注意：特殊字符仅用 ! * ( ) - _ = +（RFC 3986 URL userinfo 允许的子分隔符），
+    # 不能包含 @ : / ? # % & —— 后端 SQLAlchemy DSN 会按第一个 @ 截断解析密码，
+    # 含 @ 的密码会被拼进 host（如 beS6EL@mysql）；# 在部分 .env 解析器里是注释符。
     # 注意：用字符串数组而非 char[]，避免 PowerShell 数组展开（@() 换行分隔会展开嵌套数组）
-    $sets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnpqrstuvwxyz', '23456789', '!@#%^&*()-_=+')
+    $sets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnpqrstuvwxyz', '23456789', '!*()-_=+')
     $all = $sets -join ''
     $chars = [System.Collections.Generic.List[char]]::new()
     # 每个字符集至少取 1 个，保证四类都出现
@@ -131,12 +134,29 @@ foreach ($f in $requiredFiles) {
     }
 }
 
-# master.key 不存在是正常的（首次启动后端会自动生成）
-$masterKeyPath = Join-Path $ProjectRoot 'back/master.key'
-if (-not (Test-Path $masterKeyPath)) {
-    Write-Warn2 'back/master.key 不存在，首次启动后端会自动生成'
+# 密钥目录 back/keys 会挂载到容器 /app/keys（可读写），首次启动后端自动生成密钥文件。
+# 旧版把单文件 back/master.key 以 :ro 绑定挂载到 /app/master.key：宿主机文件缺失时
+# Docker 会创建同名目录，容器内 /app/master.key 变成目录导致后端无法生成密钥
+# （文件加密被禁用），且 :ro 无法支持密钥轮换，因此统一改用目录挂载方案。
+$keysDir = Join-Path $ProjectRoot 'back/keys'
+$keysMasterKey = Join-Path $keysDir 'master.key'
+$oldMasterKey = Join-Path $ProjectRoot 'back/master.key'
+if (-not (Test-Path $keysDir)) {
+    New-Item -ItemType Directory -Path $keysDir | Out-Null
+}
+if (Test-Path $oldMasterKey) {
+    $oldKeyItem = Get-Item $oldMasterKey
+    if ($oldKeyItem.PSIsContainer) {
+        Write-Warn2 '检测到 back/master.key 为目录（旧版绑定的失效产物），新方案已改用 back/keys 目录，可手动删除'
+    } elseif (-not (Test-Path $keysMasterKey)) {
+        Copy-Item $oldMasterKey $keysMasterKey
+        Write-Warn2 '已将旧版 back/master.key 迁移到 back/keys/master.key（保持已加密数据可解密）'
+    }
+}
+if (-not (Test-Path $keysMasterKey)) {
+    Write-Warn2 'back/keys/master.key 不存在，首次启动后端会自动生成'
 } else {
-    Write-OK 'back/master.key（已存在，将复用）'
+    Write-OK 'back/keys/master.key（已存在，将复用）'
 }
 
 # ============ 3. 生成或修补 back/.env ============

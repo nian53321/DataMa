@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """应用配置"""
 import os
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,8 +22,8 @@ class BaseConfig:
     DB_NAME = os.getenv("DB_NAME", "data_management")
 
     SQLALCHEMY_DATABASE_URI = (
-        f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-        "?charset=utf8mb4"
+        f"mysql+pymysql://{quote(DB_USER)}:{quote(DB_PASSWORD)}"
+        f"@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {
@@ -53,7 +54,7 @@ class BaseConfig:
 
     # 文件加密配置（信封加密：主密钥保护每文件 DEK）
     ENCRYPT_DATA_LAKE = True                     # 是否启用数据湖文件加密
-    MASTER_KEY_PATH = os.path.join(BASE_DIR, "master.key")  # 主密钥文件路径
+    MASTER_KEY_PATH = os.getenv("MASTER_KEY_PATH", os.path.join(BASE_DIR, "master.key"))  # 主密钥文件路径
 
     # 分页默认值
     DEFAULT_PAGE_SIZE = 20

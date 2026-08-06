@@ -16,7 +16,7 @@ services:
     volumes:
       - backend-data:/app/data_lake
       - backend-logs:/app/logs
-      - ./back/master.key:/app/master.key:ro
+      - ./back/keys:/app/keys
       # 宿主机采集服务录制输出目录（后端需写入预览 mp4，故挂载为读写）
       - ./output:/app/host_output
     # 映射 USB 设备到容器（Orbbec Femto Bolt 通过 USB 3.0 连接）
@@ -66,7 +66,7 @@ services:
       - ./back/.env
     volumes:
       - backend-data:/app/data_lake
-      - ./back/master.key:/app/master.key:ro
+      - ./back/keys:/app/keys
     depends_on:
       redis:
         condition: service_healthy

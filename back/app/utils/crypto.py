@@ -21,6 +21,9 @@ import threading
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
+# os.O_BINARY 仅存在于 Windows，Unix 缺失时置 0 兼容
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 # ==================== 常量 ====================
 MAGIC = b"DMEC"                       # DataManagement EnCrypted
 VERSION = 1
@@ -94,7 +97,7 @@ def _load_or_create_master_key():
             os.makedirs(parent, exist_ok=True)
         # 0600 权限 + O_EXCL 原子创建（O_BINARY 防止 Windows 文本模式换行转换）
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
         except FileExistsError:
             # 竞态：另一进程刚创建成功，读取其密钥，避免出现两份不一致的密钥
             with open(path, "rb") as f:
@@ -405,7 +408,7 @@ def _acquire_key_operation_lock():
     返回锁 fd；调用方必须在 finally 中调用 _release_key_operation_lock。
     """
     path = _master_key_path() + ".lock"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_BINARY, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | _O_BINARY, 0o600)
     try:
         if os.name == "nt":
             import msvcrt
@@ -466,7 +469,7 @@ def _swap_master_key(old_mk, new_mk, data_lake_dir, old_fp):
     backup_path = f"{path}.bak-{time.strftime('%Y%m%d%H%M%S')}{int(time.time() * 1000) % 1000:03d}"
     with open(path, "rb") as f:
         old_key_bytes = _normalize_key_bytes(f.read())
-    bfd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY, 0o600)
+    bfd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
     try:
         os.write(bfd, old_key_bytes)
     finally:
@@ -478,7 +481,7 @@ def _swap_master_key(old_mk, new_mk, data_lake_dir, old_fp):
     #    保证循环期间"新重包裹的文件"始终可读。
     prev_path = path + ".previous"
     if not os.path.exists(prev_path):
-        pfd = os.open(prev_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY, 0o600)
+        pfd = os.open(prev_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY, 0o600)
         try:
             os.write(pfd, new_mk)
         finally:
@@ -504,7 +507,7 @@ def _swap_master_key(old_mk, new_mk, data_lake_dir, old_fp):
 
     # 4. 全部成功后原子替换 master.key
     #    先刷新 .previous 为新密钥，封口"已重包裹文件"的读取间隙，再替换 master.key。
-    pfd = os.open(prev_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY, 0o600)
+    pfd = os.open(prev_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY, 0o600)
     try:
         os.write(pfd, new_mk)
     finally:

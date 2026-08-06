@@ -6,3 +6,7 @@ __pycache__/
 .env
 logs/
 data_lake/
+# 密钥（避免打进镜像）
+master.key
+desens.key
+keys/
