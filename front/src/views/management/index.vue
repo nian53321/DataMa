@@ -2228,6 +2228,8 @@ const removeAsset = (row) => {
         await loadAssetsByType()
       }
       loadLayerStat()
+      // 视频资产删除后同步刷新受试者列表（video_types 标签即时更新，无需手动刷新页面）
+      loadSubjects()
     } catch (e) { /* 拦截器已提示 */ }
   }).catch(() => {})
 }
@@ -2434,6 +2436,8 @@ const batchRemoveAssets = () => {
         selectedAssets.value = []
         loadAssetsByType()
         loadLayerStat()
+        // 删除后同步刷新受试者列表（video_types 标签即时更新）
+        loadSubjects()
       }
     } catch (e) { /* 拦截器已提示 */ }
   }).catch(() => {})

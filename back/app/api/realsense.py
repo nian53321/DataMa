@@ -30,7 +30,7 @@ import threading
 import time
 from datetime import datetime
 
-from flask import request, Response, send_file
+from flask import request, Response, send_file, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from app.api import realsense_bp
@@ -528,8 +528,22 @@ def upload_recorded():
         depth_raw_zst = os.path.join(out_dir, "depth_raw.zst")
         depth_asset_id = None
         if os.path.isfile(depth_raw_zst):
-            depth_asset = _upload_raw_depth(svc, subject_id, depth_raw_zst)
+            # 视频重采时同类型深度一并重采（_upload_raw_depth 按类型清理旧深度）
+            depth_asset = _upload_raw_depth(svc, subject_id, depth_raw_zst,
+                                            video_type=video_type)
             depth_asset_id = depth_asset.id if depth_asset else None
+        # 辅助 JSON（逐帧同步 frames.jsonl / 相机标定 calibration.json）一并入库，
+        # 重采时与深度/视频同类型替换
+        frames_jsonl = os.path.join(out_dir, "frames.jsonl")
+        calib_json = os.path.join(out_dir, "calibration.json")
+        frames_asset_id = None
+        calib_asset_id = None
+        if os.path.isfile(frames_jsonl):
+            fa = _upload_rec_json(svc, subject_id, frames_jsonl, "frames", video_type)
+            frames_asset_id = fa.id if fa else None
+        if os.path.isfile(calib_json):
+            ca = _upload_rec_json(svc, subject_id, calib_json, "calibration", video_type)
+            calib_asset_id = ca.id if ca else None
         # 深度序列信息合并到彩色资产 metadata
         meta_path = os.path.join(out_dir, "meta.json")
         extra_meta = {}
@@ -554,6 +568,10 @@ def upload_recorded():
                 }
                 if depth_asset_id:
                     extra_meta["depth_asset_id"] = depth_asset_id
+                if frames_asset_id:
+                    extra_meta["frames_asset_id"] = frames_asset_id
+                if calib_asset_id:
+                    extra_meta["calibration_asset_id"] = calib_asset_id
             except Exception:
                 pass
         if extra_meta:
@@ -575,20 +593,30 @@ def upload_recorded():
     return success(asset.to_dict(), message="已入库", code=201)
 
 
-def _upload_raw_depth(svc, subject_id, zst_path):
-    """上传/替换受试者的原始深度序列资产（zstd 无损压缩，metadata.depth_raw=true）
+def _upload_raw_depth(svc, subject_id, zst_path, video_type=None):
+    """上传/替换受试者指定视频类型的原始深度序列资产（zstd 无损压缩）
 
     独立于彩色视频资产管理，避免被视频重采逻辑（video_type）误删。
-    返回新资产；文件缺失/入库失败返回 None。
+    - 命名带 video_type 后缀（face/gait 等，便于区分），但 metadata 不写
+      video_type（普通视频重采按 metadata.video_type 删除，深度资产会被误删）；
+      类型记录在独立字段 depth_video_type，按类型各自保留一份。
+    - 返回新资产；文件缺失/入库失败返回 None。
     """
     from app.models import DataAsset as _DA
     from app.models import DataType as _DT
     from werkzeug.datastructures import FileStorage
 
-    # 清理旧的原始深度资产
+    # 清理同类型旧的原始深度资产（不同类型各自保留）。
+    # 兼容旧数据：无 depth_video_type 标记的旧深度（每受试者仅一份）视为可替换，
+    # 新上传带类型时一并清理，避免历史深度残留。
     old = _DA.query.filter_by(subject_id=subject_id, data_type=_DT.VIDEO).all()
     for a in old:
-        if (a.metadata_json or {}).get("depth_raw"):
+        meta = a.metadata_json or {}
+        old_vt = meta.get("depth_video_type") or ""
+        if meta.get("depth_raw") and (
+            old_vt == (video_type or "")
+            or (video_type and not old_vt)
+        ):
             from app.services.subject_service import (
                 _purge_asset_records, _collect_asset_file_paths,
             )
@@ -607,18 +635,80 @@ def _upload_raw_depth(svc, subject_id, zst_path):
 
     if not os.path.isfile(zst_path):
         return None
+    # 原始文件名带 video_type，幂等检查按类型区分（同类型重复录制时长相同也不误判）
+    fname = f"depth_raw_{video_type}.zst" if video_type else "depth_raw.zst"
     with open(zst_path, "rb") as f:
-        fs = FileStorage(stream=f, filename="depth_raw.zst",
+        fs = FileStorage(stream=f, filename=fname,
                          content_type="application/octet-stream")
         asset, _is_dup = svc.upload_asset(
             subject_id=subject_id,
             data_type="video",
             file_storage=fs,
             layer="raw",
-            video_type=None,  # 通用视频，不参与 face/body/gait 重采
+            video_type=None,  # 不参与 face/body/gait 重采，避免普通视频上传误删深度资产
+            naming_video_type=video_type,  # 仅命名加类型后缀便于区分
         )
     dmeta = asset.metadata_json or {}
-    dmeta.update({"depth_raw": True})
+    dmeta.update({"depth_raw": True, "depth_video_type": video_type})
+    asset.metadata_json = dmeta
+    db.session.commit()
+    return asset
+
+
+def _upload_rec_json(svc, subject_id, file_path, kind, video_type=None):
+    """上传/替换受试者指定视频类型的辅助 JSON 资产（frames.jsonl / calibration.json）
+
+    kind: "frames" | "calibration"。metadata 标记 realsense_meta_kind + depth_video_type，
+    重采时同类型替换（与深度资产一致，互不影响）。返回新资产；文件缺失/失败返回 None。
+    """
+    from app.models import DataAsset as _DA
+    from app.models import DataType as _DT
+    from werkzeug.datastructures import FileStorage
+
+    # 清理同类型旧的辅助 JSON（兼容无类型标记的旧数据，与深度资产清理规则一致）
+    old = _DA.query.filter_by(subject_id=subject_id, data_type=_DT.JSON).all()
+    for a in old:
+        meta = a.metadata_json or {}
+        old_vt = meta.get("depth_video_type") or ""
+        if meta.get("realsense_meta_kind") == kind and (
+            old_vt == (video_type or "")
+            or (video_type and not old_vt)
+        ):
+            from app.services.subject_service import (
+                _purge_asset_records, _collect_asset_file_paths,
+            )
+            from app.utils.audit import snapshot_delete
+            storage_root = current_app.config["DATA_LAKE_DIR"]
+            snapshot_delete("data_asset", a, f"RealSense {kind} 重采替换 {a.file_name}",
+                            operator=svc._operator_user())
+            _purge_asset_records(a)
+            for fp in _collect_asset_file_paths(a, storage_root):
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+            db.session.delete(a)
+    db.session.commit()
+
+    if not os.path.isfile(file_path):
+        return None
+    # 原始文件名带 video_type，幂等检查按类型区分
+    base = os.path.basename(file_path)
+    stem, ext = os.path.splitext(base)
+    fname = f"{stem}_{video_type}{ext}" if video_type else base
+    with open(file_path, "rb") as f:
+        fs = FileStorage(stream=f, filename=fname,
+                         content_type="application/json")
+        asset, _is_dup = svc.upload_asset(
+            subject_id=subject_id,
+            data_type="json",
+            file_storage=fs,
+            layer="raw",
+            video_type=None,
+            naming_video_type=video_type,
+        )
+    dmeta = asset.metadata_json or {}
+    dmeta.update({"realsense_meta_kind": kind, "depth_video_type": video_type})
     asset.metadata_json = dmeta
     db.session.commit()
     return asset

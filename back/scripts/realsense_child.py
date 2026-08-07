@@ -11,16 +11,17 @@
   - 深度：D455F 原生 1280x720（z16，单位 mm），原始 z16 以 ffv1 无损保留，另生成 jet 伪彩色预览
   - 深度量程：D455F 理想范围 0.6m-6m（深度 200mm-8000mm 归一化到伪彩色）
 
-录制编码（对齐 orbbec 侧"彩色零重编码/深度无损"思路，消除旧 MJPG 写盘+二次转码的双重有损）：
-  color.mp4       彩色 H.264（libx264 CRF 18，浏览器可播）
-  depth.mp4       深度伪彩色 H.264（libx264 CRF 23，jet 色标，0=深灰无效）
-  depth_raw.mkv   原始深度序列（ffv1 无损，z16 16 位精度完整保留，供分析）
-  meta.json       序列号 / 分辨率 / 帧时间戳 / 编码信息
+录制产物（输出目录，全部为最终格式）：
+  color.mp4         彩色 H.264（libx264 CRF 18，浏览器可播）
+  depth_raw.zst     原始深度序列（zstd 无损压缩，z16 16 位精度完整保留，供分析）
+  frames.jsonl      逐帧同步记录（MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
+  calibration.json  相机标定（depth_scale / RGB 内参 / 畸变 / 分辨率 / 序列号 / 对齐状态）
+  meta.json         序列号 / 分辨率 / 帧时间戳 / 编码信息
 
 子命令：
   probe                        探测设备，输出 "OK <count> <serial>" 与 "DETAIL <json>"
   stream                       输出彩色 MJPEG 流到 stdout（含 --frame 边界）
-  record <path> <fps>          录制（彩色 MP4 + 深度伪彩色 MP4 + 原始深度 MKV + 元数据），stdin 收到 "stop" 后优雅停止
+  record <path> <fps>          录制（彩色 MP4 + 原始深度 zstd + 逐帧同步与标定 JSON），stdin 收到 "stop" 后优雅停止
 """
 import os
 import sys
@@ -36,10 +37,13 @@ sys.path.insert(0, SCRIPTS_DIR)
 # D455F 深度最高 90fps、RGB 最高 60fps；usbip 透传带宽有限，默认 30fps 稳定。
 DEFAULT_FPS = 30
 # 分辨率协商降级链 (color_w, color_h, depth_w, depth_h)：
-# 首选 D455/D455F 原生 1280x800 彩色 + 1280x720 深度（16:10 RGB 全幅面），
-# 带宽不足时依次降级；非 D455 系（D415/D435）也总能命中其中一档。
+# usbip 透传 USB2（480Mbps，实测 speed=480）下各组合带宽估算：
+#   1280x800@30+1280x720@30 ≈ 147MB/s 超 USB2（仅 5fps 可跑）
+#   848x480@15 ≈ 30MB/s / 640x480@30 ≈ 46MB/s 在 USB2 带宽内（可命中高帧率）
+# 帧率优先策略（_start_pipeline 先降分辨率再降 fps）会优先命中 640x480@30
+# 或 848x480@15，USB 链路升级到 USB3（5000M）后才能跑原生分辨率高帧率。
 _STREAM_COMBOS = (
-    (1280, 800, 1280, 720),   # D455F 原生
+    (1280, 800, 1280, 720),   # D455F 原生（USB2 下仅 5fps）
     (1280, 720, 1280, 720),
     (848, 480, 848, 480),
     (640, 480, 640, 480),
@@ -79,6 +83,18 @@ def _import_rs():
     return rs
 
 
+def _distortion_name(rs, model):
+    """pyrealsense2 畸变模型枚举 -> 标准小写名（如 inverse_brown_conrady）"""
+    try:
+        for _n in dir(rs.distortion):
+            if _n.isupper():
+                if int(getattr(rs.distortion, _n)) == int(model):
+                    return _n.lower()
+    except Exception:
+        pass
+    return str(model)
+
+
 def _query_devices():
     """枚举 RealSense 设备，返回 (count, serial)
     只枚举不打开流，避免长时间占用设备。
@@ -107,14 +123,19 @@ def _fps_chain(fps):
 
 
 def _start_pipeline(rs, fps):
-    """启动 pipeline（彩色 + 深度），D455F 原生分辨率优先，失败自动降级。
+    """启动 pipeline（彩色 + 深度），帧率优先降级，失败自动降档。
+
+    usbip 透传下 RealSense 被识别为 USB2（480Mbps，实测 speed=480），带宽预算约
+    40-60MB/s，D455F 原生 1280x800@30+1280x720@30 需约 147MB/s 必然失败。
+    帧率优先：先以请求 fps 试所有分辨率（USB2 内 640x480@30 约 46MB/s 可命中），
+    全失败再降 fps（15fps 命中 848x480，5fps 才跑得起原生 1280x800）。
 
     返回 (pipeline, profile, color_w, color_h, depth_w, depth_h, actual_fps)；
     profile 用于读取实际设备信息（型号/固件/深度缩放）。所有组合均失败时抛异常。
     """
     last_err = None
-    for (cw, ch, dw, dh) in _STREAM_COMBOS:
-        for f in _fps_chain(fps):
+    for f in _fps_chain(fps):
+        for (cw, ch, dw, dh) in _STREAM_COMBOS:
             pipe = rs.pipeline()
             cfg = rs.config()
             cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
@@ -329,13 +350,35 @@ def _zstd_writer(q, fobj, w, h):
         fobj.close()
 
 
+def _jsonl_writer(q, fobj):
+    """写线程：从队列取帧记录字典逐行写 JSONL；None 哨兵后关闭文件"""
+    import json
+    try:
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            try:
+                fobj.write(json.dumps(item, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+    finally:
+        try:
+            fobj.flush()
+            fobj.close()
+        except Exception:
+            pass
+
+
 def cmd_record(path, fps):
-    """录制彩色 H.264 MP4 + 原始深度 zstd 无损压缩序列 + 元数据
+    """录制彩色 H.264 MP4 + 原始深度 zstd 无损压缩序列 + 逐帧同步/标定信息
 
     产物（输出目录保留，不打包；全部为最终格式，无需二次转码）：
-      <path>/color.mp4      彩色视频（H.264，libx264 CRF 18，浏览器可播）
-      <path>/depth_raw.zst  原始深度序列（zstd 无损压缩，z16 16 位精度完整保留，供分析）
-      <path>/meta.json      序列号 / 配置 / 每帧时间戳 / 编码信息
+      <path>/color.mp4         彩色视频（H.264，libx264 CRF 18，浏览器可播）
+      <path>/depth_raw.zst     原始深度序列（zstd 无损压缩，z16 16 位精度完整保留）
+      <path>/frames.jsonl      逐帧记录：mp4_frame/zst_frame + RGB/深度硬件时间戳(ms) + 硬件帧号
+      <path>/calibration.json  相机标定：depth_scale/RGB 内参/畸变/分辨率/序列号/对齐状态
+      <path>/meta.json         序列号 / 配置 / 每帧时间戳 / 编码信息
     深度伪彩色不再录制：可视化播放时由后端从原始深度实时转码（depth-video 端点）。
     输出 "DONE <out_dir> <frames>" 或 "ERR <原因>" 到 stdout。
     """
@@ -370,6 +413,11 @@ def cmd_record(path, fps):
                                    .get_option(rs.option.depth_units) * 1000.0, 3)
         except Exception:
             pass
+
+        # 深度对齐到彩色坐标系（depth aligned to color）：
+        # 对齐后深度图逐像素与彩色图对应（分辨率也变为彩色分辨率）
+        align = rs.align(rs.stream.color)
+        dw, dh = cw, ch  # 对齐后深度分辨率 = 彩色分辨率
 
         stop_event = threading.Event()
 
@@ -430,7 +478,50 @@ def cmd_record(path, fps):
             target=_zstd_writer, args=(depth_q, depth_fobj, dw, dh), daemon=True)
         depth_writer.start()
 
+        # 逐帧同步记录（frames.jsonl：MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
+        frames_q = queue.Queue(maxsize=60)
+        frames_fobj = open(os.path.join(out_dir, "frames.jsonl"), "w", encoding="utf-8")
+        frames_writer = threading.Thread(
+            target=_jsonl_writer, args=(frames_q, frames_fobj), daemon=True)
+        frames_writer.start()
+
+        # 相机标定信息（每次录制保存一次，写入 out_dir/calibration.json）
+        color_intr = None
+        try:
+            color_intr = profile.get_stream(
+                rs.stream.color).as_video_stream_profile().get_intrinsics()
+        except Exception:
+            pass
+        calib = {
+            "depth_scale": round(depth_units_mm / 1000.0, 6),  # 米/单位（depth_units）
+            "rgb_intrinsics": None,
+            "rgb_distortion": None,
+            "rgb_resolution": f"{cw}x{ch}",
+            "depth_resolution": f"{dw}x{dh}",
+            "serial": _serial,
+            "depth_aligned_to_color": True,
+            "align_note": "color/depth 已执行 align_to_color 对齐（深度分辨率与彩色一致）；时间戳为传感器硬件时钟(ms)",
+        }
+        if color_intr is not None:
+            calib["rgb_intrinsics"] = {
+                "fx": float(color_intr.fx),
+                "fy": float(color_intr.fy),
+                "ppx": float(color_intr.ppx),
+                "ppy": float(color_intr.ppy),
+            }
+            calib["rgb_distortion"] = {
+                "model": _distortion_name(rs, color_intr.model),
+                "coeffs": [float(c) for c in color_intr.coeffs],
+            }
+        try:
+            with open(os.path.join(out_dir, "calibration.json"), "w", encoding="utf-8") as f:
+                json.dump(calib, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # 标定信息写盘失败不影响录制
+
         frame_idx = 0
+        mp4_count = 0
+        zst_count = 0
         meta = {
             "device_type": "realsense",
             "device_serial": _serial,
@@ -448,17 +539,27 @@ def cmd_record(path, fps):
         try:
             while not stop_event.is_set():
                 frames = pipe.wait_for_frames()
+                frames = align.process(frames)  # 深度对齐到彩色坐标系
                 ts = _time.time()
                 color = frames.get_color_frame()
                 depth = frames.get_depth_frame()
                 items = [None, None]
+                rec = {}
                 if color is not None:
                     color_arr = _frame_array(color)
                     items[0] = color_arr.tobytes()
                     # 录制中同步输出 MJPEG 实时预览（stdout 无消费者/背压时静默丢弃）
                     _try_emit_jpeg(color_arr)
+                    rec["mp4_frame"] = mp4_count
+                    mp4_count += 1
+                    rec["rgb_ts_ms"] = round(color.get_timestamp(), 3)
+                    rec["rgb_frame"] = color.get_frame_number()
                 if depth is not None:
                     items[1] = _frame_array(depth).tobytes()
+                    rec["zst_frame"] = zst_count
+                    zst_count += 1
+                    rec["depth_ts_ms"] = round(depth.get_timestamp(), 3)
+                    rec["depth_frame"] = depth.get_frame_number()
                 for q, item in zip((color_q, depth_q), items):
                     if item is None:
                         continue
@@ -470,6 +571,11 @@ def cmd_record(path, fps):
                         except queue.Full:
                             if stop_event.is_set():
                                 break
+                if rec:
+                    try:
+                        frames_q.put_nowait(rec)
+                    except queue.Full:
+                        pass  # 背压：帧同步记录非关键，丢弃
                 meta["frames"].append({"index": frame_idx, "t": round(ts, 4)})
                 frame_idx += 1
         finally:
@@ -479,13 +585,14 @@ def cmd_record(path, fps):
                 pass
             stop_event.set()
             # 哨兵 → 写线程关闭 stdin → ffmpeg 读到 EOF 正常 flush 收尾
-            for q in (color_q, depth_q):
+            for q in (color_q, depth_q, frames_q):
                 try:
                     q.put(None)
                 except Exception:
                     pass
             color_writer.join(timeout=60)
             depth_writer.join(timeout=120)
+            frames_writer.join(timeout=60)
             for p in encs:
                 try:
                     p.wait(timeout=60)

@@ -217,7 +217,8 @@ class AssetService(BaseService):
     def upload_asset(self, subject_id: int, data_type: str,
                      file_storage, layer: str = "raw",
                      sample_rate: Optional[int] = None,
-                     video_type: Optional[str] = None):
+                     video_type: Optional[str] = None,
+                     naming_video_type: Optional[str] = None):
         """实际上传文件并登记数据资产，按受试者伪ID分目录存储
 
         存储结构：{DATA_LAKE_DIR}/{layer}/{subject_pseudo_id}/{data_type}/{filename}
@@ -304,11 +305,13 @@ class AssetService(BaseService):
         # 保证"先写新、后删旧"，新文件失败时旧视频仍保留，避免重采造成数据丢失。
         # 应用命名规范：查询启用的命名规范并生成规范化文件名
         # 外部加密文件传剥离 .enc 后的文件名，确保扩展名是真实类型（wav 而非 enc）
-        # 视频传 video_type 用于命名区分（face/body/gait）
+        # 视频传 video_type 用于命名区分（face/body/gait）；
+        # naming_video_type 仅影响命名后缀（如深度资产），不写 metadata/不参与重采
         naming_input = base_name if is_external_enc else original_name
         naming_std = get_naming_standard(data_type)
         norm_name, norm_ext = apply_naming_standard(
-            naming_std, subject, data_type, naming_input, video_type=video_type,
+            naming_std, subject, data_type, naming_input,
+            video_type=naming_video_type or video_type,
         )
         # 拼接扩展名（保留原后缀；无后缀时不追加）
         final_ext = norm_ext or ext

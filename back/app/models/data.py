@@ -16,6 +16,7 @@ class DataType(enum.Enum):
     GAIT = "gait"           # 步态
     SCALE = "scale"         # 量表（结构化）
     TASK = "task"           # 认知任务数据
+    JSON = "json"           # JSON/JSONL 辅助数据（如相机标定、逐帧同步记录）
 
 
 class DataLayer(enum.Enum):

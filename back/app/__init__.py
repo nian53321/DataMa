@@ -150,6 +150,34 @@ def _ensure_schema_upgrade(database):
                     except Exception as e:
                         logger.warning("subject_template 升级失败 id=%s: %s", row[0], e)
                 conn.commit()
+        # data_assets.data_type 补齐新增枚举值（如 JSON）：
+        # create_all 不修改已有表，旧库缺新枚举成员时插入会触发 MySQL 1265 Data truncated
+        if "data_assets" in inspector.get_table_names():
+            dt_col = next((c for c in inspector.get_columns("data_assets")
+                           if c["name"] == "data_type"), None)
+            if dt_col and "ENUM" in str(dt_col["type"]).upper():
+                import re as _re
+                _m = _re.search(r"ENUM\((.*)\)", str(dt_col["type"]),
+                                flags=_re.IGNORECASE | _re.DOTALL)
+                _existing = []
+                if _m:
+                    _existing = [v.strip().strip("'") for v in _m.group(1).split(",")]
+                from app.models.data import DataType
+                _needed = [e.name for e in DataType]
+                _missing = [v for v in _needed if v not in _existing]
+                if _missing:
+                    _new_type = "ENUM(" + ",".join(f"'{v}'" for v in _existing + _missing) + ")"
+                    try:
+                        with database.engine.connect() as conn:
+                            conn.execute(text(
+                                "ALTER TABLE data_assets MODIFY COLUMN data_type "
+                                f"{_new_type} NOT NULL COMMENT '模态类型'"
+                            ))
+                            conn.commit()
+                        logger.warning("schema 升级：data_assets.data_type 补齐枚举值 %s",
+                                       ",".join(_missing))
+                    except Exception as e:
+                        logger.warning("schema 升级 data_type 枚举失败: %s", e)
     except Exception as e:
         logger.warning("schema 升级失败: %s", e)
 
