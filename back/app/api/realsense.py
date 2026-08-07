@@ -560,7 +560,7 @@ def upload_recorded():
         if depth_asset_id:
             extra_meta["depth_asset_id"] = depth_asset_id
         if extra_meta:
-            ameta = color_asset.metadata_json or {}
+            ameta = dict(color_asset.metadata_json or {})
             ameta.update({"realsense": extra_meta})
             color_asset.metadata_json = ameta
             db.session.commit()
@@ -581,7 +581,7 @@ def upload_recorded():
             logger.exception("辅助 JSON 入库失败（不影响主资产入库）")
         # JSON 资产关联补写到彩色资产 metadata
         if frames_asset_id or calib_asset_id:
-            ameta = color_asset.metadata_json or {}
+            ameta = dict(color_asset.metadata_json or {})
             rmeta = dict(ameta.get("realsense") or {})
             if frames_asset_id:
                 rmeta["frames_asset_id"] = frames_asset_id
@@ -659,7 +659,7 @@ def _upload_raw_depth(svc, subject_id, zst_path, video_type=None):
             video_type=None,  # 不参与 face/body/gait 重采，避免普通视频上传误删深度资产
             naming_video_type=video_type,  # 仅命名加类型后缀便于区分
         )
-    dmeta = asset.metadata_json or {}
+    dmeta = dict(asset.metadata_json or {})
     dmeta.update({"depth_raw": True, "depth_video_type": video_type})
     asset.metadata_json = dmeta
     db.session.commit()
@@ -718,7 +718,7 @@ def _upload_rec_json(svc, subject_id, file_path, kind, video_type=None):
             video_type=None,
             naming_video_type=video_type,
         )
-    dmeta = asset.metadata_json or {}
+    dmeta = dict(asset.metadata_json or {})
     dmeta.update({"realsense_meta_kind": kind, "depth_video_type": video_type})
     asset.metadata_json = dmeta
     db.session.commit()
