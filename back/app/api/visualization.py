@@ -721,9 +721,13 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
     """把 mkv 深度轨转码为伪彩色 MP4（H.264），像彩色视频一样可逐帧播放
 
     两遍处理：第一遍下采样扫描全局深度范围（1%~99% 分位，排除 0 无效值），
-    第二遍逐帧归一化 + jet 伪彩色写入 cv2 中间文件，再用 ffmpeg 转 H.264：
-    浏览器（Chrome/Edge/Firefox）不支持 cv2 mp4v 输出的 MPEG-4 Part 2 编码，
-    仅 H.264 可在线播放；+faststart 让 moov 前置，视频可秒开。
+    第二遍逐帧归一化 + jet 伪彩色写入 H.264。
+
+    编码方式：
+    - 优先 ffmpeg 管道直接编码 libx264（浏览器可播，+faststart 秒开）。
+      opencv-python-headless 在部分环境（如 python:slim 镜像）不带 MPEG-4
+      Part 2(mp4v) 编码器，cv2.VideoWriter 打不开，因此主链路不再依赖它；
+    - 回退：cv2.mp4v 中间文件 + ffmpeg 转 H.264（兼容本地/桌面环境）。
     """
     import subprocess
     import numpy as np
@@ -742,53 +746,87 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
     hi = float(np.percentile(all_v, 99))
     span = (hi - lo) or 1.0
 
-    # 第二遍：逐帧伪彩色写入中间 mp4（MPEG-4 Part 2）
-    # 中间文件唯一化：并发请求首次访问同一资产时各写各的临时文件，避免互相截断
-    import tempfile as _tf
-    _fd, tmp_raw = _tf.mkstemp(suffix=".tmp.mp4", dir=os.path.dirname(out_path))
-    os.close(_fd)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(tmp_raw, fourcc, float(fps), (w, h))
-    if not writer.isOpened():
-        try:
-            os.remove(tmp_raw)
-        except OSError:
-            pass
-        return False
-    try:
+    # 伪彩色帧生成器（第二遍逐帧归一化 + jet 伪彩色，无效像素置深灰）
+    def frames():
         for arr in _read_depth_frames(file_path, stream_index, w, h, step=1, src_pix_fmt=src_pix_fmt):
             norm = np.zeros((h, w), dtype=np.uint8)
             mask = arr > 0
             norm[mask] = np.clip(((arr[mask] - lo) / span * 255), 0, 255).astype(np.uint8)
             color = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
             color[~mask] = (16, 16, 16)  # 无效像素置深灰
-            writer.write(color)
-    finally:
-        writer.release()
+            yield color
 
-    # ffmpeg 转 H.264（浏览器可播）+ faststart（moov 前置，秒开）
-    # 先写临时文件，成功后原子 rename 到缓存路径：并发首次访问不会互相截断损坏缓存
+    # 优先：ffmpeg 管道直接编码 H.264（libx264），写临时文件成功后原子 rename 到缓存
     tmp_h264 = out_path + ".h264.tmp"
-    p = subprocess.run(
-        ["ffmpeg", "-y", "-i", tmp_raw,
+    p = subprocess.Popen(
+        ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+         "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
          "-c:v", "libx264", "-pix_fmt", "yuv420p",
          "-preset", "medium", "-crf", "23",
-         "-movflags", "+faststart",
-         "-an", tmp_h264],
-        capture_output=True, timeout=600,
+         "-movflags", "+faststart", "-an", tmp_h264],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     try:
-        os.remove(tmp_raw)
+        for color in frames():
+            p.stdin.write(color.tobytes())
+    except BrokenPipeError:
+        pass
+    try:
+        p.stdin.close()
+    except Exception:
+        pass
+    try:
+        _out, _err = p.communicate(timeout=600)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        _out, _err = p.communicate()
+    if p.returncode == 0 and os.path.isfile(tmp_h264) and os.path.getsize(tmp_h264) > 0:
+        os.replace(tmp_h264, out_path)
+        return True
+    current_app.logger.warning("深度转码 ffmpeg 管道失败 rc=%s: %s",
+                               p.returncode, _err[-500:].decode("utf-8", "replace"))
+    try:
+        os.remove(tmp_h264)
     except OSError:
         pass
-    if p.returncode != 0:
+
+    # 回退：cv2.mp4v 中间文件 + ffmpeg 转 H.264
+    import tempfile as _tf
+    _fd, tmp_raw = _tf.mkstemp(suffix=".tmp.mp4", dir=os.path.dirname(out_path))
+    os.close(_fd)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(tmp_raw, fourcc, float(fps), (w, h))
+    if writer.isOpened():
+        try:
+            for color in frames():
+                writer.write(color)
+        finally:
+            writer.release()
+        p2 = subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_raw,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-preset", "medium", "-crf", "23",
+             "-movflags", "+faststart", "-an", tmp_h264],
+            capture_output=True, timeout=600,
+        )
+        if p2.returncode == 0 and os.path.isfile(tmp_h264) and os.path.getsize(tmp_h264) > 0:
+            os.replace(tmp_h264, out_path)
+            try:
+                os.remove(tmp_raw)
+            except OSError:
+                pass
+            return True
+        current_app.logger.warning("深度转码 cv2 回退失败 rc=%s: %s", p2.returncode,
+                                   p2.stderr[-500:].decode("utf-8", "replace"))
         try:
             os.remove(tmp_h264)
         except OSError:
             pass
-        return False
-    os.replace(tmp_h264, out_path)
-    return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+    try:
+        os.remove(tmp_raw)
+    except OSError:
+        pass
+    return False
 
 
 @visualization_bp.route("/depth-video/<int:asset_id>", methods=["GET"])
