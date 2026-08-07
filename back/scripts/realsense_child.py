@@ -131,6 +131,22 @@ def _start_pipeline(rs, fps):
     raise RuntimeError(f"启动 RealSense 相机失败（{last_err}）")
 
 
+def _frame_array(frame):
+    """取帧数据为 (h, w, c) uint8 ndarray
+
+    pyrealsense2 的 frame.get_data() 在 numpy 可用时返回 ndarray，但在部分
+    numpy/OpenCV 组合下（如容器内 opencv 5.x）会回退返回 bytes；统一在此转换，
+    供 stream（cv2 编码）与 record（ffmpeg 原始帧）共用。
+    """
+    import numpy as np
+    data = frame.get_data()
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+        return np.frombuffer(data, dtype=np.uint8).reshape(
+            frame.get_height(), frame.get_width(), -1)
+    return np.ascontiguousarray(data)
+
+
 def _emit_jpeg(frame, quality=80):
     """将一帧编码为 JPEG 并写入 stdout（含 MJPEG 边界）"""
     import cv2
@@ -140,6 +156,25 @@ def _emit_jpeg(frame, quality=80):
     _safe_write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
     _safe_write(buf.tobytes())
     _safe_write(b"\r\n")
+
+
+def _try_emit_jpeg(frame, quality=70):
+    """录制中实时预览帧输出：stdout 无消费者/管道背压时静默丢弃，绝不阻塞或抛错影响录制"""
+    fd = _saved_stdout_fd if _saved_stdout_fd is not None else 1
+    import select
+    try:
+        _r, _w, _x = select.select([], [fd], [], 0)
+        if fd not in _w:
+            return
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return
+        os.write(fd, b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+        os.write(fd, buf.tobytes())
+        os.write(fd, b"\r\n")
+    except (OSError, BrokenPipeError):
+        pass
 
 
 # ==================== probe ====================
@@ -213,7 +248,7 @@ def cmd_stream(fps):
                 if color is None:
                     continue
                 # color.get_data() 为 (h, w, 3) 的 BGR ndarray（bgr8 格式）
-                _emit_jpeg(color.get_data())
+                _emit_jpeg(_frame_array(color))
         finally:
             pipe.stop()
         return 0
@@ -418,9 +453,12 @@ def cmd_record(path, fps):
                 depth = frames.get_depth_frame()
                 items = [None, None]
                 if color is not None:
-                    items[0] = color.get_data().tobytes()
+                    color_arr = _frame_array(color)
+                    items[0] = color_arr.tobytes()
+                    # 录制中同步输出 MJPEG 实时预览（stdout 无消费者/背压时静默丢弃）
+                    _try_emit_jpeg(color_arr)
                 if depth is not None:
-                    items[1] = depth.get_data().tobytes()
+                    items[1] = _frame_array(depth).tobytes()
                 for q, item in zip((color_q, depth_q), items):
                     if item is None:
                         continue

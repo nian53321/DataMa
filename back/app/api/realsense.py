@@ -204,6 +204,49 @@ def _stop_proc(proc, wait=30):
     return proc.returncode, (out or b"").decode("utf-8", "replace")
 
 
+def _stop_rec_proc(proc, wait=30):
+    """停止录制子进程并解析结果行（stdout 混有 MJPEG 实时预览帧）
+
+    录制子进程在录制期间持续向 stdout 输出 MJPEG 帧，若用 communicate 会把全程
+    预览帧读入内存；这里改为后台线程流式消费并丢弃帧数据，只保留尾部最近 64KB
+    供 DONE/ERR 行解析。返回 (returncode, tail_text)。
+    """
+    if proc is None or proc.poll() is not None:
+        _mark_stopped()
+        return proc.returncode if proc else 0, ""
+    try:
+        if proc.stdin:
+            proc.stdin.write(b"stop\n")
+            proc.stdin.flush()
+    except Exception:
+        pass
+    tail = []
+
+    def _drain():
+        buf = b""
+        try:
+            for raw in proc.stdout:
+                buf = (buf + raw)[-65536:]
+        except Exception:
+            pass
+        tail.append(buf)
+
+    threading.Thread(target=_drain, daemon=True).start()
+    try:
+        proc.wait(timeout=wait)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+    _mark_stopped()
+    return proc.returncode, (tail[0] if tail else b"").decode("utf-8", "replace")
+
+
 def _parse_done(out):
     """解析子进程输出的 DONE/ERR 行，返回 (ok, dir_or_err, frames)"""
     for line in out.splitlines():
@@ -285,15 +328,24 @@ def preview_stream():
     """实时预览 MJPEG 流：透传子进程 stdout（multipart/x-mixed-replace）
 
     鉴权：优先 ?media_token=<短期签名>，兼容 JWT（header / access_token query）。
+    录制中预览子进程已停止，改透传录制子进程 stdout（record 子进程同步输出 MJPEG 帧）。
     """
     with _proc_lock:
-        proc = _stream_proc
+        if _stream_proc is not None and _stream_proc.poll() is None:
+            proc = _stream_proc
+        else:
+            proc = _rec_proc
     if proc is None or proc.poll() is not None:
         return fail("预览未启动", 409)
 
     def gen():
         try:
             while proc.poll() is None:
+                # 停止/切换时让出 stdout 读取权（避免与 _stop_rec_proc 的解析线程竞争）
+                with _proc_lock:
+                    still_live = (_stream_proc is proc) or (_rec_proc is proc)
+                if not still_live:
+                    break
                 chunk = proc.stdout.read(8192)
                 if not chunk:
                     break
@@ -369,8 +421,9 @@ def record_stop():
     if proc is None or proc.poll() is not None:
         return fail("没有进行中的录制", 409)
     # 深度 zstd 序列不走 ffmpeg，停止时仅需等彩色 libx264 EOF flush（秒级）；
-    # 30s 上限兜底 USB 掉线等异常，避免 communicate 长时间阻塞请求线程
-    rc, out = _stop_proc(proc, wait=30)
+    # 30s 上限兜底 USB 掉线等异常，避免阻塞请求线程过长。
+    # 录制中 stdout 持续输出 MJPEG 预览帧，用流式解析（丢弃帧数据，只取 DONE/ERR 行）
+    rc, out = _stop_rec_proc(proc, wait=30)
     ok, result, frames = _parse_done(out)
     if not ok or rc != 0:
         with _rec_state_lock:

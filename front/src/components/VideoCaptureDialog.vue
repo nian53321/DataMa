@@ -1142,8 +1142,12 @@ const startRealSenseRecord = async () => {
   realSensePreviewReady.value = false
   try {
     await startRealSenseRecordApi({ fps: 30 })
-    // 后端 record/start 会先停预览子进程（录制与预览互斥），实时流已断开
-    realSensePreviewing.value = false
+    // 后端 record/start 会先停预览子进程并启动录制子进程；
+    // 录制子进程同步输出 MJPEG 实时画面（后端 preview/stream 透传录制流），
+    // 前端保持实时流不断开，录制中画面持续显示
+    // 预览源已切换为录制子进程，强制刷新流 URL（src 变化触发 img 重新连接）
+    realSenseLiveSignedUrl.value = ''
+    loadRealSenseLiveUrl()
     // 计时器
     const startTs = Date.now()
     if (realSenseRecordTimerId) clearInterval(realSenseRecordTimerId)
@@ -1163,6 +1167,9 @@ const startRealSenseRecord = async () => {
 const stopRealSenseRecord = async () => {
   if (stoppingRealSense.value) return
   stoppingRealSense.value = true
+  // 先断开录制中的实时预览流（MJPEG 源为录制子进程），
+  // 停止时后端才能独占读取 stdout 解析 DONE 结果行
+  realSensePreviewing.value = false
   if (realSenseRecordTimerId) {
     clearInterval(realSenseRecordTimerId)
     realSenseRecordTimerId = null
