@@ -143,9 +143,11 @@ def apply_naming_standard(standard, subject, data_type, original_filename, video
         name = _safe_segment(ctx.get("original") or "unnamed")
     name = _safe_segment(name)
 
-    # 视频子类型兜底：模板未引用 {video_type} 但属于 video 模态时自动追加
-    # 确保三类视频文件名可区分，避免重采时因同名导致路径冲突
-    if data_type == "video" and video_type and "{video_type}" not in template:
+    # 子类型兜底：模板未引用 {video_type} 但存在子类型时自动追加，
+    # 确保 face/body/gait 等同类文件命名可区分，避免重采/替换时因同名导致路径冲突。
+    # 适用：video 模态（face/body/gait）与 realsense 辅助 JSON（frames/calibration，
+    # 通过 naming_video_type 显式传入，data_type=json 但也需区分模态）。
+    if video_type and "{video_type}" not in template:
         vt = _safe_segment(video_type)
         # 避免重复追加（如模板已含 face/body/gait 字面量）
         if vt and vt not in name.split("_"):
