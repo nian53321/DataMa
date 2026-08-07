@@ -757,13 +757,14 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
             yield color
 
     # 优先：ffmpeg 管道直接编码 H.264（libx264），写临时文件成功后原子 rename 到缓存
-    tmp_h264 = out_path + ".h264.tmp"
+    # 临时文件保留 .mp4 扩展名并显式 -f mp4，避免 ffmpeg 无法根据扩展名推断输出格式
+    tmp_h264 = out_path.rsplit(".", 1)[0] + ".tmp.mp4"
     p = subprocess.Popen(
         ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
          "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
          "-c:v", "libx264", "-pix_fmt", "yuv420p",
          "-preset", "medium", "-crf", "23",
-         "-movflags", "+faststart", "-an", tmp_h264],
+         "-movflags", "+faststart", "-f", "mp4", "-an", tmp_h264],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     try:
@@ -806,7 +807,7 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
             ["ffmpeg", "-y", "-i", tmp_raw,
              "-c:v", "libx264", "-pix_fmt", "yuv420p",
              "-preset", "medium", "-crf", "23",
-             "-movflags", "+faststart", "-an", tmp_h264],
+             "-movflags", "+faststart", "-f", "mp4", "-an", tmp_h264],
             capture_output=True, timeout=600,
         )
         if p2.returncode == 0 and os.path.isfile(tmp_h264) and os.path.getsize(tmp_h264) > 0:
