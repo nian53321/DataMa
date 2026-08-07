@@ -246,6 +246,7 @@
               </div>
               <div v-else class="depth-video-box">
                 <video
+                  v-if="depthVideoState.url"
                   :key="depthVideoState.url"
                   :src="depthVideoState.url"
                   controls
