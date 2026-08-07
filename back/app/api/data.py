@@ -45,8 +45,23 @@ def _svc_subject():
 
 
 def _svc_asset():
-    """构造 AssetService"""
-    return AssetService(operator_id=int(get_jwt_identity()), operator_role=current_role())
+    """构造 AssetService
+
+    media_token 签名路径（/play、/file 在线播放/下载）无 JWT 上下文，
+    get_jwt_identity() 会抛 RuntimeError；此时 operator 传 None 即可
+    （服务层 _operator_user() 返回 None，审计日志跳过操作员字段）。
+    """
+    try:
+        operator_id = int(get_jwt_identity())
+    except RuntimeError:
+        operator_id = None
+    operator_role = None
+    if operator_id is not None:
+        try:
+            operator_role = current_role()
+        except RuntimeError:
+            operator_role = None
+    return AssetService(operator_id=operator_id, operator_role=operator_role)
 
 
 def _svc_processing():
@@ -498,13 +513,14 @@ def serve_asset_file(asset_id):
     鉴权：仅管理员可调用，用于下载原始文件。普通角色请用 /play 在线播放。
     所有下载操作记录审计日志。加密文件会先解密到临时文件，响应结束后自动清理。
     """
-    serve_path, is_temp = _svc_asset().serve_asset_file(asset_id)
+    serve_path, is_temp, mimetype, download_name = _svc_asset().serve_asset_file(asset_id)
     if is_temp:
         _register_temp_cleanup(serve_path)
-    # send_file 自动处理 Range 请求与 MIME 推断
-    # 显式声明 Accept-Ranges，让浏览器/客户端明确知道支持断点续传
-    # （Werkzeug 默认仅在 206 响应中返回该头，200 响应会缺失，可能导致部分客户端中止请求）
-    resp = send_file(serve_path, conditional=True)
+    # send_file 自动处理 Range 请求；显式指定 mimetype 与 download_name——
+    # 加密文件解密临时文件若无扩展名，send_file 会把 MIME 推断为 octet-stream、
+    # 下载名为 tmpXXXX，导致浏览器下载/播放均无法识别（用户误以为格式不支持）。
+    resp = send_file(serve_path, conditional=True, mimetype=mimetype,
+                     download_name=download_name, as_attachment=True)
     resp.headers["Accept-Ranges"] = "bytes"
     return resp
 

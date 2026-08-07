@@ -19,6 +19,7 @@
 - 这样 service 不依赖 Flask 的 after_this_request，可独立测试
 """
 import os
+import mimetypes
 from typing import Tuple, Optional
 
 from flask import current_app
@@ -426,12 +427,14 @@ class AssetService(BaseService):
 
     # ==================== 文件服务（下载/播放） ====================
 
-    def serve_asset_file(self, asset_id: int) -> Tuple[str, bool]:
+    def serve_asset_file(self, asset_id: int) -> Tuple[str, bool, str, str]:
         """流式提供数据文件原始下载（仅 ADMIN）
 
-        返回 (path, is_temp)：
+        返回 (path, is_temp, mimetype, download_name)：
         - is_temp=True 时调用方需在响应后删除临时文件
-        - 加密文件会先解密到临时文件，明文文件直接流式返回
+        - 加密文件会先解密到临时文件（带正确扩展名，保证 send_file 推断 MIME/下载名正确），
+          明文文件直接流式返回
+        - mimetype / download_name 供路由层 send_file 使用
         - 所有下载操作记录审计日志
         """
         asset = self._get_or_404(DataAsset, asset_id, "数据资产不存在")
@@ -442,8 +445,10 @@ class AssetService(BaseService):
         if not os.path.exists(abs_path):
             raise NotFoundError("文件不存在于存储目录")
 
-        # 加密文件需先解密到临时文件，明文文件直接流式返回
-        serve_path, is_temp = _decrypt_for_serving(abs_path)
+        # 解密临时文件带真实扩展名：无扩展名临时文件会让 send_file 把 MIME 推断为
+        # application/octet-stream、下载文件名变成 tmpXXXX，浏览器无法识别/播放。
+        ext = os.path.splitext(asset.file_name)[1] or f".{asset.file_format or 'bin'}"
+        serve_path, is_temp = _decrypt_for_serving(abs_path, suffix=ext)
         # 记录下载审计日志（事后可追溯）
         operator = self._operator_user()
         log_operation(
@@ -452,7 +457,8 @@ class AssetService(BaseService):
             operator=operator,
         )
         self._commit()
-        return serve_path, is_temp
+        mimetype = mimetypes.guess_type(asset.file_name)[0] or "application/octet-stream"
+        return serve_path, is_temp, mimetype, asset.file_name
 
     def play_asset(self, asset_id: int) -> Tuple[str, bool, str]:
         """播放数据文件：浏览器原生格式直接流，其余视频格式自动转码为 H.264 MP4 后流式播放
