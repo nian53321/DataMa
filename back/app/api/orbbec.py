@@ -872,7 +872,7 @@ def upload_recorded():
             )
         # 把深度元数据合并到资产 metadata
         if extra_meta:
-            meta = asset.metadata_json or {}
+            meta = dict(asset.metadata_json or {})
             meta.update({"orbbec": extra_meta})
             asset.metadata_json = meta
             db.session.commit()
