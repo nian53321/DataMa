@@ -827,16 +827,11 @@ const onVideoError = (e) => {
   videoError.value = true
 }
 
-// 切换视频时重置状态，并显式触发 load（避免 :key 重建元素产生的额外 abort）
+// 切换视频时重置状态。不在 src 为空时调 load()（空 src load 会触发 error 误判播放失败），
+// 由下方 watch(currentVideoPlaySrc) 在签名 URL 就绪后统一触发 load()。
 const onVideoSwitch = () => {
   videoError.value = false
   videoLoading.value = true
-  // :src 已是响应式绑定，变化后浏览器会自动加载；这里显式 load 兜底
-  nextTick(() => {
-    if (videoRef.value) {
-      try { videoRef.value.load() } catch (e) { /* ignore */ }
-    }
-  })
 }
 
 // 签名 URL 异步填充 mediaUrlCache 后，<video> 的 :src 虽响应式更新，
@@ -848,6 +843,8 @@ const currentVideoPlaySrc = computed(() =>
 )
 watch(currentVideoPlaySrc, (src) => {
   if (!src) return
+  videoError.value = false
+  videoLoading.value = true
   nextTick(() => {
     if (videoRef.value) {
       try { videoRef.value.load() } catch (e) { /* ignore */ }
