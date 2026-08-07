@@ -194,8 +194,12 @@ def _ensure_schema_upgrade(database):
                         _m = _json.loads(_r[2]) if isinstance(_r[2], str) else (_r[2] or {})
                     except Exception:
                         continue
-                    if _m.get("depth_raw") and isinstance(_m.get("depth_video_type"), str):
-                        _depth_by_key[(_r[1], _m.get("depth_video_type"))] = _r[0]
+                    if _m.get("depth_raw"):
+                        # 深度资产：优先按 depth_video_type 收录；无类型标记的旧深度
+                        # （改名前每受试者仅一份）记为 "*" 通用深度，修复时回退匹配
+                        _vt = _m.get("depth_video_type")
+                        _key = (_r[1], _vt) if isinstance(_vt, str) else (_r[1], "*")
+                        _depth_by_key.setdefault(_key, _r[0])
                 for _r in _rows:
                     try:
                         _m = _json.loads(_r[2]) if isinstance(_r[2], str) else (_r[2] or {})
@@ -209,6 +213,8 @@ def _ensure_schema_upgrade(database):
                     if _rm.get("depth_asset_id"):
                         continue  # 已关联，跳过
                     _did = _depth_by_key.get((_r[1], _m.get("video_type")))
+                    if not _did:
+                        _did = _depth_by_key.get((_r[1], "*"))  # 旧深度回退匹配
                     if _did:
                         _rm["depth_asset_id"] = _did
                         _m["realsense"] = _rm
