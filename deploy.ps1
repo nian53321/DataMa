@@ -184,6 +184,27 @@ if (-not (Test-Path $envFile)) {
     } else {
         Write-OK 'back/.env 已配置（跳过自动生成）'
     }
+    # 已有 .env 但缺密钥文件路径（旧版升级）：补上，否则容器内后端回落到默认
+    # /app/master.key 与挂载目录 /app/keys 不一致，会误生成新密钥导致旧数据无法解密
+    $missingKeyPaths = @()
+    if ($content -notmatch '^\s*MASTER_KEY_PATH\s*=') { $missingKeyPaths += 'MASTER_KEY_PATH' }
+    if ($content -notmatch '^\s*DESENS_KEY_PATH\s*=') { $missingKeyPaths += 'DESENS_KEY_PATH' }
+    if ($missingKeyPaths.Count -gt 0) {
+        $lines = @()
+        foreach ($line in $content -split "`r?`n") {
+            $lines += $line
+            if ($line -match '^\s*GUNICORN_WORKERS\s*=') {
+                # 在 GUNICORN_WORKERS 之后追加密钥路径配置（与 .env.example 顺序一致）
+                $lines += ''
+                $lines += '# 密钥文件路径（docker-compose 把宿主机 back/keys/ 目录挂载到容器 /app/keys）'
+                if ('MASTER_KEY_PATH' -in $missingKeyPaths) { $lines += 'MASTER_KEY_PATH=/app/keys/master.key' }
+                if ('DESENS_KEY_PATH' -in $missingKeyPaths) { $lines += 'DESENS_KEY_PATH=/app/keys/desens.key' }
+            }
+        }
+        $content = $lines -join "`n"
+        Write-EnvFile -Path $envFile -Content $content
+        Write-Warn2 "back/.env 缺少 $($missingKeyPaths -join ', ')，已自动补上（避免密钥路径回落到 /app/master.key）"
+    }
 }
 
 $dbPassword = $null
