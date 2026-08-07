@@ -839,6 +839,21 @@ const onVideoSwitch = () => {
   })
 }
 
+// 签名 URL 异步填充 mediaUrlCache 后，<video> 的 :src 虽响应式更新，
+// 但浏览器对已挂载元素改 src 不会自动重新加载——显式 load() 触发真正播放。
+// 用 computed 精确绑定"当前视频的签名 URL"，仅当它从空变有值/变化时才 load，
+// 避免 audio 等其他 kind 的 cache 更新误触 video.load()（空 src load 会触发 error）。
+const currentVideoPlaySrc = computed(() =>
+  viewMode.value === 'subject' ? playUrl(currentVideo.value) : playUrl(selectedAsset.value)
+)
+watch(currentVideoPlaySrc, (src) => {
+  if (!src) return
+  nextTick(() => {
+    if (videoRef.value) {
+      try { videoRef.value.load() } catch (e) { /* ignore */ }
+    }
+  })
+})
 // 切换视频/文件时重置深度视频为 idle（不自动请求转码，用户按需点击"加载深度视频"）
 watch(() => (viewMode.value === 'subject' ? currentVideo.value?.id : null), () => resetDepthVideo())
 watch(() => (viewMode.value === 'file' ? selectedAssetId.value : null), () => resetDepthVideo())
