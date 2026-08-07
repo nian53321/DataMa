@@ -313,7 +313,7 @@ def preview_stream():
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def record_start():
     """启动录制（子进程 record，彩色 MP4 + 深度 zstd 序列）"""
-    global _rec_proc
+    global _rec_proc, _stream_proc
     data = request.get_json(silent=True) or {}
     with _proc_lock:
         if _rec_proc is not None and _rec_proc.poll() is None:
