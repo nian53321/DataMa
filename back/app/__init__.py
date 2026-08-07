@@ -178,6 +178,44 @@ def _ensure_schema_upgrade(database):
                                        ",".join(_missing))
                     except Exception as e:
                         logger.warning("schema 升级 data_type 枚举失败: %s", e)
+        # 数据修复：补全 realsense 彩色资产缺失的 depth_asset_id 关联
+        # （早期版本辅助 JSON 上传失败会中断 extra_meta 合并，
+        #   导致深度可视化定位深度资产失败报"无深度轨"）
+        if "data_assets" in inspector.get_table_names():
+            import json as _json
+            _depth_by_key = {}
+            with database.engine.connect() as conn:
+                _rows = conn.execute(text(
+                    "SELECT id, subject_id, metadata_json FROM data_assets "
+                    "WHERE data_type = 'VIDEO'"
+                )).fetchall()
+                for _r in _rows:
+                    try:
+                        _m = _json.loads(_r[2]) if isinstance(_r[2], str) else (_r[2] or {})
+                    except Exception:
+                        continue
+                    if _m.get("depth_raw") and isinstance(_m.get("depth_video_type"), str):
+                        _depth_by_key[(_r[1], _m.get("depth_video_type"))] = _r[0]
+                for _r in _rows:
+                    try:
+                        _m = _json.loads(_r[2]) if isinstance(_r[2], str) else (_r[2] or {})
+                    except Exception:
+                        continue
+                    if _m.get("depth_raw"):
+                        continue  # 深度资产本身，跳过
+                    if _m.get("original_filename") != "color.mp4":
+                        continue  # 只补 realsense 彩色资产（避免误关联 orbbec/普通视频）
+                    _rm = _m.get("realsense") if isinstance(_m.get("realsense"), dict) else {}
+                    if _rm.get("depth_asset_id"):
+                        continue  # 已关联，跳过
+                    _did = _depth_by_key.get((_r[1], _m.get("video_type")))
+                    if _did:
+                        _rm["depth_asset_id"] = _did
+                        _m["realsense"] = _rm
+                        conn.execute(text(
+                            "UPDATE data_assets SET metadata_json = :m WHERE id = :id"
+                        ), {"m": _json.dumps(_m, ensure_ascii=False), "id": _r[0]})
+                conn.commit()
     except Exception as e:
         logger.warning("schema 升级失败: %s", e)
 

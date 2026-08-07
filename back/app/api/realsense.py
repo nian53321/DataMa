@@ -532,19 +532,8 @@ def upload_recorded():
             depth_asset = _upload_raw_depth(svc, subject_id, depth_raw_zst,
                                             video_type=video_type)
             depth_asset_id = depth_asset.id if depth_asset else None
-        # 辅助 JSON（逐帧同步 frames.jsonl / 相机标定 calibration.json）一并入库，
-        # 重采时与深度/视频同类型替换
-        frames_jsonl = os.path.join(out_dir, "frames.jsonl")
-        calib_json = os.path.join(out_dir, "calibration.json")
-        frames_asset_id = None
-        calib_asset_id = None
-        if os.path.isfile(frames_jsonl):
-            fa = _upload_rec_json(svc, subject_id, frames_jsonl, "frames", video_type)
-            frames_asset_id = fa.id if fa else None
-        if os.path.isfile(calib_json):
-            ca = _upload_rec_json(svc, subject_id, calib_json, "calibration", video_type)
-            calib_asset_id = ca.id if ca else None
-        # 深度序列信息合并到彩色资产 metadata
+        # 深度信息与关联立即合并到彩色资产 metadata：不依赖后续辅助 JSON 上传，
+        # 避免辅助 JSON 入库失败时深度关联丢失（否则可视化定位深度资产失败，报"无深度轨"）
         meta_path = os.path.join(out_dir, "meta.json")
         extra_meta = {}
         if os.path.isfile(meta_path):
@@ -566,17 +555,39 @@ def upload_recorded():
                     "start_time": child_meta.get("start_time", ""),
                     "end_time": child_meta.get("end_time", ""),
                 }
-                if depth_asset_id:
-                    extra_meta["depth_asset_id"] = depth_asset_id
-                if frames_asset_id:
-                    extra_meta["frames_asset_id"] = frames_asset_id
-                if calib_asset_id:
-                    extra_meta["calibration_asset_id"] = calib_asset_id
             except Exception:
                 pass
+        if depth_asset_id:
+            extra_meta["depth_asset_id"] = depth_asset_id
         if extra_meta:
             ameta = color_asset.metadata_json or {}
             ameta.update({"realsense": extra_meta})
+            color_asset.metadata_json = ameta
+            db.session.commit()
+        # 辅助 JSON（逐帧同步 frames.jsonl / 相机标定 calibration.json）一并入库，
+        # 重采时与深度/视频同类型替换；失败仅记录警告，不影响主资产入库
+        frames_jsonl = os.path.join(out_dir, "frames.jsonl")
+        calib_json = os.path.join(out_dir, "calibration.json")
+        frames_asset_id = None
+        calib_asset_id = None
+        try:
+            if os.path.isfile(frames_jsonl):
+                fa = _upload_rec_json(svc, subject_id, frames_jsonl, "frames", video_type)
+                frames_asset_id = fa.id if fa else None
+            if os.path.isfile(calib_json):
+                ca = _upload_rec_json(svc, subject_id, calib_json, "calibration", video_type)
+                calib_asset_id = ca.id if ca else None
+        except Exception:
+            logger.exception("辅助 JSON 入库失败（不影响主资产入库）")
+        # JSON 资产关联补写到彩色资产 metadata
+        if frames_asset_id or calib_asset_id:
+            ameta = color_asset.metadata_json or {}
+            rmeta = dict(ameta.get("realsense") or {})
+            if frames_asset_id:
+                rmeta["frames_asset_id"] = frames_asset_id
+            if calib_asset_id:
+                rmeta["calibration_asset_id"] = calib_asset_id
+            ameta["realsense"] = rmeta
             color_asset.metadata_json = ameta
             db.session.commit()
     except Exception:
