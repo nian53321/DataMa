@@ -520,8 +520,8 @@ docker compose up -d                      # 启动剩余服务
 - **解决**：改 `docker-compose.yml` 中对应端口映射，如 `"8080:80"` 改为 `"9090:80"`，访问 `http://localhost:9090`
 
 ### Q6：文件上传 413 Request Entity Too Large
-- **原因**：nginx 限制（已默认配 512m）
-- **解决**：如仍报错，检查 `front/nginx.conf` 中 `client_max_body_size 512m;`
+- **原因**：nginx 限制（已默认配 2048m）
+- **解决**：如仍报错，检查 `front/nginx.conf` 中 `client_max_body_size 2048m;`
 
 ### Q7：首次启动后数据库没初始化
 - **原因**：应用启动时会自动 `db.create_all()` 并初始化默认 admin / 角色 / 标签 / 脱敏配置

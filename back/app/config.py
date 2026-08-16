@@ -60,8 +60,8 @@ class BaseConfig:
     DEFAULT_PAGE_SIZE = 20
     MAX_PAGE_SIZE = 100
 
-    # 文件上传上限（512MB）
-    MAX_CONTENT_LENGTH = 512 * 1024 * 1024
+    # 文件上传上限（2GB，含普通摄像头录制视频 multipart 上传）
+    MAX_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024
 
     # refresh token 30 天有效
     JWT_REFRESH_TOKEN_EXPIRES = 30 * 24 * 3600

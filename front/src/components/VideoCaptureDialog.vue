@@ -1514,8 +1514,8 @@ const switchToPlayback = (blob) => {
 }
 
 // ==================== 文件选择（无摄像头时的备选方案） ====================
-// 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 512MB 一致）
-const MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+// 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 2GB 一致）
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 const pickVideoFile = () => {
   fileInputRef.value?.click()
 }
@@ -1529,7 +1529,7 @@ const onVideoFileChange = (e) => {
     return
   }
   if (file.size > MAX_UPLOAD_BYTES) {
-    ElMessage.warning('文件过大（超过 512MB），请选择较小的视频文件')
+    ElMessage.warning('文件过大（超过 2GB），请选择较小的视频文件')
     e.target.value = ''
     return
   }
@@ -1759,7 +1759,7 @@ const handleUpload = async () => {
     return
   }
   if (recordedBlob.size > MAX_UPLOAD_BYTES) {
-    ElMessage.warning('文件过大（超过 512MB），请裁剪后重试')
+    ElMessage.warning('文件过大（超过 2GB），请裁剪后重试')
     return
   }
   uploading.value = true

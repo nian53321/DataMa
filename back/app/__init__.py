@@ -368,7 +368,7 @@ def create_app(env=None):
     @app.errorhandler(HTTPException)
     def handle_http_error(e):
         if e.code == 413:
-            message = "上传文件过大（超过 512MB 限制），请拆分后重试"
+            message = "上传文件过大（超过 2GB 限制），请拆分后重试"
         else:
             message = e.description
         return jsonify({"code": e.code, "message": message, "data": None}), e.code

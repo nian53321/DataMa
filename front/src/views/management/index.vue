@@ -1428,8 +1428,8 @@ const batchUploadProgress = reactive({
 const subjectFolderInputRef = ref(null)
 // 检测浏览器是否支持 webkitdirectory
 const supportsFolderSelect = ref(typeof document !== 'undefined' && 'webkitdirectory' in document.createElement('input'))
-// 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 512MB 一致）
-const MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+// 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 2GB 一致）
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 // 按后缀识别模态类型
 const detectDataType = (ext, fileName = '') => {
@@ -1794,7 +1794,7 @@ const handleSubjectFileChange = (file) => {
     return
   }
   if (file.raw?.size > MAX_UPLOAD_BYTES) {
-    ElMessage.warning(`文件 ${file.name} 超过 512MB 上限，已跳过`)
+    ElMessage.warning(`文件 ${file.name} 超过 2GB 上限，已跳过`)
     return
   }
   subjectFileList.value.push({
@@ -1892,7 +1892,7 @@ const handleSubjectFolderChange = async (e) => {
     }
   }
 
-  const oversizeNote = oversizedCount ? `，跳过 ${oversizedCount} 个超过 512MB 的文件` : ''
+  const oversizeNote = oversizedCount ? `，跳过 ${oversizedCount} 个超过 2GB 的文件` : ''
   if (unrecognized.length) {
     const sample = unrecognized.slice(0, 3).map((u) => `${u.name}（.${u.ext}）`).join('、')
     const metaNote = skippedMetaCount ? `，跳过 ${skippedMetaCount} 个元数据/密钥文件` : ''
@@ -2031,7 +2031,7 @@ const openAccessDialog = () => {
 
 const handleFileChange = (file) => {
   if (file.raw?.size > MAX_UPLOAD_BYTES) {
-    ElMessage.warning('文件超过 512MB 上限，请选择较小的文件')
+    ElMessage.warning('文件超过 2GB 上限，请选择较小的文件')
     return
   }
   uploadedFile.value = file
@@ -2092,7 +2092,7 @@ const handleFolderChange = (e) => {
     }
   })
   folderFiles.value = recognized // 仅导入可识别类型的文件
-  const oversizeNote = oversizedCount ? `，跳过 ${oversizedCount} 个超过 512MB 的文件` : ''
+  const oversizeNote = oversizedCount ? `，跳过 ${oversizedCount} 个超过 2GB 的文件` : ''
   if (unrecognized.length) {
     const sample = unrecognized.slice(0, 3).map((u) => `${u.name}（.${u.ext}）`).join('、')
     const metaNote = skippedMetaCount ? `，跳过 ${skippedMetaCount} 个元数据/密钥文件` : ''
