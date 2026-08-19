@@ -503,6 +503,8 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
                     subject=subject,
                     data_type=data_type,
                     original_filename=original_name,
+                    # 量表传入量表类型（MoCA/MMSE/AD8），使重命名后仍可区分不同量表
+                    scale_type=detect_scale_type(original_name) if is_scale else None,
                 )
                 # 重新拼装为含扩展名的完整文件名
                 new_name = f"{norm_name}.{norm_ext}" if norm_ext else norm_name

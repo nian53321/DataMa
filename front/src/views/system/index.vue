@@ -1510,6 +1510,8 @@ const namingVariables = [
   { key: 'batch', desc: '采集批次' },
   { key: 'seq', desc: '序号(3位)' },
   { key: 'original', desc: '原始文件名' },
+  { key: 'video_type', desc: '视频子类型(face/body/gait，仅视频)' },
+  { key: 'scale_type', desc: '量表类型(moca/mmse/ad8，仅量表，未引用时自动追加)' },
 ]
 
 // 插入命名变量到模板
@@ -1534,6 +1536,8 @@ const namingPreview = computed(() => {
     batch: standardForm.schema.defaults?.batch || 'B01',
     seq: '001',
     original: '原始文件名',
+    video_type: 'face',
+    scale_type: 'moca',
   }
   try {
     return tpl.replace(/\{(\w+)\}/g, (_, k) => vars[k] || `{${k}}`) + '.mp4'

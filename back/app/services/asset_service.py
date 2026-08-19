@@ -44,6 +44,7 @@ from app.utils.like_query import build_like_contains
 from app.utils.naming import (
     apply_naming_standard, get_naming_standard, validate_extension,
 )
+from app.utils.scale_adapter import detect_scale_type
 from app.utils.response import paginate
 from werkzeug.utils import secure_filename
 from app.utils.naming import _safe_segment as safe_filename_segment
@@ -312,6 +313,8 @@ class AssetService(BaseService):
         norm_name, norm_ext = apply_naming_standard(
             naming_std, subject, data_type, naming_input,
             video_type=naming_video_type or video_type,
+            # 量表传入量表类型（MoCA/MMSE/AD8），使重命名后仍可区分不同量表
+            scale_type=detect_scale_type(naming_input) if dt == DataType.SCALE else None,
         )
         # 拼接扩展名（保留原后缀；无后缀时不追加）
         final_ext = norm_ext or ext
@@ -404,9 +407,7 @@ class AssetService(BaseService):
         if dt == DataType.SCALE:
             try:
                 import json as _json
-                from app.utils.scale_adapter import (
-                    parse_scale_summary, detect_scale_type,
-                )
+                from app.utils.scale_adapter import parse_scale_summary
                 if is_external_enc:
                     content = _scale_plain_bytes
                 else:

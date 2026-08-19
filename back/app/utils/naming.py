@@ -19,6 +19,7 @@
   {seq}        - 同受试者同模态当日序号（3位，如 001）
   {original}   - 原始文件名（不含扩展名）
   {video_type} - 视频子类型（face/body/gait，仅 video 模态）
+  {scale_type} - 量表类型（moca/mmse/ad8，仅 scale 模态；模板未引用时自动追加到末尾）
 
 扩展名自动保留原文件后缀。若模板已含 .{ext}，则不再追加。
 """
@@ -54,7 +55,8 @@ def _safe_segment(value):
     return s or "NA"
 
 
-def _build_context(subject, data_type, original_filename, seq=None, video_type=None):
+def _build_context(subject, data_type, original_filename, seq=None, video_type=None,
+                   scale_type=None):
     """构建模板变量上下文"""
     now = datetime.now(BEIJING_TZ)
     # 原始文件名（不含扩展名）
@@ -69,6 +71,7 @@ def _build_context(subject, data_type, original_filename, seq=None, video_type=N
         "seq": f"{seq:03d}" if seq is not None else "001",
         "original": original_stem,
         "video_type": video_type or "",
+        "scale_type": scale_type or "",
     }
     return ctx
 
@@ -89,7 +92,8 @@ def _next_seq(subject_id, data_type):
         return 1
 
 
-def apply_naming_standard(standard, subject, data_type, original_filename, video_type=None):
+def apply_naming_standard(standard, subject, data_type, original_filename, video_type=None,
+                          scale_type=None):
     """应用命名规范生成规范化文件名
 
     Args:
@@ -98,14 +102,16 @@ def apply_naming_standard(standard, subject, data_type, original_filename, video
         data_type: 模态类型字符串
         original_filename: 上传原始文件名
         video_type: 视频子类型（face/body/gait，仅 video 模态有效）
+        scale_type: 量表类型（moca/mmse/ad8，仅 scale 模态有效；可由文件名识别）
 
     Returns:
         (normalized_name, ext): 规范化文件名(不含扩展名), 扩展名(小写无点)
 
-    视频子类型规则：
-    - 若模板含 {video_type}，按模板渲染（用户可自定义位置）
-    - 若模板不含 {video_type} 但 data_type=video 且 video_type 存在，
-      则在规范化名末尾自动追加 _{video_type}，确保 face/body/gait 文件名可区分
+    子类型规则：
+    - {video_type}：模板含时按模板渲染；不含但 data_type=video 有子类型时自动追加
+      _{video_type}，确保 face/body/gait 文件名可区分
+    - {scale_type}：模板含时按模板渲染；不含但 data_type=scale 有量表类型时自动追加
+      _{scale_type}，确保 MoCA/MMSE/AD8 等不同量表文件名可区分
     """
     # 解析 schema
     schema = {}
@@ -122,7 +128,11 @@ def apply_naming_standard(standard, subject, data_type, original_filename, video
 
     # 构建上下文
     seq = _next_seq(subject.id if subject else None, data_type) if subject else 1
-    ctx = _build_context(subject, data_type, original_filename, seq, video_type)
+    ctx = _build_context(subject, data_type, original_filename, seq, video_type, scale_type)
+
+    # 量表类型统一小写（MOCA/MMSE/AD8 → moca/mmse/ad8），保证模板直引与自动追加风格一致
+    if scale_type:
+        ctx["scale_type"] = str(scale_type).lower()
 
     # 时间戳自定义格式
     ctx["timestamp"] = datetime.now(BEIJING_TZ).strftime(ts_format)
@@ -143,15 +153,20 @@ def apply_naming_standard(standard, subject, data_type, original_filename, video
         name = _safe_segment(ctx.get("original") or "unnamed")
     name = _safe_segment(name)
 
-    # 子类型兜底：模板未引用 {video_type} 但存在子类型时自动追加，
-    # 确保 face/body/gait 等同类文件命名可区分，避免重采/替换时因同名导致路径冲突。
-    # 适用：video 模态（face/body/gait）与 realsense 辅助 JSON（frames/calibration，
-    # 通过 naming_video_type 显式传入，data_type=json 但也需区分模态）。
+    # 子类型兜底：模板未引用子类型变量但存在子类型时自动追加，避免同模态文件因同名
+    # 导致路径冲突。适用：
+    # - video 模态（face/body/gait，video_type）
+    # - scale 模态（MoCA/MMSE/AD8 等，scale_type）
     if video_type and "{video_type}" not in template:
         vt = _safe_segment(video_type)
         # 避免重复追加（如模板已含 face/body/gait 字面量）
         if vt and vt not in name.split("_"):
             name = f"{name}_{vt}"
+    if scale_type and data_type == "scale" and "{scale_type}" not in template:
+        st = _safe_segment(scale_type).lower()
+        # 避免重复追加（如模板已含 moca/mmse/ad8 字面量）
+        if st and st not in name.split("_"):
+            name = f"{name}_{st}"
 
     return name, ext
 
@@ -217,6 +232,7 @@ DEFAULT_NAMING_STANDARDS = [
                 "seq": "同受试者同模态序号(3位)",
                 "original": "原始文件名(不含扩展名)",
                 "video_type": "视频子类型(face/body/gait，仅video模态；模板未引用时自动追加到末尾)",
+                "scale_type": "量表类型(moca/mmse/ad8，仅scale模态；模板未引用时自动追加到末尾)",
             },
         },
         "description": "默认命名规则：模态_伪ID_时间戳_场景_批次.扩展名",
