@@ -164,108 +164,125 @@
 
       <!-- 分模态可视化 -->
       <el-row :gutter="16">
-        <el-col :span="12">
+        <el-col :span="24">
           <el-card>
             <template #header>
               <div class="card-title">
                 <span>视频模块</span>
-                <el-space v-if="videoList.length">
-                  <el-select
-                    v-model="currentVideoId"
-                    size="small"
-                    style="width: 220px"
-                    @change="onVideoSwitch"
-                  >
-                    <el-option
-                      v-for="(v, i) in videoList"
-                      :key="v.id"
-                      :label="`${i + 1}. ${v.file_name}`"
-                      :value="v.id"
-                    />
-                  </el-select>
-                  <el-tag size="small" type="success">共 {{ videoList.length }} 路 / offset {{ currentVideo?.offset_ms || 0 }}ms</el-tag>
-                </el-space>
+                <el-tag v-if="videoGroups.length" size="small" type="success">共 {{ videoList.length }} 路 · {{ videoGroups.length }} 类</el-tag>
                 <el-tag v-else size="small" type="info">无视频数据</el-tag>
               </div>
             </template>
-            <div class="video-box">
-              <div class="video-wrap" v-if="currentVideo?.file_url">
-                <video
-                  v-if="!videoError"
-                  ref="videoRef"
-                  :src="playUrl(currentVideo)"
-                  controls
-                  controlslist="nodownload noremoteplayback"
-                  playsinline
-                  crossorigin="anonymous"
-                  class="video-el"
-                  @loadstart="videoLoading = true"
-                  @canplay="videoLoading = false"
-                  @error="onVideoError"
-                  @contextmenu.prevent
-                />
-                <!-- 转码/加载中遮罩 -->
-                <div v-if="videoLoading && !videoError" class="loading-overlay">
-                  <el-icon class="is-loading" :size="32"><Loading /></el-icon>
-                  <p>{{ isPlayableVideo(currentVideo.file_format) ? '加载中...' : '正在转码为 MP4，请稍候...' }}</p>
+            <!-- 三个视频子模块（face/body/gait，有几类显示几类），每类独立播放器 -->
+            <div v-if="videoGroups.length" class="video-subgrid" style="display: flex; flex-wrap: wrap; gap: 16px">
+              <div v-for="g in videoGroups" :key="g.type" style="flex: 1 1 320px; min-width: 300px; border: 1px solid #ebeef5; border-radius: 6px; padding: 12px">
+                <!-- 子模块头：类型标签 + 该类视频下拉 -->
+                <div class="card-title" style="margin-bottom: 8px">
+                  <span>{{ g.label }}</span>
+                  <el-space v-if="g.videos.length">
+                    <el-select
+                      v-if="g.videos.length > 1"
+                      v-model="videoGroupSel[g.type]"
+                      size="small"
+                      style="width: 190px"
+                    >
+                      <el-option
+                        v-for="(v, i) in g.videos"
+                        :key="v.id"
+                        :label="`${i + 1}. ${v.file_name}`"
+                        :value="v.id"
+                      />
+                    </el-select>
+                    <el-tag size="small" type="success">{{ g.videos.length }} 路</el-tag>
+                  </el-space>
                 </div>
-                <!-- 出错回退下载（仅管理员可下载原文件） -->
-                <div v-if="videoError" class="preview-box">
-                  <el-icon size="40" color="#e6a23c"><VideoCamera /></el-icon>
-                  <p>该格式暂无法在线播放</p>
-                  <el-button v-if="isAdmin" type="primary" size="small" :icon="Download" tag="a" :href="fileUrl(currentVideo)" download>
-                    下载文件
-                  </el-button>
-                  <p v-else class="sub-tip" style="color: #909399; font-size: 12px">无下载权限，请联系管理员</p>
+                <!-- 播放器 -->
+                <div class="video-box">
+                  <div class="video-wrap" v-if="currentVideoOf(g.type)?.file_url">
+                    <video
+                      v-if="!videoGroupLoad[g.type]?.error"
+                      :ref="(el) => { if (el) videoGroupRefs[g.type] = el; else delete videoGroupRefs[g.type] }"
+                      :key="currentVideoOf(g.type).id"
+                      :src="playUrl(currentVideoOf(g.type))"
+                      controls
+                      controlslist="nodownload noremoteplayback"
+                      playsinline
+                      crossorigin="anonymous"
+                      class="video-el"
+                      @loadstart="videoGroupLoad[g.type] = { loading: true, error: false }"
+                      @canplay="videoGroupLoad[g.type] = { loading: false, error: false }"
+                      @error="onGroupVideoError(g.type, $event)"
+                      @contextmenu.prevent
+                    />
+                    <!-- 转码/加载中遮罩 -->
+                    <div v-if="videoGroupLoad[g.type]?.loading && !videoGroupLoad[g.type]?.error" class="loading-overlay">
+                      <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+                      <p>{{ isPlayableVideo(currentVideoOf(g.type).file_format) ? '加载中...' : '正在转码为 MP4，请稍候...' }}</p>
+                    </div>
+                    <!-- 出错回退下载（仅管理员可下载原文件） -->
+                    <div v-if="videoGroupLoad[g.type]?.error" class="preview-box">
+                      <el-icon size="32" color="#e6a23c"><VideoCamera /></el-icon>
+                      <p>该格式暂无法在线播放</p>
+                      <el-button v-if="isAdmin" type="primary" size="small" :icon="Download" tag="a" :href="fileUrl(currentVideoOf(g.type))" download>
+                        下载文件
+                      </el-button>
+                      <p v-else class="sub-tip" style="color: #909399; font-size: 12px">无下载权限，请联系管理员</p>
+                    </div>
+                  </div>
+                  <div v-else class="preview-box">
+                    <el-icon size="32" color="#c0c4cc"><VideoCamera /></el-icon>
+                    <p>该类型暂无视频</p>
+                  </div>
+                  <p v-if="currentVideoOf(g.type)" class="sub-tip" style="margin-top: 6px">
+                    {{ currentVideoOf(g.type).file_name }}
+                    <el-tag size="small" :type="isPlayableVideo(currentVideoOf(g.type).file_format) ? 'success' : 'warning'" style="margin-left: 6px">
+                      {{ isPlayableVideo(currentVideoOf(g.type).file_format) ? '可在线播放' : '自动转码播放' }}
+                    </el-tag>
+                  </p>
+                </div>
+                <!-- 深度视频（伪彩色，按需加载转码） -->
+                <div v-if="currentVideoOf(g.type)" class="depth-video">
+                  <el-divider content-position="left"><el-icon><DataAnalysis /></el-icon>&nbsp;深度视频（伪彩色）</el-divider>
+                  <div v-if="depthGroupOf(g.type).status === 'idle'" class="preview-box">
+                    <el-button type="primary" plain @click="loadDepthGroupVideo(g.type)">
+                      <el-icon style="margin-right: 6px"><VideoCamera /></el-icon>加载深度视频
+                    </el-button>
+                    <p class="sub-tip" style="color: #909399; font-size: 12px; margin-top: 6px">
+                      按需转码，仅当需要可视化深度数据时执行（首次约需数十秒）
+                    </p>
+                  </div>
+                  <div v-else-if="depthGroupOf(g.type).status === 'failed'" class="preview-box">
+                    <el-icon size="32" color="#c0c4cc"><VideoCamera /></el-icon>
+                    <p>该视频无深度轨，无法可视化</p>
+                  </div>
+                  <div v-else class="depth-video-box">
+                    <video
+                      v-if="depthGroupOf(g.type).url"
+                      :key="depthGroupOf(g.type).url"
+                      :src="depthGroupOf(g.type).url"
+                      controls
+                      controlslist="nodownload noremoteplayback"
+                      playsinline
+                      class="depth-video-el"
+                      @loadeddata="onDepthGroupLoaded(g.type)"
+                      @error="onDepthGroupError(g.type)"
+                    />
+                    <div v-if="depthGroupOf(g.type).status === 'loading'" class="loading-overlay">
+                      <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+                      <p>正在转码深度视频，请稍候（首次约需数十秒）...</p>
+                    </div>
+                  </div>
                 </div>
               </div>
-              <div v-else class="preview-box">
-                <el-icon size="40" color="#c0c4cc"><VideoCamera /></el-icon>
-                <p>该受试者暂无视频数据</p>
-              </div>
-              <p v-if="currentVideo" class="sub-tip" style="margin-top: 6px">
-                {{ currentVideo.file_name }}
-                <el-tag size="small" :type="isPlayableVideo(currentVideo.file_format) ? 'success' : 'warning'" style="margin-left: 6px">
-                  {{ isPlayableVideo(currentVideo.file_format) ? '可在线播放' : '自动转码播放' }}
-                </el-tag>
-              </p>
             </div>
-            <!-- 深度视频（伪彩色，像彩色视频一样逐帧播放；手动按需加载转码） -->
-            <div v-if="currentVideo" class="depth-video">
-              <el-divider content-position="left"><el-icon><DataAnalysis /></el-icon>&nbsp;深度视频（伪彩色）</el-divider>
-              <div v-if="depthVideoState.status === 'idle'" class="preview-box">
-                <el-button type="primary" plain @click="loadDepthVideo(currentVideo.id)">
-                  <el-icon style="margin-right: 6px"><VideoCamera /></el-icon>加载深度视频
-                </el-button>
-                <p class="sub-tip" style="color: #909399; font-size: 12px; margin-top: 6px">
-                  按需转码，仅当需要可视化深度数据时执行（首次约需数十秒）
-                </p>
-              </div>
-              <div v-else-if="depthVideoState.status === 'failed'" class="preview-box">
-                <el-icon size="40" color="#c0c4cc"><VideoCamera /></el-icon>
-                <p>该视频无深度轨，无法可视化</p>
-              </div>
-              <div v-else class="depth-video-box">
-                <video
-                  v-if="depthVideoState.url"
-                  :key="depthVideoState.url"
-                  :src="depthVideoState.url"
-                  controls
-                  controlslist="nodownload noremoteplayback"
-                  playsinline
-                  class="depth-video-el"
-                  @loadeddata="onDepthVideoLoaded"
-                  @error="onDepthVideoError"
-                />
-                <div v-if="depthVideoState.status === 'loading'" class="loading-overlay">
-                  <el-icon class="is-loading" :size="32"><Loading /></el-icon>
-                  <p>正在转码深度视频，请稍候（首次约需数十秒）...</p>
-                </div>
-              </div>
+            <div v-else class="preview-box">
+              <el-icon size="40" color="#c0c4cc"><VideoCamera /></el-icon>
+              <p>该受试者暂无视频数据</p>
             </div>
           </el-card>
         </el-col>
-        <el-col :span="12">
+        <!-- 音频模块（单独占一行） -->
+        <el-col :span="24" style="margin-top: 16px">
           <el-card>
             <template #header>
               <div class="card-title">
@@ -820,6 +837,76 @@ const videoError = ref(false)
 const videoLoading = ref(false)
 const currentVideo = computed(() => videoList.value.find((v) => v.id === currentVideoId.value) || videoList.value[0])
 const currentAudio = computed(() => audioList.value.find((a) => a.id === currentAudioId.value) || audioList.value[0])
+
+// ===== 受试者模式视频子模块（face/body/gait + 通用，每类独立播放器） =====
+const videoGroupDefs = [
+  { type: 'face', label: '面部视频' },
+  { type: 'body', label: '身体视频' },
+  { type: 'gait', label: '步态视频' },
+  { type: '', label: '通用视频' },
+]
+// 视频按类型分组（仅保留有视频的类型，有几类展示几类）
+// video_type 存于 metadata（face/body/gait）；无类型视为通用视频
+const videoGroups = computed(() =>
+  videoGroupDefs
+    .map((g) => ({ ...g, videos: videoList.value.filter((v) => (v.metadata?.video_type || '') === g.type) }))
+    .filter((g) => g.videos.length)
+)
+const videoGroupSel = reactive({})    // type -> 当前选中视频 id
+const videoGroupLoad = reactive({})   // type -> { loading, error }
+const videoGroupRefs = {}             // type -> <video> DOM
+const videoGroupDepth = reactive({})  // type -> 深度视频 { url, status }
+const depthGroupOf = (type) => (videoGroupDepth[type] || (videoGroupDepth[type] = { url: '', status: 'idle' }))
+const currentVideoOf = (type) => {
+  const g = videoGroups.value.find((x) => x.type === type)
+  if (!g || !g.videos.length) return null
+  return g.videos.find((v) => v.id === videoGroupSel[type]) || g.videos[0]
+}
+const onGroupVideoError = (type, e) => {
+  const code = e?.target?.error?.code
+  if (code === 1) return // aborted，正常切换
+  videoGroupLoad[type] = { loading: false, error: true }
+}
+// 签名 URL 异步就绪后触发各子模块 video.load()（与单视频逻辑一致）
+watch(
+  () => videoGroups.value.map((g) => `${g.type}:${playUrl(currentVideoOf(g.type))}`).join('|'),
+  () => {
+    if (!videoGroups.value.length) return
+    videoGroups.value.forEach((g) => {
+      const src = playUrl(currentVideoOf(g.type))
+      if (!src) return
+      videoGroupLoad[g.type] = { loading: true, error: false }
+      const el = videoGroupRefs[g.type]
+      nextTick(() => { try { el?.load() } catch (e) { /* ignore */ } })
+    })
+  },
+)
+// 子模块切换视频时重置该组深度视频状态（不自动请求转码）
+watch(
+  () => videoGroups.value.map((g) => `${g.type}:${currentVideoOf(g.type)?.id || ''}`).join('|'),
+  () => {
+    videoGroupDefs.forEach((d) => {
+      if (videoGroupDepth[d.type]) videoGroupDepth[d.type] = { url: '', status: 'idle' }
+    })
+  },
+)
+const loadDepthGroupVideo = (type) => {
+  const cv = currentVideoOf(type)
+  const st = depthGroupOf(type)
+  if (!cv || st.status === 'loading' || st.status === 'ready') return
+  st.url = ''
+  st.status = 'loading'
+  fetchSignedUrlApi({ kind: 'depth_video', asset_id: cv.id })
+    .then((res) => {
+      const url = res?.data?.url
+      if (url && st.status === 'loading') st.url = url
+    })
+    .catch(() => {
+      if (st.status === 'loading') { st.url = ''; st.status = 'failed' }
+    })
+}
+const onDepthGroupLoaded = (type) => { depthGroupOf(type).status = 'ready' }
+const onDepthGroupError = (type) => { depthGroupOf(type).status = 'failed' }
 
 // 浏览器原生可播放的视频格式（mkv/avi/flv 等由后端转码为 mp4）
 const PLAYABLE_VIDEO = ['mp4', 'webm', 'ogg', 'ogv', 'mov', 'm4v']
