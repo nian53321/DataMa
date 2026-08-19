@@ -377,14 +377,50 @@
             <template #header>
               <div class="card-title">
                 <span>量表与认知任务模块</span>
-                <el-space>
-                  <el-tag v-if="scaleMeta?.summary" size="small" type="success">
-                    {{ scaleMeta.summary.assess_name || '量表' }} {{ scaleMeta.summary.total_score }}/{{ scaleMeta.summary.max_score }}
-                  </el-tag>
-                </el-space>
+                <el-tag v-if="scaleCards.length" size="small" type="info">{{ scaleCards.length }} 张量表</el-tag>
               </div>
             </template>
-            <div ref="radarRef" style="height: 280px"></div>
+            <!-- 全部量表资产：每张表一张卡片（有几张展示几张） -->
+            <div
+              v-if="scaleCards.length"
+              style="display: flex; flex-wrap: wrap; gap: 16px"
+            >
+              <div
+                v-for="card in scaleCards"
+                :key="card.assetId"
+                style="flex: 1 1 320px; min-width: 300px"
+              >
+                <div
+                  class="scale-card-header"
+                  style="margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px"
+                >
+                  <span class="scale-card-name" style="font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
+                    {{ card.summary?.assess_name || card.file_name || '量表' }}
+                  </span>
+                  <el-tag v-if="card.summary" size="small" type="success" style="flex: none">
+                    {{ card.summary.total_score }}/{{ card.summary.max_score }}
+                    <template v-if="card.summary.education_adjusted">（教育校正）</template>
+                  </el-tag>
+                </div>
+                <div
+                  v-if="card.summary && card.summary.sections && card.summary.sections.length"
+                  :ref="(el) => { if (el) scaleRadarEls[card.assetId] = el; else delete scaleRadarEls[card.assetId] }"
+                  style="height: 260px; border: 1px solid #ebeef5; border-radius: 6px"
+                ></div>
+                <el-empty
+                  v-else-if="card.summary"
+                  :description="`总分 ${card.summary.total_score}/${card.summary.max_score}（暂无分项明细）`"
+                  :image-size="70"
+                />
+                <el-empty v-else description="量表数据解析失败" :image-size="70" />
+                <div class="scale-card-file" style="margin-top: 4px; font-size: 12px; color: #909399; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
+                  {{ card.file_name }}
+                </div>
+              </div>
+            </div>
+            <!-- 无量表资产但受试者字段有量表得分：回退展示受试者字段雷达图 -->
+            <div v-else-if="hasSubjectScaleFields" ref="radarRef" style="height: 280px"></div>
+            <el-empty v-else description="暂无量表数据" :image-size="80" />
           </el-card>
         </el-col>
       </el-row>
@@ -671,7 +707,10 @@ const assetBarRef = ref()
 const eegMeta = ref(null)
 const ecgMeta = ref(null)
 const eyeMeta = ref(null)       // 眼动指标（sync_data 解析结果）
-const scaleMeta = ref(null)     // 量表得分（MoCA 等）
+const scaleMeta = ref(null)     // 量表得分（按文件模式单选，MoCA 等）
+const scaleCards = ref([])      // 受试者模式全部量表资产 [{ assetId, file_name, summary }]
+let scaleRadarEls = {}          // 量表雷达图 DOM 引用映射（受试者模式，assetId -> el）
+let scaleRadarCharts = {}       // 量表雷达图 echarts 实例映射（assetId -> chart）
 let radarChart = null
 let eegChannelChart = null
 let eegChannelsData = []
@@ -1152,6 +1191,71 @@ const updateSimCharts = (modality = null) => {
   }
 }
 
+// 受试者是否有量表字段（用于无量表资产时的回退雷达图）
+const hasSubjectScaleFields = computed(() => {
+  const s = subjectInfo.value || {}
+  return [s.mmse_score, s.moca_score, s.ad8_score, s.cognitive_risk_level]
+    .some((v) => v !== undefined && v !== null && v !== '')
+})
+
+// 清空受试者模式多量表雷达图
+const clearScaleRadars = () => {
+  Object.values(scaleRadarCharts).forEach((c) => {
+    try { c.dispose() } catch (e) { /* 实例可能已失效 */ }
+  })
+  scaleRadarCharts = {}
+  scaleRadarEls = {}
+  if (radarChart) radarChart.setOption({ series: [] }, true)
+}
+
+// 渲染受试者模式下全部量表雷达图：
+// - 有量表资产：每张量表一个雷达图（有几张展示几张）
+// - 无量表资产但受试者字段有得分：回退展示受试者字段雷达图
+// - 均无：清空
+const renderScaleRadars = async () => {
+  clearScaleRadars()
+  if (scaleCards.value.length) {
+    await nextTick()
+    scaleCards.value.forEach((card) => {
+      const el = scaleRadarEls[card.assetId]
+      const summary = card.summary
+      if (!el || !summary || !Array.isArray(summary.sections)) return
+      const sections = summary.sections.filter((sec) => sec.max_score > 0)
+      if (!sections.length) return
+      // 快速切换受试者时同一 DOM 可能被多次渲染，复用已存在的实例避免重复 init 报错
+      let chart = echarts.getInstanceByDom(el)
+      if (!chart) chart = echarts.init(el)
+      scaleRadarCharts[card.assetId] = chart
+      chart.setOption({
+        tooltip: { trigger: 'item' },
+        radar: {
+          indicator: sections.map((sec) => ({ name: sec.name, max: sec.max_score })),
+          shape: 'polygon',
+        },
+        series: [{
+          type: 'radar',
+          data: [{
+            value: sections.map((sec) => sec.score),
+            name: `${summary.assess_name || '量表'} ${summary.total_score}/${summary.max_score}`,
+          }],
+          areaStyle: { color: 'rgba(84,112,198,0.15)' },
+          lineStyle: { color: '#5470c6' },
+          itemStyle: { color: '#5470c6' },
+        }],
+      })
+    })
+  } else if (hasSubjectScaleFields.value) {
+    await nextTick()
+    if (radarRef.value) {
+      if (!radarChart) radarChart = echarts.init(radarRef.value)
+      // scaleMeta 为 null → updateRadarChart 走受试者字段回退分支
+      updateRadarChart()
+    }
+  } else {
+    if (radarChart) radarChart.setOption({ series: [] }, true)
+  }
+}
+
 const updateRadarChart = () => {
   if (!radarChart) return
   const s = subjectInfo.value || {}
@@ -1295,20 +1399,32 @@ const onSubjectChange = async () => {
     } else {
       if (gaitChart) gaitChart.setOption({ series: [] }, true)
     }
-    // 量表：有真实量表资产时加载 MoCA 等得分
-    scaleMeta.value = null
+    // 量表：加载该受试者全部量表资产（有几张展示几张），逐张解析摘要
+    scaleCards.value = []
+    clearScaleRadars()
     if (hasModality('scale')) {
-      const scaleAsset = tracks.value.find((t) => t.data_type === 'scale')
-      try {
-        const scaleRes = await getScaleAssetApi(scaleAsset.id)
-        if (seq !== subjectSeq) return  // 过期响应丢弃
-        if (scaleRes.code === 200 && scaleRes.data) {
-          scaleMeta.value = scaleRes.data
+      const scaleAssets = tracks.value.filter((t) => t.data_type === 'scale')
+      const cards = []
+      for (const a of scaleAssets) {
+        let summary = null
+        // 优先用 timeline 附带 metadata 中已解析的 summary（扫描/上传时已写入）
+        if (a.metadata && a.metadata.summary) {
+          summary = a.metadata.summary
+        } else {
+          try {
+            const scaleRes = await getScaleAssetApi(a.id)
+            if (seq !== subjectSeq) return  // 过期响应丢弃
+            if (scaleRes.code === 200 && scaleRes.data) {
+              summary = scaleRes.data.summary || null
+            }
+          } catch (e) { /* 该资产解析失败，仅展示文件名 */ }
         }
-      } catch (e) { /* 解析失败回退 Subject 字段 */ }
+        cards.push({ assetId: a.id, file_name: a.file_name, summary })
+      }
+      if (seq === subjectSeq) scaleCards.value = cards
     }
-    // 量表雷达图
-    if (seq === subjectSeq) updateRadarChart()
+    // 量表雷达图：多量表全部展示 / 无量表资产时回退受试者字段
+    if (seq === subjectSeq) renderScaleRadars()
   } finally {
     if (seq === subjectSeq) loading.value = false
   }
@@ -1342,6 +1458,12 @@ const disposeAllCharts = () => {
   safeDispose(ecgChart, ecgRef); ecgChart = null
   safeDispose(eyeChart, eyeRef); eyeChart = null
   safeDispose(gaitChart, gaitRef); gaitChart = null
+  // 受试者模式多量表雷达图（每个量表一个实例）
+  Object.values(scaleRadarCharts).forEach((c) => {
+    try { c.dispose() } catch (e) { /* 实例可能已失效 */ }
+  })
+  scaleRadarCharts = {}
+  scaleRadarEls = {}
   riskPieChart?.dispose(); riskPieChart = null
   assetBarChart?.dispose(); assetBarChart = null
 }
@@ -1561,6 +1683,7 @@ const initOverviewCharts = () => {
 
 const handleResize = () => {
   radarChart?.resize()
+  Object.values(scaleRadarCharts).forEach((c) => c?.resize())
   eegChannelChart?.resize()
   ecgChart?.resize()
   eyeChart?.resize()
