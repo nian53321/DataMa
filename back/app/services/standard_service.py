@@ -33,16 +33,20 @@ VALID_FIELD_TYPES = {"input", "number", "select", "textarea", "date"}
 # 默认受试者字段模板
 DEFAULT_SUBJECT_FIELDS = [
     {"field_key": "pseudo_id", "field_label": "受试者伪ID", "field_type": "input", "required": True, "enabled": True, "sort_order": 1, "placeholder": "如 SUBJ_001", "options": []},
-    {"field_key": "age", "field_label": "年龄", "field_type": "number", "required": True, "enabled": True, "sort_order": 2, "placeholder": "0-120", "options": []},
+    {"field_key": "age", "field_label": "年龄", "field_type": "number", "required": True, "enabled": True, "sort_order": 2, "placeholder": "0-120", "options": [], "max": 120},
     {"field_key": "gender", "field_label": "性别", "field_type": "select", "required": True, "enabled": True, "sort_order": 3, "placeholder": "", "options": [{"label": "男", "value": "男"}, {"label": "女", "value": "女"}]},
     {"field_key": "education_level", "field_label": "教育程度", "field_type": "input", "required": False, "enabled": True, "sort_order": 4, "placeholder": "如 高中/本科", "options": []},
     {"field_key": "phone", "field_label": "联系电话", "field_type": "input", "required": False, "enabled": True, "sort_order": 5, "placeholder": "如 13800138000", "options": []},
     {"field_key": "id_card", "field_label": "身份证号", "field_type": "input", "required": False, "enabled": True, "sort_order": 6, "placeholder": "如 110101199001011234", "options": []},
     {"field_key": "cognitive_risk_level", "field_label": "认知风险分级", "field_type": "select", "required": False, "enabled": True, "sort_order": 7, "placeholder": "", "options": [{"label": "正常", "value": "normal"}, {"label": "轻度认知障碍", "value": "mci"}, {"label": "痴呆", "value": "dementia"}]},
     {"field_key": "emotion_status", "field_label": "情绪状态", "field_type": "input", "required": False, "enabled": True, "sort_order": 8, "placeholder": "如 焦虑/抑郁", "options": []},
-    {"field_key": "collection_batch", "field_label": "采集批次", "field_type": "autocomplete", "required": False, "enabled": True, "sort_order": 9, "placeholder": "如 BATCH_001（可选/可输入新值）", "options": []},
-    {"field_key": "collection_scene", "field_label": "场景代码", "field_type": "autocomplete", "required": False, "enabled": True, "sort_order": 10, "placeholder": "如 SCENE_A（可选/可输入新值）", "options": []},
-    {"field_key": "remark", "field_label": "备注", "field_type": "textarea", "required": False, "enabled": True, "sort_order": 11, "placeholder": "其他说明", "options": []},
+    # 量表得分（手动录入；与自动采集/外部推送的量表资产摘要并存，供列表与雷达图直接展示）
+    {"field_key": "moca_score", "field_label": "MoCA 得分", "field_type": "number", "required": False, "enabled": True, "sort_order": 9, "placeholder": "0-30", "options": [], "max": 30},
+    {"field_key": "mmse_score", "field_label": "MMSE 得分", "field_type": "number", "required": False, "enabled": True, "sort_order": 10, "placeholder": "0-30", "options": [], "max": 30},
+    {"field_key": "ad8_score", "field_label": "AD8 得分", "field_type": "number", "required": False, "enabled": True, "sort_order": 11, "placeholder": "0-8", "options": [], "max": 8},
+    {"field_key": "collection_batch", "field_label": "采集批次", "field_type": "autocomplete", "required": False, "enabled": True, "sort_order": 12, "placeholder": "如 BATCH_001（可选/可输入新值）", "options": []},
+    {"field_key": "collection_scene", "field_label": "场景代码", "field_type": "autocomplete", "required": False, "enabled": True, "sort_order": 13, "placeholder": "如 SCENE_A（可选/可输入新值）", "options": []},
+    {"field_key": "remark", "field_label": "备注", "field_type": "textarea", "required": False, "enabled": True, "sort_order": 14, "placeholder": "其他说明", "options": []},
 ]
 
 # 字段类型中文名映射（供前端下拉使用）
@@ -156,6 +160,14 @@ class StandardService(BaseService):
             fields = std.schema_json["fields"]
         else:
             fields = DEFAULT_SUBJECT_FIELDS
+        # 按 sort_order 稳定排序（旧库模板无量表字段时，升级注入的字段也能按预期顺序展示）
+        fields = sorted(
+            fields,
+            key=lambda f: (
+                f.get("sort_order") if isinstance(f, dict) and isinstance(f.get("sort_order"), (int, float)) else 999,
+                fields.index(f),
+            ),
+        ) if isinstance(fields, list) else fields
         return {"fields": fields, "field_types": FIELD_TYPE_OPTIONS}
 
     def update_subject_template(self, fields: list) -> dict:

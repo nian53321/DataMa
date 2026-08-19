@@ -150,6 +150,7 @@
           <el-descriptions-item label="认知风险">{{ riskText(subjectInfo?.cognitive_risk_level) }}</el-descriptions-item>
           <el-descriptions-item label="MMSE">{{ subjectInfo?.mmse_score ?? '—' }}</el-descriptions-item>
           <el-descriptions-item label="MoCA">{{ subjectInfo?.moca_score ?? '—' }}</el-descriptions-item>
+          <el-descriptions-item label="AD8">{{ subjectInfo?.ad8_score ?? '—' }}</el-descriptions-item>
         </el-descriptions>
       </el-card>
 
@@ -378,7 +379,7 @@
                 <span>量表与认知任务模块</span>
                 <el-space>
                   <el-tag v-if="scaleMeta?.summary" size="small" type="success">
-                    MoCA {{ scaleMeta.summary.total_score }}/{{ scaleMeta.summary.max_score }}
+                    {{ scaleMeta.summary.assess_name || '量表' }} {{ scaleMeta.summary.total_score }}/{{ scaleMeta.summary.max_score }}
                   </el-tag>
                 </el-space>
               </div>
@@ -614,7 +615,7 @@
                   <span>量表与认知任务模块</span>
                   <el-space>
                     <el-tag v-if="scaleMeta?.summary" size="small" type="success">
-                      MoCA {{ scaleMeta.summary.total_score }}/{{ scaleMeta.summary.max_score }}
+                      {{ scaleMeta.summary.assess_name || '量表' }} {{ scaleMeta.summary.total_score }}/{{ scaleMeta.summary.max_score }}
                     </el-tag>
                     <el-tag size="small" type="success">当前文件</el-tag>
                   </el-space>
@@ -1168,7 +1169,7 @@ const updateRadarChart = () => {
         type: 'radar',
         data: [{
           value: sections.map(sec => sec.score),
-          name: `MoCA ${summary.total_score}/${summary.max_score}`,
+          name: `${summary.assess_name || '量表'} ${summary.total_score}/${summary.max_score}`,
         }],
         areaStyle: { color: 'rgba(84,112,198,0.15)' },
         lineStyle: { color: '#5470c6' },

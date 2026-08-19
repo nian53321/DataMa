@@ -142,6 +142,37 @@ def _ensure_schema_upgrade(database):
                                 "options": [],
                             })
                             changed = True
+                        # 升级：注入量表得分字段（mmse_score/moca_score/ad8_score），
+                        # 支持多量表手动录入。将 batch/scene/remark 的 sort_order 后移 3 位，
+                        # 使量表字段插在 emotion_status 之后（默认模板 sort_order 12/13/14）。
+                        # 仅在确实缺失量表字段时调整，避免重排管理员自定义模板。
+                        _scale_defaults = [
+                            ("moca_score", "MoCA 得分", 9, "0-30", 30),
+                            ("mmse_score", "MMSE 得分", 10, "0-30", 30),
+                            ("ad8_score", "AD8 得分", 11, "0-8", 8),
+                        ]
+                        _scale_missing = [k for k, *_ in _scale_defaults
+                                          if k not in existing_keys]
+                        if _scale_missing:
+                            for f in fields:
+                                if isinstance(f, dict) and f.get("field_key") in (
+                                    "collection_batch", "collection_scene", "remark"
+                                ) and isinstance(f.get("sort_order"), (int, float)):
+                                    f["sort_order"] = int(f["sort_order"]) + 3
+                            for key, label, order, ph, mx in _scale_defaults:
+                                if key not in existing_keys:
+                                    fields.append({
+                                        "field_key": key,
+                                        "field_label": label,
+                                        "field_type": "number",
+                                        "required": False,
+                                        "enabled": True,
+                                        "sort_order": order,
+                                        "placeholder": ph,
+                                        "options": [],
+                                        "max": mx,
+                                    })
+                            changed = True
                         if changed:
                             schema["fields"] = fields
                             conn.execute(text(

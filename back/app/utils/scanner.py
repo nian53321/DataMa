@@ -31,7 +31,8 @@ from app.utils.eye_tracking_adapter import (
     load_sync_data, is_sync_data_file,
 )
 from app.utils.scale_adapter import (
-    load_scale_data, is_scale_data_file, parse_moca_summary,
+    load_scale_data, is_scale_data_file, parse_scale_summary,
+    detect_scale_type,
 )
 
 # 全局定时器引用
@@ -96,8 +97,8 @@ def _detect_data_type(filename):
         return "gait"
     if name_lower.startswith("eye_") or name_lower.startswith("eye-"):
         return "eye"
-    # 量表文件（MoCA_用户ID_日期.json 等）
-    if is_scale_data_file(filename):
+    # 量表文件（MoCA_用户ID_日期.json 等；.enc 已剥离，外部加密量表同样可识别）
+    if is_scale_data_file(name_lower):
         return "scale"
     # 通用扩展名兜底
     ext = name_lower.rsplit(".", 1)[-1] if "." in name_lower else ""
@@ -269,17 +270,22 @@ def _parse_user_info(user_info_path):
         fields["cognitive_risk_level"] = risk
     if "comment" in data and data["comment"]:
         fields["remark"] = str(data["comment"])
-    # 量表得分
-    if "moca" in data:
-        try:
-            fields["moca_score"] = float(data["moca"])
-        except (ValueError, TypeError):
-            pass
-    if "mmse" in data:
-        try:
-            fields["mmse_score"] = float(data["mmse"])
-        except (ValueError, TypeError):
-            pass
+    # 量表得分（兼容多字段命名：量表缩写 / 缩写_score / 中文拼音等）
+    _scale_fields = [
+        ("moca", "moca_score"), ("mmse", "mmse_score"), ("ad8", "ad8_score"),
+        ("moca_score", "moca_score"), ("mmse_score", "mmse_score"),
+        ("ad8_score", "ad8_score"),
+    ]
+    for src_key, dst_key in _scale_fields:
+        if src_key in data and data[src_key] not in (None, ""):
+            try:
+                v = data[src_key]
+                # 嵌套对象（如 {"moca": {"score": 28}}）时取其 score
+                if isinstance(v, dict):
+                    v = v.get("score") or v.get("total") or v.get("totalScore")
+                fields[dst_key] = float(v)
+            except (ValueError, TypeError):
+                pass
     # 采集信息
     if "organization" in data:
         fields["collection_scene"] = str(data["organization"])
@@ -474,9 +480,10 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
         original_name = _strip_enc_suffix(fname)
         ext = original_name.rsplit(".", 1)[-1] if "." in original_name else ""
         # 眼动评估数据 sync_data.json → data_type=eye, layer=feature
-        is_sync = is_sync_data_file(fname)
-        # 量表数据（MoCA 等）→ data_type=scale, layer=feature
-        is_scale = is_scale_data_file(fname)
+        # （用剥离 .enc 后的文件名判断，外部加密的 sync_data/量表同样可识别）
+        is_sync = is_sync_data_file(original_name)
+        # 量表数据（MoCA/MMSE/AD8 等）→ data_type=scale, layer=feature
+        is_scale = is_scale_data_file(original_name)
         if is_sync:
             data_type = "eye"
         elif is_scale:
@@ -565,10 +572,12 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
             scale_data = load_scale_data(src_path)
             if scale_data:
                 asset_metadata["raw"] = scale_data
-            # MoCA 量表额外计算总分与分项得分摘要
-            moca_summary = parse_moca_summary(scale_data)
-            if moca_summary:
-                asset_metadata["summary"] = moca_summary
+                # 量表统一摘要（MoCA/MMSE/AD8 等）：总分与分项得分
+                scale_summary = parse_scale_summary(
+                    scale_data, scale_type=detect_scale_type(original_name),
+                )
+                if scale_summary:
+                    asset_metadata["summary"] = scale_summary
         asset = DataAsset(
             subject_id=subject.id,
             file_name=new_name,

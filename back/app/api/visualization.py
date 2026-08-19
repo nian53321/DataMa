@@ -556,9 +556,9 @@ def eye_asset_parse(asset_id):
 def scale_asset_parse(asset_id):
     """解析量表数据资产，返回得分摘要用于可视化
 
-    优先从 metadata_json 读取（扫描导入时已解析），
+    优先从 metadata_json 读取（扫描导入/上传时已解析），
     若无则解密文件后用 load_scale_data 解析。
-    MoCA 量表返回总分与分项得分。
+    支持多种量表（MoCA/MMSE/AD8 等），返回量表名称、总分与分项得分。
     """
     asset = DataAsset.query.get(asset_id)
     if not asset:
@@ -566,10 +566,10 @@ def scale_asset_parse(asset_id):
     if asset.data_type != DataType.SCALE:
         return fail("该资产非量表类型", 422)
 
-    # 优先从 metadata_json 读取（扫描导入时已解析，含 raw + summary）
+    # 优先从 metadata_json 读取（扫描导入/上传时已解析，含 raw + summary）
     meta = asset.metadata_json
     if meta and isinstance(meta, dict) and "summary" in meta:
-        # 扫描导入时已解析（含 raw + summary）
+        # 导入时已解析（含 raw + summary）
         return success({
             "summary": meta["summary"],
             "raw": meta.get("raw"),
@@ -582,7 +582,9 @@ def scale_asset_parse(asset_id):
     if text is None:
         return fail("文件不存在于存储目录", 404)
     try:
-        from app.utils.scale_adapter import load_scale_data, parse_moca_summary
+        from app.utils.scale_adapter import (
+            load_scale_data, parse_scale_summary, detect_scale_type,
+        )
         import tempfile
         fd, tmp_json = tempfile.mkstemp(suffix=".json")
         try:
@@ -599,7 +601,8 @@ def scale_asset_parse(asset_id):
             return fail("量表数据解析失败", 422)
 
         result = {"raw": raw}
-        summary = parse_moca_summary(raw)
+        # 统一量表摘要（MoCA/MMSE/AD8 等）
+        summary = parse_scale_summary(raw, scale_type=detect_scale_type(asset.file_name or ""))
         if summary:
             result["summary"] = summary
         return success(result)

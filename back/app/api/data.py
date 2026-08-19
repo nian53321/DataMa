@@ -384,13 +384,13 @@ def parse_sync_data():
 @data_bp.route("/parse-scale", methods=["POST"])
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def parse_scale_data():
-    """解析量表数据 JSON（如 MoCA），返回原始字段与得分摘要（仅解析存储，不映射、不分级）
+    """解析量表数据 JSON（MoCA/MMSE/AD8 等），返回原始字段与得分摘要（仅解析存储，不映射、不分级）
 
     支持明文 .json 和加密文件（.enc / DMEC）。
-    MoCA 量表额外返回总分与分项得分摘要。
+    能识别的量表额外返回总分与分项得分摘要（含量表名称）。
 
     请求：multipart/form-data，字段 file = 量表 JSON 文件
-    返回：{raw: {...原始JSON}, summary: {...MoCA摘要}} 或 {raw: {...}}
+    返回：{raw: {...原始JSON}, summary: {...量表摘要}}
     """
     if "file" not in request.files:
         return fail("未检测到上传文件", 422)
@@ -399,7 +399,9 @@ def parse_scale_data():
         return fail("文件名为空", 422)
 
     import tempfile, os
-    from app.utils.scale_adapter import load_scale_data, parse_moca_summary
+    from app.utils.scale_adapter import (
+        load_scale_data, parse_scale_summary, detect_scale_type,
+    )
     from app.utils.scanner import _read_file_plaintext
 
     raw_bytes = file.read()
@@ -438,8 +440,8 @@ def parse_scale_data():
                 pass
 
         result = {"raw": raw}
-        # MoCA 量表额外返回得分摘要
-        summary = parse_moca_summary(raw)
+        # 统一量表摘要（MoCA/MMSE/AD8 等）：总分与分项得分
+        summary = parse_scale_summary(raw, scale_type=detect_scale_type(file.filename or ""))
         if summary:
             result["summary"] = summary
 

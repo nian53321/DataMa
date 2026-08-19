@@ -335,6 +335,9 @@ class AssetService(BaseService):
                 or save_path_abs.startswith(storage_root_abs + os.sep)):
             raise ValidationError("非法的存储路径")
 
+        # 量表文件明文缓存：供落盘后解析摘要（外部加密文件在解密分支捕获）
+        _scale_plain_bytes = None
+
         # 落盘：启用加密时直接将上传流加密写入磁盘（不留明文临时文件）
         # 外部加密文件（.enc）：先用数据库外部密钥解密明文，再用内部密钥加密入库
         if _encryption_enabled():
@@ -356,6 +359,7 @@ class AssetService(BaseService):
                     raise ValidationError(
                         f"外部加密文件解密失败：{e}，请检查外部密钥是否正确"
                     )
+                _scale_plain_bytes = plaintext
                 encrypted = encrypt_bytes(plaintext)
                 with open(save_path, "wb") as f:
                     f.write(encrypted)
@@ -380,6 +384,7 @@ class AssetService(BaseService):
                     raise ValidationError(
                         f"外部加密文件解密失败：{e}，请检查外部密钥是否正确"
                     )
+                _scale_plain_bytes = plaintext
                 with open(save_path, "wb") as f:
                     f.write(plaintext)
             else:
@@ -394,6 +399,36 @@ class AssetService(BaseService):
         }
         if video_type:
             metadata["video_type"] = video_type
+        # 量表文件：解析摘要与原始字段存入 metadata（与目录扫描导入行为一致，
+        # 供可视化 /visualization/scale-asset 直接读取，避免每次解密重解析）
+        if dt == DataType.SCALE:
+            try:
+                import json as _json
+                from app.utils.scale_adapter import (
+                    parse_scale_summary, detect_scale_type,
+                )
+                if is_external_enc:
+                    content = _scale_plain_bytes
+                else:
+                    # 明文上传：落盘后流指针已到末尾，seek 回 0 重读明文（JSON 文件体积小）
+                    file_storage.stream.seek(0)
+                    content = file_storage.stream.read()
+                    file_storage.stream.seek(0)
+                if content:
+                    try:
+                        raw = _json.loads(content.decode("utf-8"))
+                    except Exception:
+                        raw = None
+                    if isinstance(raw, dict):
+                        scale_summary = parse_scale_summary(
+                            raw, scale_type=detect_scale_type(original_name)
+                        )
+                        if scale_summary:
+                            metadata["raw"] = raw
+                            metadata["summary"] = scale_summary
+            except Exception:
+                # 解析失败不影响上传主流程（可视化可回退解密后解析）
+                pass
         asset = DataAsset(
             subject_id=subject_id,
             data_type=dt,

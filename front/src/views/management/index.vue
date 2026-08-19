@@ -179,6 +179,12 @@
         <el-table-column prop="mmse_score" label="MMSE" width="90" align="center" header-align="center">
           <template #default="{ row }">{{ row.mmse_score ?? '—' }}</template>
         </el-table-column>
+        <el-table-column prop="moca_score" label="MoCA" width="90" align="center" header-align="center">
+          <template #default="{ row }">{{ row.moca_score ?? '—' }}</template>
+        </el-table-column>
+        <el-table-column prop="ad8_score" label="AD8" width="90" align="center" header-align="center">
+          <template #default="{ row }">{{ row.ad8_score ?? '—' }}</template>
+        </el-table-column>
         <el-table-column prop="collection_batch" label="批次" width="100" show-overflow-tooltip header-align="center">
           <template #default="{ row }">{{ row.collection_batch || '—' }}</template>
         </el-table-column>
@@ -368,7 +374,7 @@
           <el-col v-for="f in subjectTplFields" :key="f.field_key" :span="f.span || 24">
             <el-form-item :label="f.field_label" :required="f.required">
               <el-input v-if="f.field_type === 'input'" v-model="subjectForm[f.field_key]" :placeholder="f.placeholder" />
-              <el-input-number v-else-if="f.field_type === 'number'" v-model="subjectForm[f.field_key]" :min="0" :max="120" style="width: 100%" :placeholder="f.placeholder" />
+              <el-input-number v-else-if="f.field_type === 'number'" v-model="subjectForm[f.field_key]" :min="0" :max="f.max ?? 120" style="width: 100%" :placeholder="f.placeholder" />
               <el-select v-else-if="f.field_type === 'select'" v-model="subjectForm[f.field_key]" style="width: 100%" clearable :placeholder="f.placeholder">
                 <el-option v-for="o in (f.options || [])" :key="o.value" :label="o.label" :value="o.value" />
               </el-select>
@@ -1312,7 +1318,8 @@ const loadSubjectTemplate = async () => {
     const defaultSpan = {
       pseudo_id: 24, age: 12, gender: 12, education_level: 24,
       phone: 12, id_card: 12, cognitive_risk_level: 24,
-      emotion_status: 24, collection_batch: 12, collection_scene: 12, remark: 24,
+      emotion_status: 24, moca_score: 12, mmse_score: 12, ad8_score: 12,
+      collection_batch: 12, collection_scene: 12, remark: 24,
     }
     subjectTplFields.value = fields.map(f => {
       // 兼容旧数据库模板：批次/场景字段强制使用 autocomplete（可输入+下拉选择）
@@ -1356,6 +1363,10 @@ const loadSubjectTemplate = async () => {
       { field_key: 'phone', field_label: '联系电话', field_type: 'input', required: false, span: 12, placeholder: '如 13800138000', options: [] },
       { field_key: 'id_card', field_label: '身份证号', field_type: 'input', required: false, span: 12, placeholder: '如 110101199001011234', options: [] },
       { field_key: 'cognitive_risk_level', field_label: '认知风险分级', field_type: 'select', required: false, span: 24, placeholder: '', options: [{ label: '正常', value: 'normal' }, { label: '轻度认知障碍', value: 'mci' }, { label: '痴呆', value: 'dementia' }] },
+      { field_key: 'emotion_status', field_label: '情绪状态', field_type: 'input', required: false, span: 24, placeholder: '如 焦虑/抑郁', options: [] },
+      { field_key: 'moca_score', field_label: 'MoCA 得分', field_type: 'number', required: false, span: 12, placeholder: '0-30', options: [], max: 30 },
+      { field_key: 'mmse_score', field_label: 'MMSE 得分', field_type: 'number', required: false, span: 12, placeholder: '0-30', options: [], max: 30 },
+      { field_key: 'ad8_score', field_label: 'AD8 得分', field_type: 'number', required: false, span: 12, placeholder: '0-8', options: [], max: 8 },
       { field_key: 'collection_batch', field_label: '采集批次', field_type: 'autocomplete', required: false, span: 12, placeholder: '如 BATCH_001（可选/可输入新值）', options: [] },
       { field_key: 'collection_scene', field_label: '场景代码', field_type: 'autocomplete', required: false, span: 12, placeholder: '如 SCENE_A（可选/可输入新值）', options: [] },
       { field_key: 'remark', field_label: '备注', field_type: 'textarea', required: false, span: 24, placeholder: '其他说明', options: [] },
