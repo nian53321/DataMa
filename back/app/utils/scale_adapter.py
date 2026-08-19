@@ -180,7 +180,8 @@ def load_scale_data(file_path):
     :return: dict，原始 JSON 解析结果；解析失败返回 None
     """
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        # utf-8-sig 自动剥离 UTF-8 BOM：兼容外部系统导出的带 BOM 文件
+        with open(file_path, "r", encoding="utf-8-sig") as f:
             raw = f.read()
         return json.loads(raw)
     except Exception:

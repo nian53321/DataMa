@@ -416,7 +416,8 @@ class AssetService(BaseService):
                     file_storage.stream.seek(0)
                 if content:
                     try:
-                        raw = _json.loads(content.decode("utf-8"))
+                        # utf-8-sig 剥离 UTF-8 BOM，兼容外部系统导出的带 BOM 文件
+                        raw = _json.loads(content.decode("utf-8-sig"))
                     except Exception:
                         raw = None
                     if isinstance(raw, dict):
