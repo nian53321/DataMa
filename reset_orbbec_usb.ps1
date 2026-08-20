@@ -82,7 +82,15 @@ param(
     [switch]$UninstallCamera,
     # 自动卸载 VirtualBox：当 VBoxUSBMon 拦截无法通过停止服务根治（捕获节点反复重现）
     # 时，静默卸载 VirtualBox（MSI 静默卸载，不弹窗、不要求确认、不重启系统）
-    [switch]$UninstallVBox
+    [switch]$UninstallVBox,
+    # 无人值守模式（Web 界面"透传深度相机"按钮经 usb_agent.ps1 调用）：
+    # 所有 y/n 确认自动作答（继续分级抢救/危险复位=是，wsl --shutdown 取回=否），
+    # busid 总线号选择取默认值，全程无交互
+    [switch]$Yes,
+    # 跳过第 7/8 步（重启 backend 容器 + 容器内验证）：usb_agent 以 SYSTEM 运行
+    # 本脚本时 docker CLI 未必可用，且重启容器会打断用户正在使用的界面；容器内
+    # 设备节点由前端随后的 /orbbec/status 轮询触发 ensure_usb_nodes 自动修复
+    [switch]$SkipContainerRestart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -107,7 +115,7 @@ $env:WSL_UTF8 = '1'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Host '需要管理员权限，正在请求提权（新窗口中继续运行，结束后窗口会暂停）...' -ForegroundColor Yellow
+    Write-Host '需要管理员权限，正在请求提权（新窗口中继续运行，结束后窗口自动关闭，日志见脚本目录）...' -ForegroundColor Yellow
     # 提权重启进程会丢失原始参数，必须逐个转发（曾因漏转 -BusId，导致提权后
     # 走默认深度摄像头流程，用户指定的设备被无视）
     $relaunchArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -WslDistro `"$WslDistro`""
@@ -115,6 +123,8 @@ if (-not $isAdmin) {
     if ($Detach)  { $relaunchArgs += ' -Detach' }
     if ($UninstallCamera) { $relaunchArgs += ' -UninstallCamera' }
     if ($UninstallVBox)   { $relaunchArgs += ' -UninstallVBox' }
+    if ($Yes)             { $relaunchArgs += ' -Yes' }
+    if ($SkipContainerRestart) { $relaunchArgs += ' -SkipContainerRestart' }
     Start-Process powershell -Verb RunAs -ArgumentList $relaunchArgs
     exit 0
 }
@@ -136,13 +146,12 @@ try {
 } catch { Write-Host "（警告：日志落盘不可用，仅屏幕输出）" -ForegroundColor DarkGray }
 Write-Host "本次运行日志: $Script:LogFile" -ForegroundColor DarkGray
 
-# 统一收尾：停日志 + 提示日志位置 + 暂停防闪退 + 退出
+# 统一收尾：停日志 + 提示日志位置 + 退出（日志已落盘，窗口自动关闭不丢信息）
 function Stop-Run { param($exitCode = 1, $tip)
     if ($tip) { Write-Host $tip -ForegroundColor Yellow }
     try { Stop-Transcript | Out-Null } catch {}
     Write-Host ''
     Write-Host "完整日志已保存: $Script:LogFile（排障请提供此文件）" -ForegroundColor DarkGray
-    Read-Host "按回车键关闭窗口"
     exit $exitCode
 }
 function Exit-Fail { param($msg) Write-Err2 $msg; Stop-Run 1 }
@@ -154,7 +163,6 @@ trap {
     Write-Host "  位置: $($_.InvocationInfo.PositionMessage)" -ForegroundColor Yellow
     try { Stop-Transcript | Out-Null } catch {}
     if ($Script:LogFile) { Write-Host "  完整日志已保存: $Script:LogFile（排障请提供此文件）" -ForegroundColor DarkGray }
-    Read-Host "按回车键关闭窗口"
     exit 1
 }
 
@@ -253,9 +261,16 @@ function Invoke-UsbSoftReset {
     return $false
 }
 
-function Get-YesNo { param($question)
+function Get-YesNo { param($question, $autoAnswer)
     # y/n 确认：空回车/无效输入时重复询问，必须明确输入 y 或 n。
-    # 避免直接按回车被当作"否"，导致关键复位级别被无意跳过（远程排障时曾连续发生）
+    # 避免直接按回车被当作"否"，导致关键复位级别被无意跳过（远程排障时曾连续发生）。
+    # 无人值守（-Yes，经 usb_agent 触发）时按调用方给定的 $autoAnswer 自动作答：
+    # 继续抢救/危险复位=是，wsl --shutdown 取回设备=否（会杀掉 Docker Desktop）
+    if ($Yes -and $null -ne $autoAnswer) {
+        Write-Host "  $question" -ForegroundColor DarkGray
+        Write-Host "  [自动确认] $(if ($autoAnswer) { 'y' } else { 'n' })" -ForegroundColor DarkGray
+        return $autoAnswer
+    }
     while ($true) {
         $a = (Read-Host "  $question").Trim()
         Write-Host "  [输入] $a" -ForegroundColor DarkGray
@@ -923,7 +938,7 @@ if (-not $deviceLine -and -not $skipPassthrough -and -not $Detach) {
         Write-Host '  若目标就是其中之一（如 -BusId 透传过的普通摄像头），请加 -BusId 参数重跑，' -ForegroundColor Yellow
         Write-Host '  例如: .\reset_orbbec_usb.ps1 -BusId 9-4' -ForegroundColor Yellow
         Write-Host '  仅当要抢救的是 Orbbec/RealSense 深度摄像头时，才继续下方的端口级复位。' -ForegroundColor Yellow
-        if (-not (Get-YesNo '未找到深度摄像头，是否仍继续分级抢救（复位 USB 总线）？(y/n)')) {
+        if (-not (Get-YesNo '未找到深度摄像头，是否仍继续分级抢救（复位 USB 总线）？(y/n)' $true)) {
             Exit-Fail '未找到深度摄像头；如需操作其他设备请用 -BusId 指定（见上方列表）'
         }
     }
@@ -955,7 +970,7 @@ if (-not $deviceLine -and -not $skipPassthrough) {
         $wslVids = @(& wsl -d $WslDistro -e sh -c 'for d in /sys/bus/usb/devices/*; do n=$(basename $d); case $n in *:*) continue ;; usb*) continue ;; esac; [ -f $d/idVendor ] && cat $d/idVendor; done | sort -u' |
             Where-Object { $_ -match '^[0-9a-f]{4}$' })
         Write-Warn "WSL USB 总线上挂有设备（$($wslRealDevs -join ' ')）：摄像头可能卡在半挂载状态"
-        if (Get-YesNo '执行 wsl --shutdown 取回设备到 Windows？(y/n，会停止 Docker Desktop；取回后自动 unbind 交还本地使用)') {
+        if (Get-YesNo '执行 wsl --shutdown 取回设备到 Windows？(y/n，会停止 Docker Desktop；取回后自动 unbind 交还本地使用)' $false) {
             Write-Step '执行 wsl --shutdown（断开 vhci，设备将回到 Windows 侧）'
             & wsl --shutdown
             $backLine = $null; $waited = 0
@@ -1091,8 +1106,14 @@ if (-not $deviceLine -and -not $skipPassthrough -and -not $Detach) {
         } elseif ($busMap.Count -gt 0) {
             Write-Warn '未能从幽灵节点定位摄像头挂载点（幽灵记录已被清理）'
             Write-Host "  可用总线: $(($busMap.Keys | Sort-Object) -join ', ')"
-            $sel = Read-Host '  请输入摄像头历史 busid 的总线号（直接回车=1）'
-            Write-Host "  [输入] $sel" -ForegroundColor DarkGray
+            $sel = ''
+            if ($Yes) {
+                $sel = '1'
+                Write-Host '  摄像头历史 busid 的总线号（无人值守模式自动取默认 1）' -ForegroundColor DarkGray
+            } else {
+                $sel = Read-Host '  请输入摄像头历史 busid 的总线号（直接回车=1）'
+                Write-Host "  [输入] $sel" -ForegroundColor DarkGray
+            }
             if (-not $sel) { $sel = '1' }
             if ($busMap.ContainsKey($sel)) {
                 $rootHub = $busMap[$sel]
@@ -1366,11 +1387,11 @@ if (-not $deviceLine -and -not $skipPassthrough -and -not $Detach) {
             Write-Warn "你的联网网卡就挂在该总线上: $nn —— 重置将断开远程连接 10-30 秒"
             Write-Host '  通常自动恢复（WiFi 自动重连；ToDesk/向日葵/RDP 会话保留，断开期间等待即可）' -ForegroundColor Yellow
             Write-Host '  若复位后网络 20 秒内未恢复，脚本将不再询问、自动升级到 P4 控制器复位' -ForegroundColor Yellow
-            $ans3 = Get-YesNo '确认重置根集线器？(y/n)'
+            $ans3 = Get-YesNo '确认重置根集线器？(y/n)' $true
         } elseif ($netDetectOk) {
             Write-Host '  联网网卡不在该总线上：重置不影响远程连接，直接执行' -ForegroundColor DarkGray
         } else {
-            $ans3 = Get-YesNo '无法确定联网网卡位置，仍要重置根集线器？(y/n)'
+            $ans3 = Get-YesNo '无法确定联网网卡位置，仍要重置根集线器？(y/n)' $true
         }
         if ($ans3) {
             & pnputil /restart-device "$rootHub" | Out-Null
@@ -1402,11 +1423,11 @@ if (-not $deviceLine -and -not $skipPassthrough -and -not $Detach) {
             Write-Warn "你的联网网卡挂在该控制器下: $nn —— 重置将断开远程连接 10-30 秒"
             Write-Host '  通常自动恢复（WiFi 自动重连；ToDesk/向日葵/RDP 会话保留，断开期间等待即可）' -ForegroundColor Yellow
             Write-Host '  极小概率网卡不复位导致失联：本机不能重启的前提下将只能现场处理，请自行权衡' -ForegroundColor Yellow
-            $ans4 = Get-YesNo '确认重置控制器？(y/n)'
+            $ans4 = Get-YesNo '确认重置控制器？(y/n)' $true
         } elseif ($netDetectOk) {
             Write-Host '  联网网卡不在该控制器下（另一控制器/内置网卡）：重置不影响远程连接，直接执行' -ForegroundColor DarkGray
         } else {
-            $ans4 = Get-YesNo '无法确定联网网卡位置，仍要重置控制器？(y/n)'
+            $ans4 = Get-YesNo '无法确定联网网卡位置，仍要重置控制器？(y/n)' $true
         }
         if ($ans4) {
             & pnputil /restart-device "$controller" | Out-Null
@@ -1781,6 +1802,15 @@ if (-not $skipPassthrough) {
 } # end if (-not $skipPassthrough)
 
 # ---------- 7. 重启 backend 容器（容器内 ensure_usb_nodes.py 会自动创建设备节点） ----------
+if ($SkipContainerRestart) {
+    # 无人值守（usb_agent 触发）：跳过容器重启与容器内验证。任务以 SYSTEM 运行，
+    # docker CLI 未必可用；且重启容器会打断用户正在使用的 Web 界面。设备节点由
+    # 前端完成提示后的 /orbbec/status 轮询触发 ensure_usb_nodes 自动修复。
+    Write-Step '透传完成（跳过容器重启：设备节点由后续状态检测自动修复）'
+    Write-Host ''
+    Write-Host '设备已透传给容器，稍后在视频采集弹窗中重新检测深度相机即可使用。' -ForegroundColor Green
+    Stop-Run 0
+}
 Write-Step '重启 backend 容器'
 Start-Sleep -Seconds 3   # 等设备在 WSL 内完成枚举
 # 若走了 wsl --shutdown 取回路径，Docker Desktop 需要时间自动重启 WSL VM 和引擎，

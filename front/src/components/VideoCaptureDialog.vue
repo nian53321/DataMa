@@ -74,6 +74,16 @@
       <el-tag v-if="realSenseChecked && !realSenseAvailable" size="small" type="info">
         RealSense 未检测到
       </el-tag>
+      <!-- 深度相机未检测到时提供 USB 透传自愈入口（宿主机执行 reset_orbbec_usb.ps1） -->
+      <el-button
+        v-if="showPassthroughBtn"
+        size="small"
+        type="warning"
+        plain
+        :icon="Connection"
+        :disabled="phase === 'recording' || phase === 'paused'"
+        @click="startPassthrough"
+      >透传深度相机</el-button>
       <!-- 普通摄像头：设备选择（深度相机 RGB 亦作为普通摄像头列出） -->
       <template v-if="deviceSource === 'webcam'">
         <el-divider direction="vertical" />
@@ -403,14 +413,43 @@
       style="margin-top: 8px"
     />
   </el-dialog>
+
+  <!-- USB 透传进度对话框：宿主机无人值守执行 reset_orbbec_usb.ps1，实时轮询日志尾部 -->
+  <el-dialog
+    :model-value="passthroughVisible"
+    title="深度相机 USB 透传"
+    width="720px"
+    append-to-body
+    :close-on-click-modal="false"
+    :close-on-press-escape="!passthroughRunning"
+    :show-close="!passthroughRunning"
+    @update:model-value="onPassthroughDialogChange"
+  >
+    <div class="passthrough-status">
+      <el-tag v-if="passthroughStarting" type="info">正在触发透传任务…</el-tag>
+      <el-tag v-else-if="passthroughRunning" type="warning">
+        脚本执行中——USB 总线复位期间可能断网 10-30 秒，请耐心等待
+      </el-tag>
+      <el-tag v-else-if="passthroughExit === 0" type="success">透传完成，可在上方重新检测设备</el-tag>
+      <el-tag v-else-if="passthroughExit !== null" type="danger">透传失败（退出码 {{ passthroughExit }}），详见下方日志</el-tag>
+      <el-tag v-else type="info">任务状态未知（宿主机代理可能已重启）</el-tag>
+    </div>
+    <pre ref="passthroughLogRef" class="passthrough-log">{{ passthroughLog || '等待脚本输出…' }}</pre>
+    <template #footer>
+      <el-button v-if="passthroughRunning || passthroughStarting" :icon="Refresh" @click="pollPassthroughOnce">
+        刷新
+      </el-button>
+      <el-button v-else type="primary" @click="closePassthrough">关闭</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <script setup>
 import { ref, computed, watch, onBeforeUnmount, nextTick } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   VideoPlay, VideoPause, CircleClose, RefreshLeft, Upload, Refresh,
-  Scissor, Check, Aim, Loading,
+  Scissor, Check, Aim, Loading, Connection,
 } from '@element-plus/icons-vue'
 import { VideoCamera } from '@element-plus/icons-vue'
 import { uploadAssetApi } from '@/api/data'
@@ -424,6 +463,7 @@ import {
   getRealSenseStatusApi, startRealSenseRecordApi, stopRealSenseRecordApi,
   uploadRealSenseRecordApi, getRealSenseRecordStatusApi,
   startRealSensePreviewApi, stopRealSensePreviewApi,
+  startRealSensePassthroughApi, getRealSensePassthroughStatusApi,
 } from '@/api/realsense'
 
 // 视频类型定义（与后端 VIDEO_TYPES 对应）
@@ -484,6 +524,16 @@ const realSensePreviewReady = ref(false)   // 预览视频是否已生成(录制
 const stoppingRealSense = ref(false)       // 停止采集中的 loading 状态
 const realSensePreviewing = ref(false)     // 实时预览会话是否已启动(MJPEG 流)
 let realSenseRecordTimerId = null
+
+// ==================== USB 透传（宿主机代理，RealSense 主入口） ====================
+const passthroughVisible = ref(false)
+const passthroughStarting = ref(false)   // 触发请求进行中
+const passthroughRunning = ref(false)    // 宿主机脚本运行中
+const passthroughExit = ref(null)        // 脚本退出码（null=未结束/未知）
+const passthroughLog = ref('')           // 宿主机日志尾部（最近 80 行）
+const passthroughLogRef = ref(null)
+let passthroughTimerId = null
+let passthroughFailCount = 0             // 轮询连续失败计数（USB 复位断网期间容忍）
 
 // 当前采集的视频类型：face / body / gait（默认 face）
 const currentVideoType = ref('face')
@@ -598,6 +648,7 @@ onBeforeUnmount(() => {
   _disposed = true
   if (orbbecLiveRefreshTimer) { clearInterval(orbbecLiveRefreshTimer); orbbecLiveRefreshTimer = null }
   if (realSenseLiveRefreshTimer) { clearInterval(realSenseLiveRefreshTimer); realSenseLiveRefreshTimer = null }
+  stopPassthroughPolling()
   releaseCamera()
   releaseOrbbec()
   releaseRealSense()
@@ -654,6 +705,110 @@ const checkRealSenseStatus = async () => {
   } finally {
     realSenseChecked.value = true
   }
+}
+
+// ==================== USB 透传（宿主机代理） ====================
+// 触发按钮仅在深度相机未检测到时显示（RealSense 为主用设备）
+const showPassthroughBtn = computed(() =>
+  (realSenseChecked.value && !realSenseAvailable.value) ||
+  (orbbecChecked.value && !orbbecAvailable.value)
+)
+
+const startPassthrough = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '将在宿主机执行深度相机 USB 透传自愈脚本：复位 USB 总线并重新绑定设备，' +
+      '若远程联网网卡在受影响总线上会断网 10-30 秒，全程约 1-3 分钟。是否继续？',
+      '透传深度相机',
+      { type: 'warning', confirmButtonText: '开始透传', cancelButtonText: '取消' }
+    )
+  } catch { return }
+  passthroughVisible.value = true
+  passthroughStarting.value = true
+  passthroughRunning.value = false
+  passthroughExit.value = null
+  passthroughLog.value = ''
+  passthroughFailCount = 0
+  try {
+    await startRealSensePassthroughApi()
+  } catch (e) {
+    passthroughStarting.value = false
+    const msg = e?.response?.data?.message || e?.message || '透传任务触发失败'
+    passthroughLog.value = String(msg)
+    ElMessage.error(String(msg))
+    return
+  }
+  passthroughStarting.value = false
+  passthroughRunning.value = true
+  startPassthroughPolling()
+}
+
+const startPassthroughPolling = () => {
+  stopPassthroughPolling()
+  pollPassthroughOnce()
+  passthroughTimerId = setInterval(pollPassthroughOnce, 3000)
+}
+
+const stopPassthroughPolling = () => {
+  if (passthroughTimerId) {
+    clearInterval(passthroughTimerId)
+    passthroughTimerId = null
+  }
+}
+
+const pollPassthroughOnce = async () => {
+  if (_disposed) {
+    stopPassthroughPolling()
+    return
+  }
+  try {
+    const res = await getRealSensePassthroughStatusApi()
+    passthroughFailCount = 0
+    const d = res.data || {}
+    if (d.tail) passthroughLog.value = d.tail
+    if (d.running) {
+      passthroughRunning.value = true
+      passthroughExit.value = null
+    } else {
+      const wasActive = passthroughRunning.value || passthroughStarting.value
+      passthroughRunning.value = false
+      passthroughExit.value = typeof d.exit_code === 'number' ? d.exit_code : null
+      stopPassthroughPolling()
+      if (wasActive) await finishPassthrough()
+    }
+  } catch {
+    // USB 总线复位断网/后端容器短暂中断：容忍连续失败（约 90 秒）不终止轮询
+    passthroughFailCount += 1
+    if (passthroughFailCount > 30) {
+      stopPassthroughPolling()
+      passthroughRunning.value = false
+      passthroughExit.value = null
+      ElMessage.error('透传任务状态查询持续失败，请稍后重新打开本窗口查看')
+    }
+  }
+  await nextTick()
+  if (passthroughLogRef.value) {
+    passthroughLogRef.value.scrollTop = passthroughLogRef.value.scrollHeight
+  }
+}
+
+const finishPassthrough = async () => {
+  if (passthroughExit.value === 0) {
+    ElMessage.success('深度相机 USB 透传完成')
+  } else if (passthroughExit.value !== null) {
+    ElMessage.error(`透传脚本执行失败（退出码 ${passthroughExit.value}），详见日志`)
+  }
+  // 脚本同时自愈 Orbbec/RealSense 两路 USB，完成后重新检测设备状态
+  await Promise.all([checkOrbbecStatus(), checkRealSenseStatus()])
+}
+
+const onPassthroughDialogChange = (v) => {
+  if (!v) closePassthrough()
+}
+
+const closePassthrough = () => {
+  stopPassthroughPolling()
+  passthroughVisible.value = false
 }
 
 // 切换设备源（异步：先确保旧会话完全停止/释放，再启动新会话）
@@ -1927,6 +2082,26 @@ const releaseCamera = () => {
   color: #606266;
   font-size: 13px;
   font-weight: 500;
+}
+
+/* USB 透传进度对话框 */
+.passthrough-status {
+  margin-bottom: 8px;
+}
+
+.passthrough-log {
+  max-height: 360px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 10px 12px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border-radius: 4px;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .video-stage {

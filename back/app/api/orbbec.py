@@ -16,6 +16,8 @@
 - GET  /api/orbbec/record/status    查询最近一次录制的后处理状态
 - GET  /api/orbbec/preview          返回预览 mp4（读容器内录制目录）
 - POST /api/orbbec/upload           将已录制 mkv 入库为数据资产（复用 AssetService）
+- POST /api/orbbec/passthrough      触发宿主机执行 reset_orbbec_usb.ps1（USB 透传自愈）
+- GET  /api/orbbec/passthrough/status  透传任务进度（宿主机 usb_agent 代理）
 """
 import json
 import logging
@@ -563,6 +565,47 @@ def status():
         "mode": "none",
         "message": "未检测到深度摄像头（请确认 usbipd 已透传 USB 到容器）",
     })
+
+
+# ==================== USB 透传（宿主机代理） ====================
+# 代理调用逻辑见 app.utils.host_agent（与 realsense 共用，RealSense 为主用设备）
+from app.utils.host_agent import agent_call as _agent_call
+
+
+@orbbec_bp.route("/passthrough", methods=["POST"])
+@jwt_required()
+@role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
+def passthrough_start():
+    """触发宿主机执行 reset_orbbec_usb.ps1（USB 透传自愈抢救）
+
+    代理侧同一时刻仅允许一个任务（运行中重复触发返回"已有透传任务在执行中"）。
+    脚本含 P3/P4 USB 总线复位：若远程联网网卡在受影响总线上会断网 10-30 秒，
+    期间本接口与 /passthrough/status 轮询可能短暂失败，前端需容忍重试。
+    """
+    if _camera.recording:
+        return fail("深度相机录制进行中，请先停止采集再透传", 409)
+    if _camera.active:
+        return fail("深度相机预览会话进行中，请先停止预览再透传", 409)
+    data, err = _agent_call("/reset", method="POST", timeout=10)
+    if err:
+        if "已有透传任务" in err:
+            return success({"running": True}, message="透传任务已在执行中，继续查询进度")
+        return fail(err, 502)
+    return success(data, message="透传任务已启动")
+
+
+@orbbec_bp.route("/passthrough/status", methods=["GET"])
+@jwt_required()
+def passthrough_status():
+    """透传任务进度（running / exit_code / 日志尾部 tail）
+
+    后端容器重启不影响宿主机任务本体；前端轮询失败（断网/后端重启）应重试
+    而非立即报错。
+    """
+    data, err = _agent_call("/status", timeout=5)
+    if err:
+        return fail(err, 502)
+    return success(data)
 
 
 # ==================== 录制 ====================

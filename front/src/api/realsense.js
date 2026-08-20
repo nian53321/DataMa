@@ -24,3 +24,11 @@ export const getRealSenseRecordStatusApi = () =>
 
 // 将录制的 color.mp4 入库为数据资产
 export const uploadRealSenseRecordApi = (data) => request.post('/realsense/upload', data)
+
+// USB 透传自愈：触发宿主机执行 reset_orbbec_usb.ps1（深度相机主入口）
+export const startRealSensePassthroughApi = () =>
+  request.post('/realsense/passthrough', {}, { skipErrorHandler: true })
+
+// 透传任务进度（running / exit_code / 日志尾部 tail）
+export const getRealSensePassthroughStatusApi = () =>
+  request.get('/realsense/passthrough/status', { skipErrorHandler: true })

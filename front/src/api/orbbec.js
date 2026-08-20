@@ -24,3 +24,11 @@ export const getOrbbecRecordStatusApi = () =>
 
 // 将已录制的 mkv 入库为数据资产
 export const uploadOrbbecRecordApi = (data) => request.post('/orbbec/upload', data)
+
+// USB 透传自愈：触发宿主机执行 reset_orbbec_usb.ps1（RealSense 为主用入口）
+export const startOrbbecPassthroughApi = () =>
+  request.post('/orbbec/passthrough', {}, { skipErrorHandler: true })
+
+// 透传任务进度（running / exit_code / 日志尾部 tail）
+export const getOrbbecPassthroughStatusApi = () =>
+  request.get('/orbbec/passthrough/status', { skipErrorHandler: true })

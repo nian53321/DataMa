@@ -20,6 +20,8 @@ pyrealsense2 是 C 库，所有调用通过子进程 realsense_child.py 隔离�
 - GET  /api/realsense/record/status    查询录制状态
 - GET  /api/realsense/preview          返回录制预览 mp4
 - POST /api/realsense/upload           将录制入库为数据资产（复用 AssetService）
+- POST /api/realsense/passthrough      触发宿主机执行 reset_orbbec_usb.ps1（USB 透传自愈）
+- GET  /api/realsense/passthrough/status  透传任务进度（宿主机 usb_agent 代理）
 """
 import json
 import logging
@@ -38,6 +40,7 @@ from app.extensions import db
 from app.models import Role
 from app.services import AssetService
 from app.utils.response import success, fail
+from app.utils.host_agent import agent_call as _agent_call
 
 logger = logging.getLogger(__name__)
 from app.utils.decorators import role_required
@@ -120,8 +123,9 @@ def _wait_usb_free():
 def _wait_child_ready(proc, timeout=20):
     """等待子进程输出就绪行（READY 成功 / ERR 失败），并消费该行。
 
-    返回 (ok, message)。超时未就绪则杀掉进程并报错，避免残留进程
-    或未消费的输出污染后续 MJPEG 流。
+    返回 (ok, message, ready_text)：ready_text 为 READY 行原文（录制子进程
+    携带设备信息 JSON），失败/超时为空串。超时未就绪则杀掉进程并报错，
+    避免残留进程或未消费的输出污染后续 MJPEG 流。
     """
     import queue
     ready_q = queue.Queue(maxsize=1)
@@ -152,10 +156,10 @@ def _wait_child_ready(proc, timeout=20):
             proc.wait(timeout=5)
         except Exception:
             pass
-        return False, "RealSense 相机启动超时"
+        return False, "RealSense 相机启动超时", ""
     if text.startswith("READY"):
-        return True, ""
-    return False, text[4:]
+        return True, "", text
+    return False, text[4:], ""
 
 # 录制状态（前端轮询 /record/status）
 _rec_state = {
@@ -283,6 +287,50 @@ def status():
     })
 
 
+# ==================== USB 透传（宿主机代理） ====================
+# RealSense 为主用深度相机：透传按钮经此触发宿主机 reset_orbbec_usb.ps1
+# （无人值守 -Yes -SkipContainerRestart），脚本同时自愈 Orbbec/RealSense 两路
+# USB，进度经 /passthrough/status 轮询（代理调用见 app.utils.host_agent）。
+
+@realsense_bp.route("/passthrough", methods=["POST"])
+@jwt_required()
+@role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
+def passthrough_start():
+    """触发宿主机执行 reset_orbbec_usb.ps1（USB 透传自愈抢救）
+
+    代理侧同一时刻仅允许一个任务（运行中重复触发返回"已有透传任务在执行中"）。
+    脚本含 P3/P4 USB 总线复位：若远程联网网卡在受影响总线上会断网 10-30 秒，
+    期间本接口与 /passthrough/status 轮询可能短暂失败，前端需容忍重试。
+    """
+    with _proc_lock:
+        recording = _rec_proc is not None and _rec_proc.poll() is None
+        previewing = _stream_proc is not None and _stream_proc.poll() is None
+    if recording:
+        return fail("深度相机录制进行中，请先停止采集再透传", 409)
+    if previewing:
+        return fail("深度相机预览会话进行中，请先停止预览再透传", 409)
+    data, err = _agent_call("/reset", method="POST", timeout=10)
+    if err:
+        if "已有透传任务" in err:
+            return success({"running": True}, message="透传任务已在执行中，继续查询进度")
+        return fail(err, 502)
+    return success(data, message="透传任务已启动")
+
+
+@realsense_bp.route("/passthrough/status", methods=["GET"])
+@jwt_required()
+def passthrough_status():
+    """透传任务进度（running / exit_code / 日志尾部 tail）
+
+    后端容器重启不影响宿主机任务本体；前端轮询失败（断网/后端重启）应重试
+    而非立即报错。
+    """
+    data, err = _agent_call("/status", timeout=5)
+    if err:
+        return fail(err, 502)
+    return success(data)
+
+
 # ==================== 实时预览 ====================
 
 @realsense_bp.route("/preview/start", methods=["POST"])
@@ -297,11 +345,10 @@ def preview_start():
         if _rec_proc is not None and _rec_proc.poll() is None:
             return fail("录制进行中，不能启动实时预览", 409)
     _wait_usb_free()
-    count, _serial, _detail = _probe()
-    if count == 0:
-        return fail("未检测到 RealSense 相机", 409)
+    # 不再预先 probe 探测：额外拉起一个 Python+pyrealsense2 子进程枚举 USB 设备
+    # （usbip 下约 2~4s），stream 子进程自身会检测设备并在无设备时输出 ERR
     proc = _start_proc(["stream", str(DEFAULT_FPS)])
-    ok, msg = _wait_child_ready(proc, timeout=15)
+    ok, msg, _ready = _wait_child_ready(proc, timeout=15)
     if not ok:
         with _proc_lock:
             if _stream_proc is proc:
@@ -374,22 +421,31 @@ def record_start():
             # 录制与预览互斥：先停预览
             _stop_proc(_stream_proc, wait=10)
             _stream_proc = None
-    # 预览子进程刚退出，等待 USB 释放后再探测/启动录制，避免 pipe.start() 失败
+    # 预览子进程刚退出，等待 USB 释放后再启动录制，避免 pipe.start() 失败
     _wait_usb_free()
-    count, serial, _detail = _probe()
-    if count == 0:
-        return fail("未检测到 RealSense 相机", 409)
+    # 不再预先 probe 探测设备：额外拉起一个 Python+pyrealsense2 子进程枚举
+    # USB（usbip 下约 2~4s），录制子进程自身会检测设备并在无设备时输出 ERR
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(REALSENSE_REC_DIR, f"realsense_{ts}")
     os.makedirs(out_dir, exist_ok=True)
     fps = int(data.get("fps", DEFAULT_FPS))
     proc = _start_proc(["record", out_dir, str(fps)], rec=True)
-    ok, msg = _wait_child_ready(proc, timeout=20)
+    ok, msg, ready = _wait_child_ready(proc, timeout=20)
     if not ok:
         with _proc_lock:
             if _rec_proc is proc:
                 _rec_proc = None
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)  # 启动失败清理空目录
         return fail(f"录制启动失败：{msg}", 409)
+    # 设备信息由录制子进程 READY 行携带（协商出的实际帧率/序列号/型号/固件）
+    info = {}
+    try:
+        _v = json.loads(ready[len("READY"):].strip() or "{}")
+        if isinstance(_v, dict):
+            info = _v
+    except Exception:
+        info = {}
     with _rec_state_lock:
         _rec_state.update({
             "dir": out_dir,
@@ -399,10 +455,10 @@ def record_start():
             "done": False,
             "meta": {
                 "device_type": "realsense",
-                "device_serial": serial,
-                "device_name": _detail.get("name") or "",
-                "firmware_version": _detail.get("firmware_version") or "",
-                "fps": fps,
+                "device_serial": info.get("serial") or "",
+                "device_name": info.get("name") or "",
+                "firmware_version": info.get("firmware") or "",
+                "fps": int(info.get("fps") or fps),
                 "start_time": datetime.now().isoformat(timespec="seconds"),
             },
         })
