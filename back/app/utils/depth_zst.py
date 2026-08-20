@@ -8,10 +8,11 @@
       逐帧: [flags u32][compressed_len u32][zstd payload]
         flags bit0: 0=关键帧（uint16 量化深度值），1=差分帧（int16 与上一帧差值）
 
-v2 压缩策略（体积约为 v1 的 2/5 ~ 1/2）：
-  - 量化：z16 值按 quantum=4mm 步长 round-to-nearest 量化（先 clamp 到
-    65532mm 再加半步长右移），量化误差 ±2mm，低于 D455 深度噪声
-    （1m 处约 ±2-4mm，随距离增大）；QUANTUM 调为 1 即回到无损差分模式；
+v2 压缩策略（体积约为 v1 的 1/4 ~ 1/3）：
+  - 量化：z16 值按 quantum=8mm 步长 round-to-nearest 量化（先 clamp 到
+    65528mm 再加半步长右移），量化误差 ±4mm，低于 D455 中远距深度噪声
+    （2-5m 处约 ±5-15mm）；近距离（<1m，噪声 ±1-3mm）误差略超噪声，
+    但人脸分析以彩色为主、深度仅提供几何信息；QUANTUM 调为 1 即回到无损差分模式；
   - 帧间差分：相邻帧绝大多数像素差值为 0 或 ±1 量化级（深度噪声），
     zstd 对差分帧压缩率极高；固定间隔插入关键帧，差分膨胀（场景突变）
     时自适应提前回退；量化步长是压缩率的主导参数（实测 2/4/8mm 步长
@@ -27,9 +28,9 @@ import struct
 
 MAGIC = b"DZST"
 VERSION = 2
-QUANTUM = 4             # 量化步长（z16 单位，D455 默认 1mm/单位即 4mm；须为 2 的幂）
+QUANTUM = 8             # 量化步长（z16 单位，D455 默认 1mm/单位即 8mm；须为 2 的幂）
 QMAX = 65535 // QUANTUM     # 量化值上限（QUANTUM=1 时即为无损模式）
-CLAMP_MAX = QMAX * QUANTUM  # 量化前 clamp 上限（65532mm，覆盖 D455 全量程）
+CLAMP_MAX = QMAX * QUANTUM  # 量化前 clamp 上限（65528mm，覆盖 D455 全量程）
 KEYFRAME_INTERVAL = 30  # 关键帧间隔（30fps 下约 1 秒）
 DELTA_FORCE_RATIO = 0.5  # 差分帧压缩后超过关键帧大小该比例时强制回退关键帧
 _QSHIFT = QUANTUM.bit_length() - 1  # log2(QUANTUM)，量化移位数

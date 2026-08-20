@@ -8,8 +8,8 @@
 
 数据流：与 Orbbec 一致，只采集 彩色 + 深度 两路（**不启用红外流**）：
   - 彩色：D455F 原生 1280x800（bgr8，1MP 全局快门），分辨率自动协商逐级降级
-  - 深度：D455F 原生 1280x720（z16，单位 mm），DZST v2 存储（11bit 量化 + 帧间差分 + zstd，
-    量化误差 ≤2mm 低于深度噪声，体积约为逐帧 zstd 的 2/5）
+  - 深度：D455F 原生 1280x720（z16，单位 mm），DZST v2 存储（8mm 量化 + 帧间差分 + zstd，
+    量化误差 ±4mm 低于中远距深度噪声，体积约为逐帧 zstd 的 1/4 ~ 1/3）
   - 深度量程：D455F 理想范围 0.6m-6m（深度 200mm-8000mm 归一化到伪彩色）
 
 录制产物（输出目录，全部为最终格式）：
@@ -406,7 +406,7 @@ def cmd_record(path, fps):
 
     产物（输出目录保留，不打包；全部为最终格式，无需二次转码）：
       <path>/color.mp4         彩色视频（H.264，libx264 CRF 18，浏览器可播）
-      <path>/depth_raw.zst     原始深度序列（DZST v2：11bit 量化 + 帧间差分 zstd，解码后为毫米深度值）
+      <path>/depth_raw.zst     原始深度序列（DZST v2：8mm 量化 + 帧间差分 zstd，解码后为毫米深度值）
       <path>/frames.jsonl      逐帧记录：mp4_frame/zst_frame + RGB/深度硬件时间戳(ms) + 硬件帧号
       <path>/calibration.json  相机标定：depth_scale/RGB 内参/畸变/分辨率/序列号/对齐状态
       <path>/meta.json         序列号 / 配置 / 每帧时间戳 / 编码信息
@@ -677,7 +677,7 @@ def cmd_record(path, fps):
         meta["depth_raw"] = bool(raw_ok)
         meta["color_codec"] = "h264"
         meta["depth_codec"] = "dzst2"
-        meta["depth_quantum_mm"] = 4
+        meta["depth_quantum_mm"] = 8
         try:
             with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
