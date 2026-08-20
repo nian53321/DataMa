@@ -201,6 +201,37 @@ def _signal_proc_stop(proc):
         pass
 
 
+# 旧预览进程同步回收宽限（秒）：发 stop 信号后等待其自行退出的时间上限。
+# 预览子进程可能卡在 pipe.wait_for_frames()/pipe.stop()（USB 异常时 C 库
+# 不返回），stop 信号送达也无法优雅退出；超过宽限必须 kill，否则相机被
+# 永久占用，后续所有采集启动都报 EBUSY。
+STREAM_EXIT_GRACE_SECONDS = 10.0
+
+
+def _stop_stream_sync(proc):
+    """停止旧预览子进程：发 stop 信号后同步等待退出，超时 kill。
+
+    正常退出（pipe.stop 在 usbip 下需 2~5s）时等待时间即用户感知的
+    "等几秒"；子进程卡死（wait_for_frames 不返回）时 10s 后强制 kill。
+    进程退出后内核释放 USB 设备，新子进程 pipe.start 的忙重试可覆盖
+    kill 后短暂的释放窗口。
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    _signal_proc_stop(proc)
+    try:
+        proc.wait(timeout=STREAM_EXIT_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
 def _stop_rec_proc(proc, wait=30):
     """停止录制子进程并解析结果行（stdout 混有 MJPEG 实时预览帧）
 
@@ -420,12 +451,11 @@ def record_start():
             if _stream_proc is None:
                 _stream_proc = old_stream  # 启动失败恢复预览进程引用
         return fail("上一段录制仍在收尾，请稍后重试", 409)
-    # 预览子进程发停止信号但不等待退出：录制子进程的启动耗时（Python+import
-    # 约 2s）与预览退出（pipe.stop 在 usbip 下 1~2.5s）重叠；相机独占由录制
-    # 子进程 _start_pipeline 的设备忙重试等待，整体启动时间明显缩短
-    _signal_proc_stop(old_stream)
-    if old_stream is not None:
-        threading.Thread(target=old_stream.wait, daemon=True).start()
+    # 停旧预览：同步等待退出（正常 2~5s，即用户感知的"等几秒"），
+    # 卡死（wait_for_frames/pipe.stop 不返回）时 10s 后 kill 强制回收。
+    # 仅发信号不等待会导致旧进程继续占用相机，录制子进程的忙重试
+    # 等不到释放而报 EBUSY（正是上一版"预览↔录制切换不等待"的缺陷）。
+    _stop_stream_sync(old_stream)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(REALSENSE_REC_DIR, f"realsense_{ts}")
     os.makedirs(out_dir, exist_ok=True)

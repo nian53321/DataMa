@@ -58,10 +58,12 @@ _STREAM_COMBOS = (
 # 一次 pipe.start 即成功。存 /tmp，容器重建自动失效（USB 链路升级后重新协商）。
 _COMBO_CACHE = os.path.join(tempfile.gettempdir(), "realsense_combo.json")
 
-# 设备忙重试预算（秒）：父进程停止上一子进程（预览/录制）后立即启动本进程，
-# 上一进程退出（pipe.stop 在 usbip 下需 1~2.5s）与 USB 内核释放期间
-# pipe.start 会失败，属"设备忙"而非配置不匹配，短间隔重试即可等到
-BUSY_RETRY_SECONDS = 8.0
+# 设备忙重试预算（秒）：父进程停止上一子进程（预览/录制）后启动本进程，
+# 上一进程退出（pipe.stop 在 usbip 下需 2~5s）与 USB 内核释放期间
+# pipe.start 会失败，属"设备忙"而非配置不匹配，短间隔重试即可等到。
+# 12s 覆盖：卡死的上一进程被父进程 kill（STREAM_EXIT_GRACE_SECONDS=10）
+# 后内核释放 USB 的窗口。
+BUSY_RETRY_SECONDS = 12.0
 BUSY_RETRY_INTERVAL = 0.5
 
 

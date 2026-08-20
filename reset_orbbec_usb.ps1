@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     深度摄像头（Orbbec Femto Bolt / Intel RealSense D455f）USB 透传与恢复脚本（Windows + Docker Desktop）
 .DESCRIPTION
