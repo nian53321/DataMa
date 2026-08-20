@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import struct
+import threading
 from flask import request, current_app
 from flask_jwt_extended import jwt_required
 
@@ -692,39 +693,30 @@ def _read_depth_frames(file_path, stream_index, w, h, step=1, src_pix_fmt=""):
     step 为取样步长（select 滤镜每 step 帧取 1 帧），第一遍扫描用大步长提速。
 
     深度数据来源两类：
-    - realsense 新方案：zstd 无损压缩序列（.zst，格式见 realsense_child.py _zstd_writer）：
-      直接解压逐帧 yield，16 位精度原样保留；
+    - realsense 新方案：DZST 压缩序列（.zst，格式见 app/utils/depth_zst.py）：
+      v1 逐帧 zstd / v2 量化+帧间差分，解码统一恢复毫米深度值逐帧 yield；
     - 深度轨视频（orbbec mkv 等）：ffmpeg 提取，pix_fmt 因录制器而异：
       rgb555le（16bit 小端，bit15=无效标志，低13位为毫米值）必须按原格式透传，
       gray16be/gray16le 统一输出 gray16be（16bit→16bit 仅换字节序，数值不变）。
     """
     import numpy as np
-    import struct
 
     if (file_path or "").lower().endswith(".zst"):
         try:
-            import zstandard as _zstd
+            from app.utils.depth_zst import iter_depth_frames, read_header
         except ImportError:
             return
-        dctx = _zstd.ZstdDecompressor()
+        # 帧数少于取样步长时（短录制）降为全帧采样，避免第一遍扫描
+        # 一帧都取不到（zst 路径首帧 idx=1 不满足 1%step==0）导致转码失败
         with open(file_path, "rb") as f:
-            if f.read(4) != b"DZST":
+            header = read_header(f)
+            if header is None:
                 return
-            _ver, fw, fh, _count = struct.unpack("<IIII", f.read(16))
-            idx = 0
-            while True:
-                hdr = f.read(4)
-                if not hdr or len(hdr) < 4:
-                    break
-                (clen,) = struct.unpack("<I", hdr)
-                blk = f.read(clen)
-                if len(blk) < clen:
-                    break
-                raw = dctx.decompress(blk, max_output_size=fw * fh * 2)
-                idx += 1
-                if step and idx % step != 0:
-                    continue
-                frame = np.frombuffer(raw, dtype="<u2").reshape(fh, fw).astype(np.float32)
+            _ver, _fw, _fh, frame_count, _quantum = header
+            # 帧数少于取样步长（短录制）或帧数缺失（异常截断）时降为全帧采样
+            if not frame_count or step > frame_count:
+                step = 1
+            for frame in iter_depth_frames(f, step=step):
                 yield frame
         return
 
@@ -874,6 +866,21 @@ def _transcode_depth_video(file_path, stream_index, w, h, fps, out_path, src_pix
     return False
 
 
+# 每资产转码锁：转码完成前同一资产的并发请求（浏览器补发请求/多标签页）
+# 会同时写同一个 tmp 文件互相截断导致转码失败，需串行化 + 双重检查缓存
+_depth_transcode_locks = {}
+_depth_transcode_locks_guard = threading.Lock()
+
+
+def _get_depth_transcode_lock(asset_id):
+    with _depth_transcode_locks_guard:
+        lock = _depth_transcode_locks.get(asset_id)
+        if lock is None:
+            lock = threading.Lock()
+            _depth_transcode_locks[asset_id] = lock
+        return lock
+
+
 @visualization_bp.route("/depth-video/<int:asset_id>", methods=["GET"])
 @media_auth_required("depth_video", resource_key="asset_id")
 def depth_video(asset_id):
@@ -893,6 +900,17 @@ def depth_video(asset_id):
     asset = DataAsset.query.get(asset_id)
     if not asset:
         return fail("数据资产不存在", 404)
+
+    # 转码结果缓存（按资产 ID），避免每次播放都重新转码
+    # v2：修复 rgb555le 深度轨被色彩转换破坏的 bug；
+    # v3：改用 H.264 编码（mp4v/MPEG-4 Part 2 浏览器不支持，会触发 video error）
+    cache = os.path.join(tempfile.gettempdir(), f"depth_video_v3_{asset_id}.mp4")
+    # 缓存快路径：命中直接发送。解密（整文件读入内存）与 ffprobe 开销大，
+    # 多路深度视频同时播放时浏览器会频繁补发 Range 请求，若每个请求都重复
+    # 解密+探测会拖垮单 worker，流式响应变慢进而触发播放中断
+    if os.path.isfile(cache) and os.path.getsize(cache) > 0:
+        return send_file(cache, mimetype="video/mp4", as_attachment=False,
+                         download_name=f"depth_{asset.file_name}.mp4", conditional=True)
 
     file_path, tmp_path = _get_asset_file_path(asset)
     if file_path is None:
@@ -926,16 +944,24 @@ def depth_video(asset_id):
             is_zst = (file_path or "").lower().endswith(".zst")
 
         if is_zst:
+            from app.utils.depth_zst import read_header
             with open(file_path, "rb") as f:
-                if f.read(4) != b"DZST":
-                    return fail("深度数据格式错误", 422)
-                _ver, w, h, _cnt = struct.unpack("<IIII", f.read(16))
+                header = read_header(f)
+            if header is None:
+                return fail("深度数据格式错误", 422)
+            _ver, w, h, _cnt, _quantum = header
+            # fps 来源优先级：请求原资产（彩色资产 metadata.realsense.fps，定位链
+            # 起点）> 深度资产自身 metadata（直接访问深度资产时上传已写入）。
+            # 两者都取不到才回退 30fps（usbip 降级到 5/15fps 的录制不能按 30fps 快放）
             fps = 30.0
-            rmeta = (src_asset.metadata_json or {}).get("realsense") or {}
-            try:
-                fps = float(rmeta.get("fps") or 30.0) or 30.0
-            except (TypeError, ValueError):
-                pass
+            for _m in (asset.metadata_json, src_asset.metadata_json):
+                _fps = ((_m or {}).get("realsense") or {}).get("fps")
+                if _fps:
+                    try:
+                        fps = float(_fps) or fps
+                    except (TypeError, ValueError):
+                        pass
+                    break
             stream_index = -1
             src_pix_fmt = "zstd"
         else:
@@ -953,10 +979,7 @@ def depth_video(asset_id):
             stream_index = d["index"]
             src_pix_fmt = d.get("pix_fmt", "")
 
-        # 转码结果缓存（按资产 ID），避免每次播放都重新转码
-        # v2：修复 rgb555le 深度轨被色彩转换破坏的 bug；
-        # v3：改用 H.264 编码（mp4v/MPEG-4 Part 2 浏览器不支持，会触发 video error）
-        cache = os.path.join(tempfile.gettempdir(), f"depth_video_v3_{asset_id}.mp4")
+        # 清理历史版本缓存（v1/v2），避免残留占空间
         for stale_name in (f"depth_video_{asset_id}.mp4", f"depth_video_v2_{asset_id}.mp4"):
             stale = os.path.join(tempfile.gettempdir(), stale_name)
             if os.path.isfile(stale):
@@ -965,8 +988,14 @@ def depth_video(asset_id):
                 except OSError:
                     pass
         if not (os.path.isfile(cache) and os.path.getsize(cache) > 0):
-            ok = _transcode_depth_video(file_path, stream_index, w, h, fps, cache,
-                                        src_pix_fmt=src_pix_fmt)
+            # 同一资产并发请求串行转码 + 双重检查：转码完成前到达的重复请求
+            # 会同时写同一个 tmp 文件互相截断，导致转码失败
+            with _get_depth_transcode_lock(asset_id):
+                if os.path.isfile(cache) and os.path.getsize(cache) > 0:
+                    ok = True
+                else:
+                    ok = _transcode_depth_video(file_path, stream_index, w, h, fps, cache,
+                                                src_pix_fmt=src_pix_fmt)
             if not ok:
                 try:
                     os.remove(cache)
