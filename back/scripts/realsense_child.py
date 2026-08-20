@@ -164,6 +164,17 @@ def _fps_chain(fps):
     return chain
 
 
+def _is_no_device(err):
+    """pipe.start 失败是否疑似无设备在位（区别于设备忙/带宽配置失败）
+
+    仅作疑似判断：命中后由 _query_devices 枚举确认，避免误报。
+    """
+    s = str(err).lower()
+    return any(k in s for k in (
+        "no device", "no devices", "device not found",
+        "failed to set power state", "not connected"))
+
+
 def _is_device_busy(err):
     """判断 pipe.start 失败是否属设备被占用（V4L2 EBUSY，errno=16）
 
@@ -230,6 +241,18 @@ def _start_pipeline(rs, fps):
                     pipe.stop()
                 except Exception:
                     pass
+                if _is_no_device(e):
+                    # 疑似无设备：枚举确认（仅失败路径枚举）后立即失败，
+                    # 不跑完整个降级链。设备在位却报该错属瞬时抖动，
+                    # 按普通失败继续降级。
+                    try:
+                        count, _serial = _query_devices()
+                    except Exception:
+                        count = 0
+                    if count == 0:
+                        raise RuntimeError("未检测到 RealSense 相机") from e
+                    last_err = e
+                    break
                 if _is_device_busy(e):
                     # 设备忙与流配置无关：原地重试等上一进程释放。
                     # 无缓存时同样生效（原先仅缓存组合重试，容器重建后缓存
@@ -245,6 +268,14 @@ def _start_pipeline(rs, fps):
                 break
         if busy_until and _is_device_busy(last_err) and time.monotonic() >= busy_until:
             break  # 忙预算耗尽：设备仍被占用，继续降级无意义
+    # 所有组合均失败：枚举一次确认设备状态，给出准确错误（仅失败路径
+    # 枚举，正常路径零枚举开销）
+    try:
+        count, _serial = _query_devices()
+    except Exception:
+        count = 0
+    if count == 0:
+        raise RuntimeError("未检测到 RealSense 相机")
     hint = ("（相机可能被其他进程占用，稍后重试或重启后端容器）"
             if _is_device_busy(last_err) else "")
     raise RuntimeError(f"启动 RealSense 相机失败（{last_err}）{hint}")
@@ -365,12 +396,9 @@ def cmd_stream(fps):
     """持续输出彩色 MJPEG 流。stdin 收到 "stop" 时优雅退出；父进程断连自动退出。"""
     try:
         rs = _import_rs()
-        count, _serial = _query_devices()
-        if count == 0:
-            # 输出 ERR 让父进程立即失败（父进程 _wait_child_ready 只认 READY/ERR 行，
-            # 若此处输出占位 JPEG 帧，父进程会等满 15s 超时才报"相机启动超时"）
-            _safe_print("ERR 未检测到 RealSense 相机")
-            return 1
+        # 不预先枚举设备：_start_pipeline 成功即设备在位；失败时由其内部
+        # 诊断（枚举确认无设备/被占用），正常路径省掉 usbip 下 1~2s 的
+        # USB 枚举耗时（仅失败时才枚举，错误信息同样准确）
         pipe, profile, cw, ch, dw, dh, actual_fps = _start_pipeline(rs, int(fps))
 
         stop_event = threading.Event()
@@ -508,10 +536,8 @@ def cmd_record(path, fps):
 
     try:
         rs = _import_rs()
-        count, _serial = _query_devices()
-        if count == 0:
-            _safe_print("ERR 未检测到 RealSense 相机")
-            return 1
+        # 不预先枚举设备（省 usbip 下 1~2s）：无设备/被占用由 _start_pipeline
+        # 失败路径诊断报错；序列号改从已启动 pipeline 的设备对象读取
         pipe, profile, cw, ch, dw, dh, actual_fps = _start_pipeline(rs, int(fps))
 
         # 从已启动的 pipeline 读取设备信息（与录制同一设备），写入 meta 供入库
@@ -519,12 +545,17 @@ def cmd_record(path, fps):
         device_name = ""
         firmware = ""
         depth_units_mm = 1.0
+        _serial = ""
         try:
             device_name = device.get_info(rs.camera_info.name) or ""
         except Exception:
             pass
         try:
             firmware = device.get_info(rs.camera_info.firmware_version) or ""
+        except Exception:
+            pass
+        try:
+            _serial = device.get_info(rs.camera_info.serial_number) or ""
         except Exception:
             pass
         try:
