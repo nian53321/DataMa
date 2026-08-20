@@ -8,6 +8,8 @@ master.key
 *.key
 *.pem
 密钥.txt
+# 宿主机 USB 透传代理配置（含访问令牌，由 install_usb_agent.ps1 生成）
+usb_agent_config.json
 
 # ===================== 依赖与编译产物 =====================
 node_modules/
