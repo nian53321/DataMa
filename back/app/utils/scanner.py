@@ -297,6 +297,11 @@ def _parse_user_info(user_info_path):
     # id 字段作为伪ID（userInfo.json 中的 id 通常是长整型受试者编号）
     if "id" in data and data["id"] not in ("", None):
         fields["pseudo_id"] = str(data["id"])
+    # 真实姓名（核心键为 userName；兼容 name / realName / real_name 兜底）
+    for _name_key in ("userName", "name", "realName", "real_name"):
+        if data.get(_name_key) not in ("", None):
+            fields["real_name"] = str(data[_name_key])
+            break
     if "age" in data:
         try:
             fields["age"] = int(data["age"])
@@ -517,10 +522,9 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
     subject_feature_base = os.path.join(data_lake, "feature", subject.pseudo_id)
     os.makedirs(subject_raw_base, exist_ok=True)
 
-    # 跳过文件名集合：元数据文件
-    # （正常情况下扫描目录不含密钥文件，但防御性跳过避免误入库）
+    # 跳过文件名集合：仅防御性跳过密钥文件（扫描目录正常情况下不含）
+    # （userInfo.json / userInfo.json.enc 需作为数据资产入库，不再跳过）
     skip_filenames_lower = {
-        "userinfo.json", "userinfo.json.enc",
         "密钥.txt", "key.txt", "secret.txt",
     }
 
@@ -556,15 +560,20 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
         is_sync = is_sync_data_file(original_name)
         # 量表数据（MoCA/MMSE/AD8 等）→ data_type=scale, layer=feature
         is_scale = is_scale_data_file(original_name)
-        if is_sync:
+        # userInfo 元数据文件：剥离 .enc 后若为 userInfo.json，作为 json 资产入库
+        # （保留原名，不套命名规范便于识别；内容与其他模态同样 DMEC 加密落盘）
+        is_userinfo = original_name.lower() == "userinfo.json"
+        if is_userinfo:
+            data_type = "json"
+        elif is_sync:
             data_type = "eye"
         elif is_scale:
             data_type = "scale"
         else:
             data_type = _detect_data_type(fname)
-        # 应用命名规范（按模态精确匹配命名规范，回退到通用规范）
+        # 应用命名规范（按模态精确匹配命名规范，回退到通用规范）；userInfo 保留原名
         new_name = original_name
-        naming_std = get_naming_standard(data_type)
+        naming_std = None if is_userinfo else get_naming_standard(data_type)
         if naming_std:
             try:
                 norm_name, norm_ext = apply_naming_standard(

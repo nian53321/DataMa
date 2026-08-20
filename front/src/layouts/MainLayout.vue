@@ -1,6 +1,6 @@
 <template>
   <el-container class="main-layout">
-    <el-aside :width="isCollapse ? '64px' : '220px'" class="sidebar">
+    <el-aside :width="isCollapse ? '64px' : '200px'" class="sidebar">
       <div class="logo">
         <el-icon size="24"><DataAnalysis /></el-icon>
         <span v-show="!isCollapse" class="logo-text">多模态数据平台</span>

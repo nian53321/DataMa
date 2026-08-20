@@ -21,9 +21,8 @@ const PSEUDO_ID_RE = /^[A-Za-z0-9_\-]{3,64}$/
 // 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 2GB 一致）
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
-// 跳过的元数据/密钥文件名（小写比对）
+// 跳过的密钥文件（小写比对）；userInfo 需作为 json 资产入库，不在跳过清单
 const META_FILES = new Set([
-  'userinfo.json', 'userinfo.json.enc',
   '密钥.txt', 'key.txt', 'secret.txt',
 ])
 
@@ -59,6 +58,7 @@ async function withRetry(fn, retries = 1, delayMs = 600) {
 function detectDataType(name) {
   const n = (name || '').toLowerCase()
   const stripped = n.endsWith('.enc') ? n.slice(0, -4) : n
+  if (stripped === 'userinfo.json') return 'json'
   if (/_sync_data\.json$/.test(stripped)) return 'eye'
   if (/^(moca|mmse|ad8)_.+_\d{8}\.json$/.test(stripped)) return 'scale'
   if (stripped.startsWith('eeg_') || stripped.startsWith('eeg-')) return 'eeg'
@@ -90,7 +90,8 @@ function groupBySubject(files) {
     }
     const lower = f.name.toLowerCase()
     if (lower === 'userinfo.json' || lower === 'userinfo.json.enc') {
-      map.get(pseudoId).userInfo = f
+      map.get(pseudoId).userInfo = f        // 仍用于解析受试者字段
+      map.get(pseudoId).files.push(f)       // 同时作为 json 数据资产入库上传
     } else if (
       !META_FILES.has(lower) &&
       !lower.endsWith('_sync_fields_zh.json') &&

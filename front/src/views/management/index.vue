@@ -162,7 +162,10 @@
         @selection-change="onSubjectSelectionChange"
       >
         <el-table-column type="selection" width="44" />
-        <el-table-column prop="pseudo_id" label="伪ID" min-width="110" show-overflow-tooltip />
+        <el-table-column prop="pseudo_id" label="伪ID" min-width="170" show-overflow-tooltip />
+        <el-table-column prop="real_name" label="姓名" width="110" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.real_name || '—' }}</template>
+        </el-table-column>
         <el-table-column prop="age" label="年龄" width="60" align="center" header-align="center" />
         <el-table-column prop="gender" label="性别" width="60" align="center" header-align="center" />
         <el-table-column prop="phone" label="联系电话" min-width="100" show-overflow-tooltip header-align="center">
@@ -176,13 +179,13 @@
             <el-tag size="small" :type="riskTagType(row.cognitive_risk_level)">{{ riskText(row.cognitive_risk_level) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="mmse_score" label="MMSE" width="90" align="center" header-align="center">
+        <el-table-column prop="mmse_score" label="MMSE" width="60" align="center" header-align="center">
           <template #default="{ row }">{{ row.mmse_score ?? '—' }}</template>
         </el-table-column>
-        <el-table-column prop="moca_score" label="MoCA" width="90" align="center" header-align="center">
+        <el-table-column prop="moca_score" label="MoCA" width="60" align="center" header-align="center">
           <template #default="{ row }">{{ row.moca_score ?? '—' }}</template>
         </el-table-column>
-        <el-table-column prop="ad8_score" label="AD8" width="90" align="center" header-align="center">
+        <el-table-column prop="ad8_score" label="AD8" width="60" align="center" header-align="center">
           <template #default="{ row }">{{ row.ad8_score ?? '—' }}</template>
         </el-table-column>
         <el-table-column prop="collection_batch" label="批次" width="100" show-overflow-tooltip header-align="center">
@@ -191,7 +194,7 @@
         <el-table-column prop="collection_scene" label="场景" width="100" show-overflow-tooltip header-align="center">
           <template #default="{ row }">{{ row.collection_scene || '—' }}</template>
         </el-table-column>
-        <el-table-column label="视频采集" width="220" align="center" header-align="center">
+        <el-table-column label="视频采集" width="120" align="center" header-align="center">
           <template #default="{ row }">
             <div style="display: flex; gap: 4px; justify-content: center; flex-wrap: wrap">
               <el-tag
@@ -211,14 +214,16 @@
           </template>
         </el-table-column>
         <el-table-column prop="created_at" label="创建时间" min-width="150" show-overflow-tooltip header-align="center" />
-        <el-table-column label="操作" min-width="320" fixed="right">
+        <el-table-column label="操作" min-width="360" fixed="right">
           <template #default="{ row }">
+            <div style="white-space: nowrap">
             <el-button size="small" link type="primary" @click="viewAssets(row)">数据资产</el-button>
             <el-button size="small" link type="success" @click="goVisualization(row)">可视化</el-button>
             <el-button v-if="canEdit" size="small" link type="primary" @click="openVideoCapture(row)">视频采集</el-button>
             <el-button v-if="canEdit" size="small" link type="warning" @click="openEditDialog(row)">编辑</el-button>
             <el-button size="small" link type="info" @click="openHistory(row, 'subject', `受试者 ${row.pseudo_id}`)">历史</el-button>
             <el-button v-if="canDelete" size="small" link type="danger" @click="removeSubject(row)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -1302,7 +1307,7 @@ const subjectDialog = ref(false)
 const subjectFormRef = ref()
 const editingId = ref(null)
 const subjectForm = reactive({
-  pseudo_id: '', age: 60, gender: '男', education_level: '',
+  pseudo_id: '', real_name: '', age: 60, gender: '男', education_level: '',
   phone: '', id_card: '',
   cognitive_risk_level: '', collection_batch: '', collection_scene: '', remark: '',
 })
@@ -1316,7 +1321,7 @@ const loadSubjectTemplate = async () => {
     const fields = (data.fields || []).filter(f => f.enabled !== false && f.field_key)
     // 默认宽度映射（与历史硬编码表单一致），未存 span 时按此兜底
     const defaultSpan = {
-      pseudo_id: 24, age: 12, gender: 12, education_level: 24,
+      pseudo_id: 24, real_name: 12, age: 12, gender: 12, education_level: 24,
       phone: 12, id_card: 12, cognitive_risk_level: 24,
       emotion_status: 24, moca_score: 12, mmse_score: 12, ad8_score: 12,
       collection_batch: 12, collection_scene: 12, remark: 24,
@@ -1337,6 +1342,15 @@ const loadSubjectTemplate = async () => {
     })
     // 保险：如果模板里没有批次/场景字段（被管理员删除），强制注入默认字段
     const existingKeys = subjectTplFields.value.map(f => f.field_key)
+    // 姓名（真实姓名）字段：若模板缺失则强制注入到伪ID之后；非 admin 由后端脱敏显示
+    if (!existingKeys.includes('real_name')) {
+      subjectTplFields.value.splice(1, 0, {
+        field_key: 'real_name', field_label: '姓名',
+        field_type: 'input', required: false, span: 12,
+        placeholder: '受试者真实姓名（非管理员脱敏显示）', options: [],
+      })
+      existingKeys.push('real_name')
+    }
     if (!existingKeys.includes('collection_batch')) {
       subjectTplFields.value.push({
         field_key: 'collection_batch', field_label: '采集批次',
@@ -1357,6 +1371,7 @@ const loadSubjectTemplate = async () => {
     // 接口未就绪时使用默认字段
     subjectTplFields.value = [
       { field_key: 'pseudo_id', field_label: '受试者伪ID', field_type: 'input', required: true, span: 24, placeholder: '如 SUBJ_001', options: [] },
+      { field_key: 'real_name', field_label: '姓名', field_type: 'input', required: false, span: 12, placeholder: '受试者真实姓名（非管理员脱敏显示）', options: [] },
       { field_key: 'age', field_label: '年龄', field_type: 'number', required: true, span: 12, placeholder: '0-120', options: [] },
       { field_key: 'gender', field_label: '性别', field_type: 'select', required: true, span: 12, placeholder: '', options: [{ label: '男', value: '男' }, { label: '女', value: '女' }] },
       { field_key: 'education_level', field_label: '教育程度', field_type: 'input', required: false, span: 24, placeholder: '如 高中/本科', options: [] },
@@ -1452,6 +1467,8 @@ const detectDataType = (ext, fileName = '') => {
     const idx = stripped.lastIndexOf('.')
     realExt = idx > 0 ? stripped.slice(idx + 1) : ''
   }
+  // userInfo 元数据文件 → json 类型资产（与后端 scanner 一致）
+  if (name === 'userinfo.json' || name === 'userinfo.json.enc') return 'json'
   // 眼动评估数据 sync_data.json → eye（与后端 is_sync_data_file 一致，优先级最高）
   if (/_sync_data\.json$/.test(name)) return 'eye'
   // 量表数据（MoCA_用户ID_日期.json 等）→ scale
@@ -1849,10 +1866,10 @@ const handleSubjectFolderChange = async (e) => {
       oversizedCount++
       return
     }
-    // 检测 userInfo 文件（明文或外部加密），单独提取用于解析元数据
+    // 检测 userInfo 文件（明文或外部加密）：单独提取用于解析元数据，同时作为 json 资产入库
     if (nameLower === 'userinfo.json' || nameLower === 'userinfo.json.enc') {
       userInfoFile = f
-      return // userInfo 不作为数据资产上传
+      // 不 return：userInfo 也要作为 json 数据资产上传入库（继续走下方识别逻辑）
     }
     // 提取扩展名：剥离外部加密后缀 .enc，取真实扩展名（如 xxx.wav.enc -> wav）
     let nameForExt = f.name
@@ -2070,9 +2087,8 @@ const handleFolderChange = (e) => {
   let oversizedCount = 0
   files.forEach((f) => {
     const nameLower = f.name.toLowerCase()
-    // 跳过 userInfo、密钥文件、眼动字段说明文件（元数据，不作为数据资产入库）
-    if (nameLower === 'userinfo.json' || nameLower === 'userinfo.json.enc'
-        || nameLower === '密钥.txt' || nameLower === 'key.txt'
+    // 跳过密钥文件与眼动字段说明文件（不入库）；userInfo 需作为 json 数据资产入库
+    if (nameLower === '密钥.txt' || nameLower === 'key.txt'
         || nameLower.endsWith('_sync_fields_zh.json')) {
       skippedMetaCount++
       return
@@ -2613,7 +2629,7 @@ const onManualFolderChange = (e) => {
     if (segs.length < 2) continue // 根目录直接放的文件忽略
     const name = f.name
     const lower = name.toLowerCase()
-    if (lower === 'userinfo.json' || lower === 'userinfo.json.enc') continue
+    // userInfo 也作为 json 资产入库，不再跳过
     if (lower.endsWith('_sync_fields_zh.json')) continue
     if (name.startsWith('~$') || name.startsWith('.')) continue
     recognized.push({ file: f, path, name, size: f.size, lastModified: f.lastModified })

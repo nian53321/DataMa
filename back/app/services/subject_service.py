@@ -125,6 +125,7 @@ class SubjectService(BaseService):
 
         subject = Subject(
             pseudo_id=pseudo_id,
+            real_name=(data.get("real_name") or "").strip() or None,
             age=data.get("age"),
             gender=data.get("gender"),
             education_level=data.get("education_level"),
@@ -164,7 +165,7 @@ class SubjectService(BaseService):
         subject = self._get_or_404(Subject, subject_id, "受试者不存在")
         old_dict = subject.to_dict()  # 修改前快照
 
-        for f in ["age", "gender", "education_level", "phone", "id_card",
+        for f in ["real_name", "age", "gender", "education_level", "phone", "id_card",
                   "cognitive_risk_level", "emotion_status", "collection_batch",
                   "collection_scene", "mmse_score", "moca_score", "ad8_score",
                   "remark"]:

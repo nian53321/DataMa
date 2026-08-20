@@ -169,12 +169,11 @@
             <template #header>
               <div class="card-title">
                 <span>视频模块</span>
-                <el-tag v-if="videoGroups.length" size="small" type="success">共 {{ videoList.length }} 路 · {{ videoGroups.length }} 类</el-tag>
-                <el-tag v-else size="small" type="info">无视频数据</el-tag>
+                <el-tag size="small" :type="videoGroups.some(g => g.videos.length) ? 'success' : 'info'">共 {{ videoList.length }} 路 · {{ videoGroups.filter(g => g.videos.length).length }} 类</el-tag>
               </div>
             </template>
-            <!-- 三个视频子模块（face/body/gait，有几类显示几类），每类独立播放器 -->
-            <div v-if="videoGroups.length" class="video-subgrid" style="display: flex; flex-wrap: wrap; gap: 16px">
+            <!-- 三个视频子模块（face/body/gait，始终渲染；缺失时显示"尚未采集"），每类独立播放器 -->
+            <div class="video-subgrid" style="display: flex; flex-wrap: wrap; gap: 16px">
               <div v-for="g in videoGroups" :key="g.type" style="flex: 1 1 320px; min-width: 300px; border: 1px solid #ebeef5; border-radius: 6px; padding: 12px">
                 <!-- 子模块头：类型标签 + 该类视频下拉 -->
                 <div class="card-title" style="margin-bottom: 8px">
@@ -231,7 +230,7 @@
                   </div>
                   <div v-else class="preview-box">
                     <el-icon size="32" color="#c0c4cc"><VideoCamera /></el-icon>
-                    <p>该类型暂无视频</p>
+                    <p>尚未采集</p>
                   </div>
                   <p v-if="currentVideoOf(g.type)" class="sub-tip" style="margin-top: 6px">
                     {{ currentVideoOf(g.type).file_name }}
@@ -274,10 +273,6 @@
                   </div>
                 </div>
               </div>
-            </div>
-            <div v-else class="preview-box">
-              <el-icon size="40" color="#c0c4cc"><VideoCamera /></el-icon>
-              <p>该受试者暂无视频数据</p>
             </div>
           </el-card>
         </el-col>
@@ -845,12 +840,13 @@ const videoGroupDefs = [
   { type: 'gait', label: '步态视频' },
   { type: '', label: '通用视频' },
 ]
-// 视频按类型分组（仅保留有视频的类型，有几类展示几类）
-// video_type 存于 metadata（face/body/gait）；无类型视为通用视频
+// 视频按类型分组（face/body/gait 三种模态始终渲染；无视频的显示"尚未采集"占位，
+// 避免只采一个视频时单独占满整行）。通用视频（无类型）仅在确有视频时渲染，
+// 以免多出一格造成误导。video_type 存于 metadata（face/body/gait）；无类型视为通用视频。
 const videoGroups = computed(() =>
   videoGroupDefs
     .map((g) => ({ ...g, videos: videoList.value.filter((v) => (v.metadata?.video_type || '') === g.type) }))
-    .filter((g) => g.videos.length)
+    .filter((g) => g.type !== '' || g.videos.length)
 )
 const videoGroupSel = reactive({})    // type -> 当前选中视频 id
 const videoGroupLoad = reactive({})   // type -> { loading, error }

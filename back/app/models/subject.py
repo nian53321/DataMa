@@ -11,6 +11,7 @@ class Subject(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     pseudo_id = db.Column(db.String(64), unique=True, nullable=False, index=True, comment="受试者伪ID")
+    real_name = db.Column(db.String(64), comment="真实姓名（脱敏）")
     age = db.Column(db.Integer, comment="年龄")
     gender = db.Column(db.String(8), comment="性别")
     education_level = db.Column(db.String(32), comment="教育程度")
@@ -40,6 +41,7 @@ class Subject(db.Model):
         return {
             "id": self.id,
             "pseudo_id": self.pseudo_id,
+            "real_name": self.real_name,
             "age": self.age,
             "gender": self.gender,
             "education_level": self.education_level,
