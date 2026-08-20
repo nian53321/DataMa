@@ -8,8 +8,8 @@
 
 数据流：与 Orbbec 一致，只采集 彩色 + 深度 两路（**不启用红外流**）：
   - 彩色：D455F 原生 1280x800（bgr8，1MP 全局快门），分辨率自动协商逐级降级
-  - 深度：D455F 原生 1280x720（z16，单位 mm），DZST v2 存储（8mm 量化 + 帧间差分 + zstd，
-    量化误差 ±4mm 低于中远距深度噪声，体积约为逐帧 zstd 的 1/4 ~ 1/3）
+  - 深度：D455F 原生 1280x720（z16，单位 mm），DZST v2 存储（16mm 量化 + 帧间差分 + zstd，
+    量化误差 ±8mm 低于中远距深度噪声，体积约为逐帧 zstd 的 1/4 ~ 1/3）
   - 深度量程：D455F 理想范围 0.6m-6m（深度 200mm-8000mm 归一化到伪彩色）
 
 录制产物（输出目录，全部为最终格式）：
@@ -29,6 +29,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime
 
 BACK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # back/
@@ -56,6 +57,12 @@ _STREAM_COMBOS = (
 # 前面的组合必然失败，每次失败重试含 USB 带宽协商（usbip 下数秒）；缓存命中后
 # 一次 pipe.start 即成功。存 /tmp，容器重建自动失效（USB 链路升级后重新协商）。
 _COMBO_CACHE = os.path.join(tempfile.gettempdir(), "realsense_combo.json")
+
+# 设备忙重试预算（秒）：父进程停止上一子进程（预览/录制）后立即启动本进程，
+# 上一进程退出（pipe.stop 在 usbip 下需 1~2.5s）与 USB 内核释放期间
+# pipe.start 会失败，属"设备忙"而非配置不匹配，短间隔重试即可等到
+BUSY_RETRY_SECONDS = 8.0
+BUSY_RETRY_INTERVAL = 0.5
 
 
 def _load_combo_cache():
@@ -166,6 +173,12 @@ def _start_pipeline(rs, fps):
     上次成功组合优先尝试（缓存于 _COMBO_CACHE）：降级链前面的组合在 USB2 下
     每次启动都要重复失败重试，缓存命中后一次 pipe.start 即成功。
 
+    设备忙重试：仅对缓存组合生效。父进程发出停止信号后不等上一子进程退出即
+    启动本进程（缩短启动耗时），本进程 import 完成时上一进程可能仍持有相机
+    （pipe.stop 在 usbip 下需 1~2.5s），pipe.start 失败属"设备忙"而非配置
+    不匹配，短间隔重试等到释放即可。无缓存时跳过重试——组合本就可能因带宽
+    不足失败，重试无意义，直接走降级链。
+
     返回 (pipeline, profile, color_w, color_h, depth_w, depth_h, actual_fps)；
     profile 用于读取实际设备信息（型号/固件/深度缩放）。所有组合均失败时抛异常。
     """
@@ -179,21 +192,30 @@ def _start_pipeline(rs, fps):
     else:
         attempts = chain
     last_err = None
-    for (f, cw, ch, dw, dh) in attempts:
-        pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
-        cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, f)
-        try:
-            profile = pipe.start(cfg)
-            _save_combo_cache((f, cw, ch, dw, dh))
-            return pipe, profile, cw, ch, dw, dh, f
-        except Exception as e:
-            last_err = e
+    for combo in attempts:
+        (f, cw, ch, dw, dh) = combo
+        # 缓存组合（上次成功过）失败大概率是设备忙，在预算内重试同一组合
+        busy_until = (time.monotonic() + BUSY_RETRY_SECONDS
+                      if cached is not None and combo == cached else 0.0)
+        while True:
+            pipe = rs.pipeline()
+            cfg = rs.config()
+            cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
+            cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, f)
             try:
-                pipe.stop()
-            except Exception:
-                pass
+                profile = pipe.start(cfg)
+                _save_combo_cache(combo)
+                return pipe, profile, cw, ch, dw, dh, f
+            except Exception as e:
+                last_err = e
+                try:
+                    pipe.stop()
+                except Exception:
+                    pass
+                if time.monotonic() < busy_until:
+                    time.sleep(BUSY_RETRY_INTERVAL)
+                    continue
+                break
     raise RuntimeError(f"启动 RealSense 相机失败（{last_err}）")
 
 
@@ -390,7 +412,7 @@ def _load_depth_zst():
 
 
 # 深度序列文件格式（DZST v2，见 app/utils/depth_zst.py）：
-#   12bit 量化 + 关键帧/帧间差分 + zstd，体积约为逐帧 zstd 的 1/8 ~ 1/15
+#   16mm 量化 + 关键帧/帧间差分 + zstd，体积约为逐帧 zstd 的 1/4 ~ 1/3
 def _zstd_writer(q, fobj, w, h):
     """写线程：从队列取 z16 深度帧字节，DZST v2 压缩追加写入；None 哨兵后回填帧数并关闭"""
     try:
@@ -442,7 +464,7 @@ def cmd_record(path, fps):
 
     产物（输出目录保留，不打包；全部为最终格式，无需二次转码）：
       <path>/color.mp4         彩色视频（H.264，libx264 CRF 18，浏览器可播）
-      <path>/depth_raw.zst     原始深度序列（DZST v2：8mm 量化 + 帧间差分 zstd，解码后为毫米深度值）
+      <path>/depth_raw.zst     原始深度序列（DZST v2：16mm 量化 + 帧间差分 zstd，解码后为毫米深度值）
       <path>/frames.jsonl      逐帧记录：mp4_frame/zst_frame + RGB/深度硬件时间戳 + 硬件帧号
       <path>/calibration.json  相机标定：depth_scale/RGB 内参/畸变/分辨率/序列号/对齐状态
       <path>/meta.json         序列号 / 配置 / 编码信息
@@ -716,7 +738,11 @@ def cmd_record(path, fps):
         meta["depth_raw"] = bool(raw_ok)
         meta["color_codec"] = "h264"
         meta["depth_codec"] = "dzst2"
-        meta["depth_quantum_mm"] = 8
+        # 量化步长与 depth_zst.QUANTUM 保持一致（当前 16mm，误差 ±8mm）
+        try:
+            meta["depth_quantum_mm"] = int(_load_depth_zst().QUANTUM)
+        except Exception:
+            meta["depth_quantum_mm"] = 16
         try:
             with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
