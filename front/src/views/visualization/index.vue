@@ -252,7 +252,11 @@
                   </div>
                   <div v-else-if="depthGroupOf(g.type).status === 'failed'" class="preview-box">
                     <el-icon size="32" color="#c0c4cc"><VideoCamera /></el-icon>
-                    <p>该视频无深度轨，无法可视化</p>
+                    <p v-if="depthGroupOf(g.type).noDepth">该视频无深度轨，无法可视化</p>
+                    <template v-else>
+                      <p>深度视频加载失败，请重试</p>
+                      <el-button type="primary" size="small" plain @click="loadDepthGroupVideo(g.type)">重试</el-button>
+                    </template>
                   </div>
                   <div v-else class="depth-video-box">
                     <video
@@ -263,8 +267,8 @@
                       controlslist="nodownload noremoteplayback"
                       playsinline
                       class="depth-video-el"
-                      @loadeddata="onDepthGroupLoaded(g.type)"
-                      @error="onDepthGroupError(g.type)"
+                      @loadeddata="onDepthGroupLoaded(g.type, $event)"
+                      @error="onDepthGroupError(g.type, $event)"
                     />
                     <div v-if="depthGroupOf(g.type).status === 'loading'" class="loading-overlay">
                       <el-icon class="is-loading" :size="32"><Loading /></el-icon>
@@ -364,11 +368,13 @@
                 <el-space>
                   <el-tag v-if="eyeMeta?.risk_value" size="small" type="warning">风险指数 {{ eyeMeta.risk_value }}</el-tag>
                   <el-tag v-if="eyeMeta?.risk_proportion" size="small">高于同龄人 {{ (eyeMeta.risk_proportion * 100).toFixed(1) }}%</el-tag>
-                  <el-tag v-if="!eyeMeta" size="small" type="info">无数据</el-tag>
+                  <el-tag v-if="eyeParseFailed" size="small" type="danger">解析失败</el-tag>
+                  <el-tag v-else-if="!eyeMeta" size="small" type="info">无数据</el-tag>
                 </el-space>
               </div>
             </template>
-            <div ref="eyeRef" style="height: 360px"></div>
+            <div v-if="!eyeParseFailed" ref="eyeRef" style="height: 360px"></div>
+            <el-empty v-else description="眼动数据解析失败" :image-size="80" />
           </el-card>
         </el-col>
 
@@ -536,7 +542,11 @@
                 </div>
                 <div v-else-if="depthVideoState.status === 'failed'" class="preview-box">
                   <el-icon size="40" color="#c0c4cc"><VideoCamera /></el-icon>
-                  <p>该视频无深度轨，无法可视化</p>
+                  <p v-if="depthVideoState.noDepth">该视频无深度轨，无法可视化</p>
+                  <template v-else>
+                    <p>深度视频加载失败，请重试</p>
+                    <el-button type="primary" size="small" plain @click="loadDepthVideo(selectedAsset.id)">重试</el-button>
+                  </template>
                 </div>
                 <div v-else class="depth-video-box">
                   <video
@@ -634,11 +644,13 @@
                   <el-space>
                     <el-tag v-if="eyeMeta?.risk_value" size="small" type="warning">风险指数 {{ eyeMeta.risk_value }}</el-tag>
                     <el-tag v-if="eyeMeta?.risk_proportion" size="small">高于同龄人 {{ (eyeMeta.risk_proportion * 100).toFixed(1) }}%</el-tag>
-                    <el-tag size="small" type="success">当前文件</el-tag>
+                    <el-tag v-if="eyeParseFailed" size="small" type="danger">解析失败</el-tag>
+                    <el-tag v-else size="small" type="success">当前文件</el-tag>
                   </el-space>
                 </div>
               </template>
-              <div ref="eyeRef" style="height: 300px"></div>
+              <div v-if="!eyeParseFailed" ref="eyeRef" style="height: 300px"></div>
+              <el-empty v-else description="眼动数据解析失败" :image-size="80" />
             </el-card>
           </el-col>
 
@@ -665,11 +677,13 @@
                     <el-tag v-if="scaleMeta?.summary" size="small" type="success">
                       {{ scaleMeta.summary.assess_name || '量表' }} {{ scaleMeta.summary.total_score }}/{{ scaleMeta.summary.max_score }}
                     </el-tag>
-                    <el-tag size="small" type="success">当前文件</el-tag>
+                    <el-tag v-if="scaleParseFailed" size="small" type="danger">解析失败</el-tag>
+                    <el-tag v-else size="small" type="success">当前文件</el-tag>
                   </el-space>
                 </div>
               </template>
-              <div ref="radarRef" style="height: 280px"></div>
+              <div v-if="!scaleParseFailed" ref="radarRef" style="height: 280px"></div>
+              <el-empty v-else description="量表数据解析失败" :image-size="80" />
             </el-card>
           </el-col>
         </el-row>
@@ -685,6 +699,7 @@ import * as echarts from 'echarts'
 import { Aim, RefreshLeft, Download, Loading, User, DataLine, VideoCamera, Headset, Microphone, DataAnalysis } from '@element-plus/icons-vue'
 import { getSubjectOverviewApi, getTimelineApi, alignModalitiesApi, getEegAssetApi, getEcgAssetApi, getEyeAssetApi, getScaleAssetApi } from '@/api/visualization'
 import { getSubjectsApi as getSubjects, getAssetsApi } from '@/api/data'
+import { fetchAllPages } from '@/utils/fetchAll'
 import { fetchSignedUrlApi } from '@/api/media'
 import { useUserStore } from '@/stores/user'
 import { ElMessage } from 'element-plus'
@@ -719,7 +734,9 @@ const assetBarRef = ref()
 const eegMeta = ref(null)
 const ecgMeta = ref(null)
 const eyeMeta = ref(null)       // 眼动指标（sync_data 解析结果）
+const eyeParseFailed = ref(false)  // 眼动解析失败标记：失败时不回退模拟数据，直接展示失败状态
 const scaleMeta = ref(null)     // 量表得分（按文件模式单选，MoCA 等）
+const scaleParseFailed = ref(false)  // 量表解析失败标记（按文件模式）：失败时不回退受试者字段
 const scaleCards = ref([])      // 受试者模式全部量表资产 [{ assetId, file_name, summary }]
 let scaleRadarEls = {}          // 量表雷达图 DOM 引用映射（受试者模式，assetId -> el）
 let scaleRadarCharts = {}       // 量表雷达图 echarts 实例映射（assetId -> chart）
@@ -733,16 +750,22 @@ let riskPieChart = null
 let assetBarChart = null
 
 // 深度视频播放器（Orbbec 深度轨转码为伪彩色 MP4，像彩色视频一样逐帧播放）
-// 状态机：idle（未请求）→ 点击"加载深度视频" → loading（转码中）→ ready（可播放）或 failed（无深度轨）
+// 状态机：idle（未请求）→ 点击"加载深度视频" → loading（转码中）→ ready（可播放）
+// 或 failed（noDepth=true 为真无深度轨；否则转码/网络失败，可重试）
 // 手动触发：切换视频仅重置为 idle，不自动请求转码接口，避免无谓的服务器转码开销
-const depthVideoState = reactive({ url: '', status: 'idle' })
+const depthVideoState = reactive({ url: '', status: 'idle', noDepth: false, retried: false, resumeAt: 0 })
 const resetDepthVideo = () => {
   depthVideoState.url = ''
   depthVideoState.status = 'idle'
+  depthVideoState.noDepth = false
+  depthVideoState.retried = false
+  depthVideoState.resumeAt = 0
 }
 const loadDepthVideo = (assetId) => {
   if (!assetId || depthVideoState.status === 'loading' || depthVideoState.status === 'ready') return
   depthVideoState.url = ''
+  depthVideoState.noDepth = false
+  depthVideoState.retried = false
   depthVideoState.status = 'loading'
   // 用 5 分钟过期的资源绑定签名 URL 替代长期 JWT 进 URL（避免 token 泄漏）
   fetchSignedUrlApi({ kind: 'depth_video', asset_id: assetId })
@@ -757,11 +780,48 @@ const loadDepthVideo = (assetId) => {
       }
     })
 }
-const onDepthVideoLoaded = () => { depthVideoState.status = 'ready' }
-const onDepthVideoError = () => {
-  // 非深度视频（无深度轨）后端返回 404，隐藏视频、给出提示
+const onDepthVideoLoaded = (e) => {
+  // 自动重试换 URL 后恢复到出错时的播放位置
+  if (depthVideoState.resumeAt > 0) {
+    try { e.target.currentTime = depthVideoState.resumeAt } catch (err) { /* ignore */ }
+    depthVideoState.resumeAt = 0
+  }
+  depthVideoState.status = 'ready'
+}
+const markDepthVideoFailed = (noDepth) => {
   depthVideoState.url = ''
+  depthVideoState.noDepth = noDepth
   depthVideoState.status = 'failed'
+}
+const onDepthVideoError = (e) => {
+  const code = e?.target?.error?.code
+  if (code === 1) return // aborted，正常切换
+  const resumeAt = e?.target?.currentTime || 0
+  const assetId = selectedAsset.value?.id
+  if (!assetId) return markDepthVideoFailed(false)
+  const stale = () => selectedAsset.value?.id !== assetId // 探测期间已切换资产则丢弃结果
+  // 探测真实状态码后再处理（video error 不携带 HTTP 状态）：
+  // 200=资源正常（多为签名 URL 过期后播放中补发请求被 401）→ 换新 URL 自动重试并恢复进度；
+  // 404=无深度轨；其余=转码/网络失败。自动重试每轮仅一次，避免循环
+  fetchSignedUrlApi({ kind: 'depth_video', asset_id: assetId })
+    .then((res) => {
+      if (stale()) return
+      const url = res?.data?.url
+      if (!url) return markDepthVideoFailed(false)
+      fetch(url, { method: 'HEAD' })
+        .then((resp) => {
+          if (stale()) return
+          if (resp.status === 200 && !depthVideoState.retried) {
+            depthVideoState.retried = true
+            depthVideoState.resumeAt = resumeAt
+            depthVideoState.url = url
+            return
+          }
+          markDepthVideoFailed(resp.status === 404)
+        })
+        .catch(() => { if (!stale()) markDepthVideoFailed(false) })
+    })
+    .catch(() => { if (!stale()) markDepthVideoFailed(false) })
 }
 
 // 按文件模式
@@ -851,8 +911,8 @@ const videoGroups = computed(() =>
 const videoGroupSel = reactive({})    // type -> 当前选中视频 id
 const videoGroupLoad = reactive({})   // type -> { loading, error }
 const videoGroupRefs = {}             // type -> <video> DOM
-const videoGroupDepth = reactive({})  // type -> 深度视频 { url, status }
-const depthGroupOf = (type) => (videoGroupDepth[type] || (videoGroupDepth[type] = { url: '', status: 'idle' }))
+const videoGroupDepth = reactive({})  // type -> 深度视频 { url, status, noDepth, retried, resumeAt }
+const depthGroupOf = (type) => (videoGroupDepth[type] || (videoGroupDepth[type] = { url: '', status: 'idle', noDepth: false, retried: false, resumeAt: 0 }))
 const currentVideoOf = (type) => {
   const g = videoGroups.value.find((x) => x.type === type)
   if (!g || !g.videos.length) return null
@@ -891,6 +951,8 @@ const loadDepthGroupVideo = (type) => {
   const st = depthGroupOf(type)
   if (!cv || st.status === 'loading' || st.status === 'ready') return
   st.url = ''
+  st.noDepth = false
+  st.retried = false
   st.status = 'loading'
   fetchSignedUrlApi({ kind: 'depth_video', asset_id: cv.id })
     .then((res) => {
@@ -901,8 +963,53 @@ const loadDepthGroupVideo = (type) => {
       if (st.status === 'loading') { st.url = ''; st.status = 'failed' }
     })
 }
-const onDepthGroupLoaded = (type) => { depthGroupOf(type).status = 'ready' }
-const onDepthGroupError = (type) => { depthGroupOf(type).status = 'failed' }
+const onDepthGroupLoaded = (type, e) => {
+  const st = depthGroupOf(type)
+  // 自动重试换 URL 后恢复到出错时的播放位置
+  if (st.resumeAt > 0) {
+    try { e.target.currentTime = st.resumeAt } catch (err) { /* ignore */ }
+    st.resumeAt = 0
+  }
+  st.status = 'ready'
+}
+const markDepthGroupFailed = (type, noDepth) => {
+  const st = depthGroupOf(type)
+  st.url = ''
+  st.noDepth = noDepth
+  st.status = 'failed'
+}
+const onDepthGroupError = (type, e) => {
+  const code = e?.target?.error?.code
+  if (code === 1) return // aborted，正常切换
+  const cv = currentVideoOf(type)
+  if (!cv) return markDepthGroupFailed(type, false)
+  const resumeAt = e?.target?.currentTime || 0
+  // 探测期间切换了视频则丢弃结果（切换时状态对象会被整体替换）
+  const stale = () => currentVideoOf(type)?.id !== cv.id
+  // 探测真实状态码后再处理（video error 不携带 HTTP 状态）：
+  // 200=资源正常（多为签名 URL 过期后播放中补发请求被 401）→ 换新 URL 自动重试并恢复进度；
+  // 404=无深度轨；其余=转码/网络失败。自动重试每轮仅一次，避免循环
+  fetchSignedUrlApi({ kind: 'depth_video', asset_id: cv.id })
+    .then((res) => {
+      if (stale()) return
+      const url = res?.data?.url
+      if (!url) return markDepthGroupFailed(type, false)
+      fetch(url, { method: 'HEAD' })
+        .then((resp) => {
+          if (stale()) return
+          const st = depthGroupOf(type)
+          if (resp.status === 200 && !st.retried) {
+            st.retried = true
+            st.resumeAt = resumeAt
+            st.url = url
+            return
+          }
+          markDepthGroupFailed(type, resp.status === 404)
+        })
+        .catch(() => { if (!stale()) markDepthGroupFailed(type, false) })
+    })
+    .catch(() => { if (!stale()) markDepthGroupFailed(type, false) })
+}
 
 // 浏览器原生可播放的视频格式（mkv/avi/flv 等由后端转码为 mp4）
 const PLAYABLE_VIDEO = ['mp4', 'webm', 'ogg', 'ogv', 'mov', 'm4v']
@@ -995,18 +1102,21 @@ const initCharts = () => {
   ;[radarChart, eegChannelChart, ecgChart, eyeChart, gaitChart].forEach((c) => c?.resize())
 }
 
-// 眼动模拟注视点（散点 + 轨迹）
-const genEyeData = (n) => {
-  const pts = []
-  let x = 50, y = 50
-  for (let i = 0; i < n; i++) {
-    x += (Math.random() - 0.5) * 30
-    y += (Math.random() - 0.5) * 25
-    x = Math.max(0, Math.min(100, x))
-    y = Math.max(0, Math.min(100, y))
-    pts.push([Number(x.toFixed(1)), Number(y.toFixed(1)), i])
+// 解析失败时销毁眼动图表实例：模板切换为失败提示后 DOM 已卸载，
+// 保留实例会持有游离 DOM；下次成功解析时 initCharts 会重建
+const disposeEyeChart = () => {
+  if (eyeChart) {
+    try { eyeChart.dispose() } catch (e) { /* 实例可能已失效 */ }
+    eyeChart = null
   }
-  return pts
+}
+
+// 同上：解析失败时销毁量表雷达图实例
+const disposeRadarChart = () => {
+  if (radarChart) {
+    try { radarChart.dispose() } catch (e) { /* 实例可能已失效 */ }
+    radarChart = null
+  }
 }
 
 // 步态模拟（左右足底压力交替）
@@ -1241,22 +1351,12 @@ const updateEyeChart = (meta) => {
 const updateSimCharts = (modality = null) => {
   // modality 指定时仅渲染对应模态；不指定（受试者模式）渲染全部
   // 注：ECG 已由 updateEcgChart 接管真实数据
-  // 眼动：有真实数据时显示能力值柱状图，否则回退模拟注视点
+  // 眼动：有真实数据时显示能力值柱状图；无数据/解析失败时清空，不回退模拟数据
   if (eyeChart && (!modality || modality === 'eye')) {
     if (eyeMeta.value?.capacity_values) {
       updateEyeChart(eyeMeta.value)
     } else {
-      const pts = genEyeData(60)
-      eyeChart.setOption({
-        tooltip: { formatter: (p) => `注视 #${p.data[2]}<br/>x:${p.data[0]} y:${p.data[1]}` },
-        grid: { left: 40, right: 16, top: 12, bottom: 28 },
-        xAxis: { type: 'value', min: 0, max: 100, name: 'x', axisLabel: { formatter: '{value}%' } },
-        yAxis: { type: 'value', min: 0, max: 100, name: 'y', inverse: true, axisLabel: { formatter: '{value}%' } },
-        series: [
-          { type: 'scatter', data: pts, symbolSize: 8, itemStyle: { color: '#5470c6', opacity: 0.6 } },
-          { type: 'line', data: pts, showSymbol: false, lineStyle: { color: '#91cc75', width: 1, opacity: 0.4 } },
-        ],
-      }, true)
+      eyeChart.setOption({ series: [] }, true)
     }
   }
   if (gaitChart && (!modality || modality === 'gait')) {
@@ -1412,6 +1512,8 @@ const onSubjectChange = async () => {
     currentAudioId.value = audioList.value[0]?.id || null
     videoError.value = false
     videoLoading.value = !!currentVideoId.value
+    // 重置解析失败标记（上次受试者的失败状态不带入本次）
+    eyeParseFailed.value = false
     await nextTick()
     if (seq !== subjectSeq) return
     initCharts()
@@ -1462,7 +1564,7 @@ const onSubjectChange = async () => {
     } else {
       clearEcgChart()
     }
-    // 眼动：有真实眼动资产时加载 sync_data 指标
+    // 眼动：有真实眼动资产时加载 sync_data 指标；解析失败直接展示失败状态，不回退模拟数据
     eyeMeta.value = null
     if (hasModality('eye')) {
       const eyeAsset = tracks.value.find((t) => t.data_type === 'eye')
@@ -1471,8 +1573,15 @@ const onSubjectChange = async () => {
         if (seq !== subjectSeq) return  // 过期响应丢弃
         if (eyeRes.code === 200 && eyeRes.data) {
           eyeMeta.value = eyeRes.data
+        } else {
+          eyeParseFailed.value = true
+          disposeEyeChart()
         }
-      } catch (e) { /* 解析失败回退模拟数据 */ }
+      } catch (e) {
+        if (seq !== subjectSeq) return  // 过期响应丢弃
+        eyeParseFailed.value = true
+        disposeEyeChart()
+      }
       updateSimCharts('eye')
     } else {
       if (eyeChart) eyeChart.setOption({ series: [] }, true)
@@ -1495,13 +1604,14 @@ const onSubjectChange = async () => {
         if (a.metadata && a.metadata.summary) {
           summary = a.metadata.summary
         } else {
+          // 解析失败时 summary 保持 null，卡片模板内联展示"量表数据解析失败"
           try {
             const scaleRes = await getScaleAssetApi(a.id)
             if (seq !== subjectSeq) return  // 过期响应丢弃
             if (scaleRes.code === 200 && scaleRes.data) {
               summary = scaleRes.data.summary || null
             }
-          } catch (e) { /* 该资产解析失败，仅展示文件名 */ }
+          } catch (e) { /* 解析失败：summary 为 null，模板展示失败状态 */ }
         }
         cards.push({ assetId: a.id, file_name: a.file_name, summary })
       }
@@ -1556,8 +1666,7 @@ const disposeAllCharts = () => {
 const loadFileAssets = async () => {
   fileLoading.value = true
   try {
-    const res = await getAssetsApi({ page: 1, page_size: 1000 })
-    fileAssetList.value = res.data.items || []
+    fileAssetList.value = await fetchAllPages(getAssetsApi)
   } catch (e) {
     fileAssetList.value = []
   } finally {
@@ -1602,6 +1711,9 @@ const onAssetChange = async () => {
   subjectInfo.value = subjectList.value.find(
     (s) => s.id === selectedAsset.value.subject_id
   ) || null
+  // 重置解析失败标记（上一个文件的失败状态不带入本次）
+  eyeParseFailed.value = false
+  scaleParseFailed.value = false
   // 等待 DOM 渲染（首次选文件时 <template v-else> 从不渲染变为渲染）
   await nextTick()
   // 等浏览器布局完成，确保 echarts 拿到正确的 DOM 尺寸
@@ -1651,15 +1763,21 @@ const onAssetChange = async () => {
     clearEcgChart()
   }
 
-  // 眼动：选中 eye 时加载真实 sync_data 指标
+  // 眼动：选中 eye 时加载真实 sync_data 指标；解析失败直接展示失败状态，不回退模拟数据
   eyeMeta.value = null
   if (t === 'eye') {
     try {
       const eyeRes = await getEyeAssetApi(selectedAsset.value.id)
       if (eyeRes.code === 200 && eyeRes.data) {
         eyeMeta.value = eyeRes.data
+      } else {
+        eyeParseFailed.value = true
+        disposeEyeChart()
       }
-    } catch (e) { /* 回退模拟数据 */ }
+    } catch (e) {
+      eyeParseFailed.value = true
+      disposeEyeChart()
+    }
     updateSimCharts('eye')
   } else if (t === 'gait') {
     updateSimCharts('gait')
@@ -1668,19 +1786,27 @@ const onAssetChange = async () => {
     if (gaitChart) gaitChart.setOption({ series: [] }, true)
   }
 
-  // 量表：选中 scale 时加载真实 MoCA 数据
+  // 量表：选中 scale 时加载真实 MoCA 数据；解析失败直接展示失败状态，不回退受试者字段
   scaleMeta.value = null
   if (t === 'scale') {
     try {
       const scaleRes = await getScaleAssetApi(selectedAsset.value.id)
-      if (scaleRes.code === 200 && scaleRes.data) {
+      if (scaleRes.code === 200 && scaleRes.data?.summary) {
         scaleMeta.value = scaleRes.data
+      } else {
+        scaleParseFailed.value = true
+        disposeRadarChart()
       }
-    } catch (e) { /* 回退 Subject 字段 */ }
+    } catch (e) {
+      scaleParseFailed.value = true
+      disposeRadarChart()
+    }
   }
 
-  // 量表雷达图：scale/task 类型或有关联受试者时显示
-  if (['scale', 'task'].includes(t) || subjectInfo.value) {
+  // 量表雷达图：量表解析失败时模板已切换为失败提示；scale/task 类型或有关联受试者时渲染
+  if (scaleParseFailed.value) {
+    // 已销毁实例，无需渲染
+  } else if (['scale', 'task'].includes(t) || subjectInfo.value) {
     updateRadarChart()
   } else {
     clearRadarChart()
@@ -1705,13 +1831,13 @@ const clearRadarChart = () => {
 
 const loadSubjects = async () => {
   try {
-    const [subRes, assetRes] = await Promise.all([
-      getSubjects({ page: 1, page_size: 500 }),
-      getAssetsApi({ page: 1, page_size: 1000 }),
+    const [subjects, assets] = await Promise.all([
+      fetchAllPages(getSubjects),
+      fetchAllPages(getAssetsApi),
     ])
-    subjectList.value = subRes.data.items || []
-    allSubjects.value = subjectList.value
-    allAssets.value = assetRes.data.items || []
+    subjectList.value = subjects
+    allSubjects.value = subjects
+    allAssets.value = assets
   } catch (e) {
     /* 接口未就绪 */
   }
