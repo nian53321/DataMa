@@ -162,6 +162,20 @@ def _fps_chain(fps):
     return chain
 
 
+def _is_device_busy(err):
+    """判断 pipe.start 失败是否属设备被占用（V4L2 EBUSY，errno=16）
+
+    usbip 下上一子进程退出后内核释放 USB 需要 1~2.5s，期间 pipe.start 报
+    "xioctl(VIDIOC_S_FMT) failed, errno=16 ... Device or resource busy"。
+    该错误与流配置无关（设备被占时换任何组合同样失败），识别出来以便
+    _start_pipeline 原地重试等释放，而不是浪费降级链。
+    """
+    s = str(err).lower()
+    return any(k in s for k in (
+        "errno=16", "errno 16", "device or resource busy",
+        "vidioc_s_fmt", "xioctl"))
+
+
 def _start_pipeline(rs, fps):
     """启动 pipeline（彩色 + 深度），帧率优先降级，失败自动降档。
 
@@ -173,11 +187,12 @@ def _start_pipeline(rs, fps):
     上次成功组合优先尝试（缓存于 _COMBO_CACHE）：降级链前面的组合在 USB2 下
     每次启动都要重复失败重试，缓存命中后一次 pipe.start 即成功。
 
-    设备忙重试：仅对缓存组合生效。父进程发出停止信号后不等上一子进程退出即
-    启动本进程（缩短启动耗时），本进程 import 完成时上一进程可能仍持有相机
-    （pipe.stop 在 usbip 下需 1~2.5s），pipe.start 失败属"设备忙"而非配置
-    不匹配，短间隔重试等到释放即可。无缓存时跳过重试——组合本就可能因带宽
-    不足失败，重试无意义，直接走降级链。
+    设备忙重试：EBUSY 错误无论有无缓存组合都原地重试（共享 8s 总预算）。
+    父进程发出停止信号后不等上一子进程退出即启动本进程（缩短启动耗时），
+    本进程 import 完成时上一进程可能仍持有相机（pipe.stop 在 usbip 下需
+    1~2.5s），pipe.start 失败属"设备忙"而非配置不匹配，短间隔重试等到释放
+    即可；预算耗尽仍忙则直接失败（继续降级无意义）。非 busy 失败仍只对缓存
+    组合重试——组合可能因带宽不足失败，重试无意义，直接走降级链。
 
     返回 (pipeline, profile, color_w, color_h, depth_w, depth_h, actual_fps)；
     profile 用于读取实际设备信息（型号/固件/深度缩放）。所有组合均失败时抛异常。
@@ -192,11 +207,12 @@ def _start_pipeline(rs, fps):
     else:
         attempts = chain
     last_err = None
+    busy_until = 0.0  # 首次遇到 EBUSY 时起算的共享重试预算（设备忙与组合无关）
     for combo in attempts:
         (f, cw, ch, dw, dh) = combo
-        # 缓存组合（上次成功过）失败大概率是设备忙，在预算内重试同一组合
-        busy_until = (time.monotonic() + BUSY_RETRY_SECONDS
-                      if cached is not None and combo == cached else 0.0)
+        # 非 busy 失败时缓存组合（上次成功过）的重试预算：容忍短暂抖动
+        retry_until = (time.monotonic() + BUSY_RETRY_SECONDS
+                       if cached is not None and combo == cached else 0.0)
         while True:
             pipe = rs.pipeline()
             cfg = rs.config()
@@ -212,11 +228,24 @@ def _start_pipeline(rs, fps):
                     pipe.stop()
                 except Exception:
                     pass
-                if time.monotonic() < busy_until:
+                if _is_device_busy(e):
+                    # 设备忙与流配置无关：原地重试等上一进程释放。
+                    # 无缓存时同样生效（原先仅缓存组合重试，容器重建后缓存
+                    # 丢失会导致预览→录制切换的首次启动必然失败）
+                    if busy_until == 0.0:
+                        busy_until = time.monotonic() + BUSY_RETRY_SECONDS
+                    if time.monotonic() < busy_until:
+                        time.sleep(BUSY_RETRY_INTERVAL)
+                        continue
+                elif time.monotonic() < retry_until:
                     time.sleep(BUSY_RETRY_INTERVAL)
                     continue
                 break
-    raise RuntimeError(f"启动 RealSense 相机失败（{last_err}）")
+        if busy_until and _is_device_busy(last_err) and time.monotonic() >= busy_until:
+            break  # 忙预算耗尽：设备仍被占用，继续降级无意义
+    hint = ("（相机可能被其他进程占用，稍后重试或重启后端容器）"
+            if _is_device_busy(last_err) else "")
+    raise RuntimeError(f"启动 RealSense 相机失败（{last_err}）{hint}")
 
 
 def _frame_array(frame):
