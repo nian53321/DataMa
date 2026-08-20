@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     USB 透传执行器（以登录用户身份运行 reset_orbbec_usb.ps1）
 .DESCRIPTION
