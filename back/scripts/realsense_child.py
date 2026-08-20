@@ -8,12 +8,13 @@
 
 数据流：与 Orbbec 一致，只采集 彩色 + 深度 两路（**不启用红外流**）：
   - 彩色：D455F 原生 1280x800（bgr8，1MP 全局快门），分辨率自动协商逐级降级
-  - 深度：D455F 原生 1280x720（z16，单位 mm），原始 z16 以 ffv1 无损保留，另生成 jet 伪彩色预览
+  - 深度：D455F 原生 1280x720（z16，单位 mm），DZST v2 存储（11bit 量化 + 帧间差分 + zstd，
+    量化误差 ≤2mm 低于深度噪声，体积约为逐帧 zstd 的 2/5）
   - 深度量程：D455F 理想范围 0.6m-6m（深度 200mm-8000mm 归一化到伪彩色）
 
 录制产物（输出目录，全部为最终格式）：
   color.mp4         彩色 H.264（libx264 CRF 18，浏览器可播）
-  depth_raw.zst     原始深度序列（zstd 无损压缩，z16 16 位精度完整保留，供分析）
+  depth_raw.zst     原始深度序列（DZST v2：量化+差分 zstd 压缩，解码后为毫米深度值，供分析）
   frames.jsonl      逐帧同步记录（MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
   calibration.json  相机标定（depth_scale / RGB 内参 / 畸变 / 分辨率 / 序列号 / 对齐状态）
   meta.json         序列号 / 分辨率 / 帧时间戳 / 编码信息
@@ -24,6 +25,7 @@
   record <path> <fps>          录制（彩色 MP4 + 原始深度 zstd + 逐帧同步与标定 JSON），stdin 收到 "stop" 后优雅停止
 """
 import os
+import queue
 import sys
 import threading
 from datetime import datetime
@@ -179,23 +181,48 @@ def _emit_jpeg(frame, quality=80):
     _safe_write(b"\r\n")
 
 
-def _try_emit_jpeg(frame, quality=70):
-    """录制中实时预览帧输出：stdout 无消费者/管道背压时静默丢弃，绝不阻塞或抛错影响录制"""
-    fd = _saved_stdout_fd if _saved_stdout_fd is not None else 1
-    import select
+def _put_latest(q, item):
+    """入队最新项：队列满时丢最旧再入队（预览只关心最新画面，绝不阻塞调用方）"""
     try:
-        _r, _w, _x = select.select([], [fd], [], 0)
-        if fd not in _w:
-            return
-        import cv2
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if not ok:
-            return
-        os.write(fd, b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-        os.write(fd, buf.tobytes())
-        os.write(fd, b"\r\n")
-    except (OSError, BrokenPipeError):
+        q.put_nowait(item)
+        return
+    except queue.Full:
         pass
+    try:
+        q.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        pass
+
+
+def _preview_writer(q, w, h):
+    """录制中实时预览写线程：从队列取彩色帧编码 JPEG 写 stdout（multipart 边界）
+
+    必须独立于采集循环：预览帧（~100KB）超过 stdout 管道缓冲（64KB），录制
+    刚开始前端尚未重连预览流（无消费者）时写管道会阻塞——曾内联在采集循环
+    里执行，开头阻塞 ~1s 导致 librealsense 帧队列溢出丢 29 帧（硬件帧号
+    1→31）。独立线程后管道背压只阻塞本线程，采集循环满帧率运行；队列满
+    丢最旧帧，消费者恢复后立即跟上最新画面。
+    """
+    import cv2
+    import numpy as np
+    fd = _saved_stdout_fd if _saved_stdout_fd is not None else 1
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        try:
+            frame = np.frombuffer(item, np.uint8).reshape(h, w, 3)
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                os.write(fd, b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                os.write(fd, buf.tobytes())
+                os.write(fd, b"\r\n")
+        except (OSError, BrokenPipeError):
+            continue
 
 
 # ==================== probe ====================
@@ -316,36 +343,40 @@ def _enc_writer(q, proc):
             pass
 
 
-# zstd 深度序列文件格式（绝对无损，压缩率远高于 ffv1）：
-#   magic "DZST" | version u32le | width u32le | height u32le | frame_count u32le
-#   然后逐帧: [compressed_len u32le][zstd block]
+def _load_depth_zst():
+    """按文件路径加载共享编解码模块（绕过 app 包导入，避免子进程拉起 Flask 依赖）"""
+    import importlib.util
+    path = os.path.join(BACK_DIR, "app", "utils", "depth_zst.py")
+    spec = importlib.util.spec_from_file_location("depth_zst", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# 深度序列文件格式（DZST v2，见 app/utils/depth_zst.py）：
+#   12bit 量化 + 关键帧/帧间差分 + zstd，体积约为逐帧 zstd 的 1/8 ~ 1/15
 def _zstd_writer(q, fobj, w, h):
-    """写线程：从队列取 z16 深度帧字节，zstd 压缩追加写入；None 哨兵后回填帧数并关闭"""
-    import struct
+    """写线程：从队列取 z16 深度帧字节，DZST v2 压缩追加写入；None 哨兵后回填帧数并关闭"""
     try:
-        import zstandard as _zstd
-    except ImportError:
-        import sys
-        sys.stderr.write("zstandard 未安装，无法写入深度序列\n")
+        depth_zst = _load_depth_zst()
+    except Exception as e:
+        sys.stderr.write(f"depth_zst 模块加载失败，无法写入深度序列: {e}\n")
         sys.stderr.flush()
         fobj.close()
         return
     try:
-        cctx = _zstd.ZstdCompressor(level=3)
-        fobj.write(b"DZST")
-        fobj.write(struct.pack("<IIII", 1, w, h, 0))
+        writer = depth_zst.DepthZstWriter(fobj, w, h)
         count = 0
         while True:
             item = q.get()
             if item is None:
                 break
-            comp = cctx.compress(item)
-            fobj.write(struct.pack("<I", len(comp)))
-            fobj.write(comp)
+            writer.write_frame(item)
             count += 1
-        fobj.seek(16)
-        fobj.write(struct.pack("<I", count))
-        fobj.flush()
+        writer.finish(count)
+    except Exception as e:
+        sys.stderr.write(f"深度序列写入失败: {e}\n")
+        sys.stderr.flush()
     finally:
         fobj.close()
 
@@ -371,11 +402,11 @@ def _jsonl_writer(q, fobj):
 
 
 def cmd_record(path, fps):
-    """录制彩色 H.264 MP4 + 原始深度 zstd 无损压缩序列 + 逐帧同步/标定信息
+    """录制彩色 H.264 MP4 + DZST v2 深度压缩序列 + 逐帧同步/标定信息
 
     产物（输出目录保留，不打包；全部为最终格式，无需二次转码）：
       <path>/color.mp4         彩色视频（H.264，libx264 CRF 18，浏览器可播）
-      <path>/depth_raw.zst     原始深度序列（zstd 无损压缩，z16 16 位精度完整保留）
+      <path>/depth_raw.zst     原始深度序列（DZST v2：11bit 量化 + 帧间差分 zstd，解码后为毫米深度值）
       <path>/frames.jsonl      逐帧记录：mp4_frame/zst_frame + RGB/深度硬件时间戳(ms) + 硬件帧号
       <path>/calibration.json  相机标定：depth_scale/RGB 内参/畸变/分辨率/序列号/对齐状态
       <path>/meta.json         序列号 / 配置 / 每帧时间戳 / 编码信息
@@ -485,6 +516,12 @@ def cmd_record(path, fps):
             target=_jsonl_writer, args=(frames_q, frames_fobj), daemon=True)
         frames_writer.start()
 
+        # 实时预览写线程（独立于采集循环，见 _preview_writer 注释）
+        preview_q = queue.Queue(maxsize=2)
+        preview_writer = threading.Thread(
+            target=_preview_writer, args=(preview_q, cw, ch), daemon=True)
+        preview_writer.start()
+
         # 相机标定信息（每次录制保存一次，写入 out_dir/calibration.json）
         color_intr = None
         try:
@@ -548,8 +585,9 @@ def cmd_record(path, fps):
                 if color is not None:
                     color_arr = _frame_array(color)
                     items[0] = color_arr.tobytes()
-                    # 录制中同步输出 MJPEG 实时预览（stdout 无消费者/背压时静默丢弃）
-                    _try_emit_jpeg(color_arr)
+                    # 实时预览帧入队（复用 items[0] 的字节拷贝，零额外拷贝）：
+                    # 编码与写管道由预览线程承担，不占采集循环的帧率预算
+                    _put_latest(preview_q, items[0])
                     rec["mp4_frame"] = mp4_count
                     mp4_count += 1
                     rec["rgb_ts_ms"] = round(color.get_timestamp(), 3)
@@ -590,6 +628,11 @@ def cmd_record(path, fps):
                     q.put(None)
                 except Exception:
                     pass
+            # 预览线程哨兵（丢旧策略，队列满也不阻塞收尾）并等它退出：
+            # 确保 DONE 结果行输出前不再有预览帧写 stdout，避免 JPEG 字节
+            # 与结果行交错导致父进程解析不到 DONE
+            _put_latest(preview_q, None)
+            preview_writer.join(timeout=5)
             color_writer.join(timeout=60)
             depth_writer.join(timeout=120)
             frames_writer.join(timeout=60)
@@ -614,7 +657,17 @@ def cmd_record(path, fps):
             return 1
 
         color_ok = os.path.isfile(color_mp4) and os.path.getsize(color_mp4) > 0
-        raw_ok = os.path.isfile(depth_zst) and os.path.getsize(depth_zst) > 16
+        # 深度有效性：解析 DZST 头部确认帧数>0（v2 头部 20 字节，0 帧空文件
+        # 也会超过旧的 ">16 字节" 阈值被误判有效；帧数未回填=写线程异常截断）
+        raw_ok = False
+        if os.path.isfile(depth_zst) and os.path.getsize(depth_zst) > 20:
+            try:
+                _dz = _load_depth_zst()
+                with open(depth_zst, "rb") as f:
+                    _hdr = _dz.read_header(f)
+                raw_ok = bool(_hdr and _hdr[3] > 0)
+            except Exception:
+                raw_ok = False
         if not color_ok:
             _safe_print("ERR 彩色视频编码失败（详见 ffmpeg.log）")
             return 1
@@ -623,7 +676,8 @@ def cmd_record(path, fps):
         meta["frame_count"] = frame_idx
         meta["depth_raw"] = bool(raw_ok)
         meta["color_codec"] = "h264"
-        meta["depth_codec"] = "zstd"
+        meta["depth_codec"] = "dzst2"
+        meta["depth_quantum_mm"] = 4
         try:
             with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)

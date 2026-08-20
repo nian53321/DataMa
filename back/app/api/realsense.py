@@ -523,40 +523,46 @@ def upload_recorded():
                 video_type=video_type,
             )
         color_asset = asset
-        # 原始深度序列（zstd 无损压缩）一并入库（metadata.depth_raw=true），
+        # 先读子进程 meta.json（失败不影响入库），深度上传时把 fps 写进深度资产
+        # 自身 metadata——直接访问深度资产播放时（不走彩色资产定位链）也能取到 fps，
+        # 否则 usbip 带宽下降级到 5/15fps 的录制会按默认 30fps 转码导致快放
+        meta_path = os.path.join(out_dir, "meta.json")
+        child_meta = {}
+        if os.path.isfile(meta_path):
+            try:
+                import json as _json
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    child_meta = _json.load(f)
+            except Exception:
+                child_meta = {}
+        # 原始深度序列（DZST 压缩）一并入库（metadata.depth_raw=true），
         # 同时把深度资产 id 记到彩色资产 metadata，供可视化从深度通道转伪彩色时定位
         depth_raw_zst = os.path.join(out_dir, "depth_raw.zst")
         depth_asset_id = None
         if os.path.isfile(depth_raw_zst):
             # 视频重采时同类型深度一并重采（_upload_raw_depth 按类型清理旧深度）
             depth_asset = _upload_raw_depth(svc, subject_id, depth_raw_zst,
-                                            video_type=video_type)
+                                            video_type=video_type,
+                                            fps=child_meta.get("fps"))
             depth_asset_id = depth_asset.id if depth_asset else None
         # 深度信息与关联立即合并到彩色资产 metadata：不依赖后续辅助 JSON 上传，
         # 避免辅助 JSON 入库失败时深度关联丢失（否则可视化定位深度资产失败，报"无深度轨"）
-        meta_path = os.path.join(out_dir, "meta.json")
         extra_meta = {}
-        if os.path.isfile(meta_path):
-            try:
-                import json as _json
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    child_meta = _json.load(f)
-                extra_meta = {
-                    "depth_frames": child_meta.get("frame_count", 0),
-                    "depth_raw": bool(child_meta.get("depth_raw")),
-                    "depth_codec": child_meta.get("depth_codec", "zstd"),
-                    "device_serial": child_meta.get("device_serial", ""),
-                    "device_name": child_meta.get("device_name", ""),
-                    "firmware_version": child_meta.get("firmware_version", ""),
-                    "color_resolution": child_meta.get("color_resolution", ""),
-                    "depth_resolution": child_meta.get("depth_resolution", ""),
-                    "depth_units_mm": child_meta.get("depth_units_mm", 1.0),
-                    "fps": child_meta.get("fps", 30),
-                    "start_time": child_meta.get("start_time", ""),
-                    "end_time": child_meta.get("end_time", ""),
-                }
-            except Exception:
-                pass
+        if child_meta:
+            extra_meta = {
+                "depth_frames": child_meta.get("frame_count", 0),
+                "depth_raw": bool(child_meta.get("depth_raw")),
+                "depth_codec": child_meta.get("depth_codec", "zstd"),
+                "device_serial": child_meta.get("device_serial", ""),
+                "device_name": child_meta.get("device_name", ""),
+                "firmware_version": child_meta.get("firmware_version", ""),
+                "color_resolution": child_meta.get("color_resolution", ""),
+                "depth_resolution": child_meta.get("depth_resolution", ""),
+                "depth_units_mm": child_meta.get("depth_units_mm", 1.0),
+                "fps": child_meta.get("fps", 30),
+                "start_time": child_meta.get("start_time", ""),
+                "end_time": child_meta.get("end_time", ""),
+            }
         if depth_asset_id:
             extra_meta["depth_asset_id"] = depth_asset_id
         if extra_meta:
@@ -604,13 +610,15 @@ def upload_recorded():
     return success(asset.to_dict(), message="已入库", code=201)
 
 
-def _upload_raw_depth(svc, subject_id, zst_path, video_type=None):
-    """上传/替换受试者指定视频类型的原始深度序列资产（zstd 无损压缩）
+def _upload_raw_depth(svc, subject_id, zst_path, video_type=None, fps=None):
+    """上传/替换受试者指定视频类型的原始深度序列资产（DZST 压缩）
 
     独立于彩色视频资产管理，避免被视频重采逻辑（video_type）误删。
     - 命名带 video_type 后缀（face/gait 等，便于区分），但 metadata 不写
       video_type（普通视频重采按 metadata.video_type 删除，深度资产会被误删）；
       类型记录在独立字段 depth_video_type，按类型各自保留一份。
+    - fps 写入 metadata.realsense（深度视频转码按真实帧率编码，usbip 降级
+      到 5/15fps 的录制不会按默认 30fps 转码导致快放）。
     - 返回新资产；文件缺失/入库失败返回 None。
     """
     from app.models import DataAsset as _DA
@@ -661,6 +669,8 @@ def _upload_raw_depth(svc, subject_id, zst_path, video_type=None):
         )
     dmeta = dict(asset.metadata_json or {})
     dmeta.update({"depth_raw": True, "depth_video_type": video_type})
+    if fps:
+        dmeta["realsense"] = {"fps": fps}
     asset.metadata_json = dmeta
     db.session.commit()
     return asset
