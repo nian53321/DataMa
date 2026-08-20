@@ -1030,6 +1030,7 @@ const applyOrbbecTrim = async () => {
   trimProgress.value = 0
   let rafId = 0
   let cropTimeout = null
+  let onTimeUpdate = null
   try {
     const canvas = canvasRef.value
     const w = v.videoWidth || 1280
@@ -1059,7 +1060,7 @@ const applyOrbbecTrim = async () => {
     v.play().catch(() => {})
     const t0 = Date.now()
     const totalMs = (end - start) * 1000
-    const onTimeUpdate = () => {
+    onTimeUpdate = () => {
       if (v.currentTime >= end - 0.05) {
         v.pause()
         v.removeEventListener('timeupdate', onTimeUpdate)
@@ -1088,6 +1089,8 @@ const applyOrbbecTrim = async () => {
   } catch (e) {
     cancelAnimationFrame(rafId)
     clearTimeout(cropTimeout)
+    if (onTimeUpdate) v.removeEventListener('timeupdate', onTimeUpdate)
+    v.pause()
     trimming.value = false
     ElMessage.error(`裁剪失败：${e.message || e}`)
   }
@@ -1633,6 +1636,7 @@ const applyTrim = async () => {
   trimProgress.value = 0
   let rafId = 0
   let cropTimeout = null
+  let onTimeUpdate = null
   try {
     const video = videoRef.value
     const canvas = canvasRef.value
@@ -1686,7 +1690,7 @@ const applyTrim = async () => {
 
     const totalMs = (end - start) * 1000
     const t0 = Date.now()
-    const onTimeUpdate = () => {
+    onTimeUpdate = () => {
       const cur = video.currentTime
       if (cur >= end - 0.05) {
         video.pause()
@@ -1723,6 +1727,9 @@ const applyTrim = async () => {
   } catch (e) {
     cancelAnimationFrame(rafId)
     clearTimeout(cropTimeout)
+    const video = videoRef.value
+    if (onTimeUpdate && video) video.removeEventListener('timeupdate', onTimeUpdate)
+    if (video) video.pause()
     trimming.value = false
     ElMessage.error(`裁剪失败：${e.message || e}`)
   }

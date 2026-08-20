@@ -22,7 +22,7 @@
         <el-card shadow="hover" class="stat-card">
           <el-icon :size="28" color="#409eff"><DataAnalysis /></el-icon>
           <div class="stat-info">
-            <div class="stat-value">{{ stat.total }}</div>
+            <div class="stat-value">{{ statFailed ? '—' : stat.total }}</div>
             <div class="stat-label">数据资产总数</div>
           </div>
         </el-card>
@@ -31,7 +31,7 @@
         <el-card shadow="hover" class="stat-card">
           <el-icon :size="28" color="#e6a23c"><Clock /></el-icon>
           <div class="stat-info">
-            <div class="stat-value">{{ stat.pending }}</div>
+            <div class="stat-value">{{ statFailed ? '—' : stat.pending }}</div>
             <div class="stat-label">待清洗</div>
           </div>
         </el-card>
@@ -40,7 +40,7 @@
         <el-card shadow="hover" class="stat-card">
           <el-icon :size="28" color="#67c23a"><CircleCheck /></el-icon>
           <div class="stat-info">
-            <div class="stat-value">{{ stat.cleaned }}</div>
+            <div class="stat-value">{{ statFailed ? '—' : stat.cleaned }}</div>
             <div class="stat-label">已清洗</div>
           </div>
         </el-card>
@@ -49,7 +49,7 @@
         <el-card shadow="hover" class="stat-card">
           <el-icon :size="28" color="#f56c6c"><Warning /></el-icon>
           <div class="stat-info">
-            <div class="stat-value">{{ stat.unqualified }}</div>
+            <div class="stat-value">{{ statFailed ? '—' : stat.unqualified }}</div>
             <div class="stat-label">质量不合格</div>
           </div>
         </el-card>
@@ -366,6 +366,8 @@ const pagination = reactive({ page: 1, page_size: 20, total: 0 })
 const stat = reactive({ total: 0, pending: 0, cleaned: 0, unqualified: 0 })
 // 全量统计（来自 dashboard stats，避免当前页数据失真）
 const dashboardStat = reactive({ asset_status_distribution: {}, qualified_rate: 0, asset_total: 0 })
+// 统计加载失败标记：失败时卡片显示"—"而不是误导性的 0
+const statFailed = ref(false)
 
 const loadDashboardStat = async () => {
   try {
@@ -374,9 +376,12 @@ const loadDashboardStat = async () => {
     dashboardStat.asset_status_distribution = d.asset_status_distribution || {}
     dashboardStat.qualified_rate = d.qualified_rate || 0
     dashboardStat.asset_total = d.asset_total || 0
+    statFailed.value = false
     updateStat()
   } catch (e) {
-    // 静默失败，不影响主流程
+    statFailed.value = true
+    // 请求失败已由全局拦截器统一提示；此处补充说明统计不可用
+    ElMessage.warning('全局统计加载失败，统计卡片暂不可用')
   }
 }
 
