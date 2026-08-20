@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     安装宿主机 USB 透传代理（视频采集弹窗"透传深度相机"按钮的宿主机侧组件）
 .DESCRIPTION
@@ -133,6 +133,44 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Register-ScheduledTask -TaskName 'DataMaUsbAgent' -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force | Out-Null
 Write-OK '计划任务已注册'
+
+# ---------- 5.5 辅助计划任务 DataMaUsbReset（登录用户上下文执行透传） ----------
+# 方案 A 核心：WSL 发行版实例绑定到登录用户，SYSTEM 账户下 wsl 感知不到发行版，
+# 透传脚本会误报「未找到可用 WSL 发行版」。故常驻代理保留 SYSTEM 监听，但真正
+# 执行 reset_orbbec_usb.ps1 的进程切到「当前登录用户」上下文（Interactive），
+# 由 usb_agent.ps1 的 /reset 经 schtasks /Run 触发本任务。
+# 前提：跑视频采集界面的机器需有管理员账号处于登录状态（Interactive 任务仅在其
+# 登录会话中运行；用户未登录时本按钮会失败，属预期）。
+Write-Step '注册辅助计划任务 DataMaUsbReset（以登录用户身份执行透传，供代理 /reset 触发）'
+$runnerPath = Join-Path $Root 'usb_reset_runner.ps1'
+if (-not (Test-Path $runnerPath)) {
+    Write-Err2 "缺少 $runnerPath（应与 install_usb_agent.ps1 同目录）"
+    exit 1
+}
+# 以当前（提权用户的原）登录用户身份注册：Interactive + RunLevel Highest。
+# 说明：提权后 $env:USERNAME 仍是发起提权的用户（UAC 提权不会切换用户名）；
+# 交互式自动登录会话匹配「当前登录用户」，无需存储密码。
+$loginUser = "$env:USERDOMAIN\$env:USERNAME"
+Stop-ScheduledTask -TaskName 'DataMaUsbReset' -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'DataMaUsbReset' -Confirm:$false -ErrorAction SilentlyContinue
+$runAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runnerPath`""
+# 占位触发：定在明天，仅让任务「已启用」（schtasks /Run 对 Disabled 任务会报错
+# "could not run because it is disabled"）。实际运行只靠代理 /reset 手动 /Run 触发，
+# 不会在安装后自动跑一遍透传。
+$runTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddDays(1)
+$runPrincipal = New-ScheduledTaskPrincipal -UserId $loginUser -LogonType Interactive -RunLevel Highest
+$runSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew  # 30 分钟上限，禁止并发
+try {
+    # 必须 Enabled（schtasks /Run 对 Disabled 任务报 "because it is disabled"）；
+    # 占位触发定在明天，不会在安装后自动跑透传，运行只靠代理 /reset 手动触发
+    Register-ScheduledTask -TaskName 'DataMaUsbReset' -Action $runAction -Trigger $runTrigger `
+        -Principal $runPrincipal -Settings $runSettings -Force | Out-Null
+    Write-OK "辅助计划任务已注册（用户 $loginUser，Interactive，仅登录会话运行）"
+} catch {
+    Write-Warn2 "辅助计划任务注册失败: $($_.Exception.Message)（透传按钮暂不可用，请以管理员用户登录本机后重跑本脚本）"
+}
 
 Start-ScheduledTask -TaskName 'DataMaUsbAgent'
 Write-Host '  已触发启动，等待代理就绪...' -ForegroundColor DarkGray

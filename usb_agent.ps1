@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     宿主机 USB 透传代理（视频采集弹窗"透传深度相机"按钮的宿主机侧组件）
 .DESCRIPTION
@@ -44,13 +44,49 @@ try {
 if (-not $Port) { $Port = [int]$cfg.port }
 $Token = [string]$cfg.token
 $ResetScript = Join-Path $Root 'reset_orbbec_usb.ps1'
+# 以无 BOM 的 UTF-8 写状态文件（避免 BOM 干扰退出码的 [int] 解析）
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # ---------- 任务状态（监听循环内单线程串行读写，无并发竞争） ----------
-$script:JobProc = $null          # System.Diagnostics.Process（cmd.exe，等待脚本结束）
+# 方案 A：常驻代理保留 SYSTEM 上下文（HttpListener + usbipd 都需要管理员/SYSTEM），
+# 但真正执行透传的进程切到「登录用户」上下文——WSL 发行版绑定登录用户，SYSTEM 下
+# wsl 感知不到发行版会导致 reset 脚本误报「未找到可用 WSL 发行版」。
+# 实现：/reset 不再直接 spawn 子进程，而是 schtasks /Run 触发辅助计划任务
+# DataMaUsbReset（install_usb_agent.ps1 注册，以登录用户身份运行 usb_reset_runner.ps1）。
+# 因代理拿不到辅助任务的进程句柄，任务状态（running/exit_code/日志尾部）改由
+# usb_reset_runner.ps1 写出的状态文件 + 日志文件驱动（Get-JobState 统一读取）。
+$script:TaskName = 'DataMaUsbReset'   # 辅助计划任务名（登录用户上下文）
 $script:JobLogFile = ''
 $script:JobExit = $null
 $script:JobStartedAt = $null
 $script:JobFinishedAt = $null
+
+# 状态/日志文件（与 usb_reset_runner.ps1 约定一致）
+$script:JobExitFile = Join-Path $Root 'usb_agent_job_exit.txt'
+
+function Update-JobState {
+    # 从「退出码状态文件 + 日志文件」推断任务是否结束。runnner 写退出码数字表示已结束。
+    if ($script:JobStartedAt -and $null -eq $script:JobExit) {
+        $ec = $null
+        try { $ec = ([System.IO.File]::ReadAllText($script:JobExitFile)).Trim() } catch { }
+        if ($ec -and $ec -ne 'running') {
+            $script:JobExit = try { [int]$ec } catch { -1 }
+            $script:JobFinishedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        }
+    }
+}
+
+function Get-JobTail {
+    # 任务日志尾部（最近 80 行），供前端进度展示
+    if ($script:JobLogFile -and (Test-Path $script:JobLogFile)) {
+        try {
+            $lines = @(Get-Content $script:JobLogFile -Encoding UTF8 -ErrorAction SilentlyContinue |
+                Select-Object -Last 80)
+            return ($lines -join "`n")
+        } catch { return '' }
+    }
+    return ''
+}
 
 function Send-Json {
     param($ctx, [int]$code, $obj)
@@ -71,28 +107,6 @@ function Test-Token {
     $t = $ctx.Request.QueryString['token']
     if (-not $t) { $t = $ctx.Request.Headers['X-Agent-Token'] }
     return ($t -and ($t -eq $Token))
-}
-
-function Update-JobState {
-    # 任务进程已退出则记录退出码与结束时间（cmd /c 会透传脚本退出码）
-    if ($script:JobProc -and $script:JobProc.HasExited -and $null -eq $script:JobExit) {
-        try { $script:JobExit = $script:JobProc.ExitCode } catch { $script:JobExit = -1 }
-        $script:JobFinishedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        try { $script:JobProc.Dispose() } catch { }
-        $script:JobProc = $null
-    }
-}
-
-function Get-JobTail {
-    # 任务日志尾部（最近 80 行），供前端进度展示
-    if ($script:JobLogFile -and (Test-Path $script:JobLogFile)) {
-        try {
-            $lines = @(Get-Content $script:JobLogFile -Encoding UTF8 -ErrorAction SilentlyContinue |
-                Select-Object -Last 80)
-            return ($lines -join "`n")
-        } catch { return '' }
-    }
-    return ''
 }
 
 # ---------- 启动监听 ----------
@@ -135,7 +149,7 @@ while ($true) {
             Update-JobState
             Send-Json $ctx 200 @{
                 ok          = $true
-                running     = [bool]$script:JobProc
+                running     = ($null -eq $script:JobExit -and $null -ne $script:JobStartedAt)
                 exit_code   = $script:JobExit
                 started_at  = $script:JobStartedAt
                 finished_at = $script:JobFinishedAt
@@ -150,28 +164,31 @@ while ($true) {
                 continue
             }
             Update-JobState
-            if ($script:JobProc) {
+            if ($null -eq $script:JobExit -and $null -ne $script:JobStartedAt) {
                 Send-Json $ctx 409 @{ ok = $false; error = '已有透传任务在执行中' }
                 continue
             }
+            # 校验辅助计划任务已注册（方案 A 依赖它：以登录用户上下文执行透传脚本）
+            $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
+            if (-not $task) {
+                Send-Json $ctx 500 @{ ok = $false; error = "辅助计划任务 $($script:TaskName) 未注册——请在宿主机以管理员运行 install_usb_agent.ps1（会注册登录用户上下文的透传执行器）" }
+                continue
+            }
+            # 清空退出码状态文件，标记进行中，然后触发辅助任务
+            try { [System.IO.File]::WriteAllText($script:JobExitFile, 'running', $utf8NoBom) } catch { }
             $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
             $script:JobLogFile = Join-Path $Root "usb_agent_job_$ts.log"
-            # 历史任务日志只保留最近 5 份
-            Get-ChildItem -Path $Root -Filter 'usb_agent_job_*.log' -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-            # cmd /c 包装：stdout+stderr 合并重定向到任务日志，退出码透传
-            #（脚本内部已把控制台编码设为 UTF-8，日志中文正常）
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = 'cmd.exe'
-            $psi.Arguments = "/c powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ResetScript`" -Yes -SkipContainerRestart > `"$($script:JobLogFile)`" 2>&1"
-            $psi.WorkingDirectory = $Root
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            $script:JobProc = [System.Diagnostics.Process]::Start($psi)
             $script:JobExit = $null
             $script:JobStartedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
             $script:JobFinishedAt = $null
+            # 触发辅助计划任务（schtasks /Run 会让任务以它注册的用户身份运行）
+            $null = & schtasks.exe /Run /TN $script:TaskName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $script:JobExit = -1
+                $script:JobFinishedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                Send-Json $ctx 500 @{ ok = $false; error = "触发透传任务失败（schtasks /Run 退出码 $LASTEXITCODE），请检查计划任务 $($script:TaskName) 是否正常" }
+                continue
+            }
             Send-Json $ctx 200 @{ ok = $true; started = $true; started_at = $script:JobStartedAt }
             continue
         }
