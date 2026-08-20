@@ -202,10 +202,10 @@ def _signal_proc_stop(proc):
 
 
 # 旧预览进程强制回收宽限（秒）：发 stop 信号后允许其自行退出的时间上限。
-# 预览子进程可能卡在 pipe.wait_for_frames()/pipe.stop()（USB 异常时 C 库
-# 不返回），stop 信号送达也无法优雅退出；超过宽限必须 kill，否则相机被
-# 永久占用，后续所有采集启动都报 EBUSY。
-STREAM_EXIT_GRACE_SECONDS = 10.0
+# 预览子进程已跳过 pipe.stop()（usbip 下该调用卡死 10s+），正常 1~2s 即
+# 退出；若子进程卡在 wait_for_frames 等 C 库调用，超过宽限必须 kill，否则
+# 相机被永久占用，后续所有采集启动都报 EBUSY。
+STREAM_EXIT_GRACE_SECONDS = 5.0
 
 
 def _ensure_stream_exited(proc):

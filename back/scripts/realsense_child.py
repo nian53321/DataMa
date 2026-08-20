@@ -424,7 +424,11 @@ def cmd_stream(fps):
                 # color.get_data() 为 (h, w, 3) 的 BGR ndarray（bgr8 格式）
                 _emit_jpeg(_frame_array(color))
         finally:
-            pipe.stop()
+            # 不调用 pipe.stop()：该 C 库调用在 usbip 下实测可能卡死 10s+
+            # （每次预览→录制切换都触发父进程 10s 兜底 kill，总耗时十几秒）。
+            # 预览无持久数据，直接退出由内核关闭 USB fd 释放设备（释放约
+            # 1s，与父进程 kill 兜底路径一致，且已验证下次 pipe.start 正常）。
+            pass
         return 0
     except Exception as e:
         _safe_print(f"ERR {e}")
@@ -740,10 +744,10 @@ def cmd_record(path, fps):
                         pass  # 背压：帧同步记录非关键，丢弃
                 frame_idx += 1
         finally:
-            try:
-                pipe.stop()
-            except Exception:
-                pass
+            # 先不 pipe.stop()：与 stream 同理，该调用在 usbip 下可能卡死
+            # 10s+，拖慢收尾导致下一次"开始录制"长时间等待。数据收尾
+            # （ffmpeg flush / zstd finish / 元数据）不依赖设备停止；进程
+            # 退出时内核关闭 USB fd 释放设备，与预览 kill 兜底路径一致。
             stop_event.set()
             # 哨兵 → 写线程关闭 stdin → ffmpeg 读到 EOF 正常 flush 收尾
             for q in (color_q, depth_q, frames_q):
