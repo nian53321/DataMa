@@ -64,6 +64,10 @@ export const getSnapshotsApi = (params) => request.get('/data/snapshots', { para
 export const getSnapshotApi = (id) => request.get(`/data/snapshots/${id}`)
 export const rollbackSnapshotApi = (id) => request.post(`/data/snapshots/${id}/rollback`)
 
+// 预览导出范围：返回命中资产统计（总数/大小/类型分布/超限标志）与明细
+export const exportPreviewApi = (data) =>
+  request.post('/data/assets/export/preview', data)
+
 // 异步导出（三步流程）：start → 轮询 progress → download
 // 启动异步导出任务，返回 task_id
 export const exportStartApi = (data) =>

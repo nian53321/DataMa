@@ -38,7 +38,8 @@ class ExportService(BaseService):
     EXPORT_MAX_FILE_COUNT = 200
     EXPORT_MAX_TOTAL_SIZE = 2 * 1024 ** 3  # 2GB
 
-    def prepare_export(self, payload: dict, progress_callback=None) -> Tuple[str, str]:
+    def prepare_export(self, payload: dict, progress_callback=None,
+                       assets: List[DataAsset] = None) -> Tuple[str, str, list]:
         """准备导出 zip
 
         :param payload: {
@@ -53,16 +54,21 @@ class ExportService(BaseService):
             encrypted: bool              # 是否加密导出（默认 True）
         }
         :param progress_callback: 可选回调(processed, total, size_done, size_total)
-        :return: (zip_tmp_path, download_filename)
+        :param assets: 已解析并通过限额校验的资产列表（异步任务线程传入，
+                       避免与 resolve_assets 重复查询数据库）；缺省时内部解析
+        :return: (zip_tmp_path, download_filename, skipped_errors)
+            skipped_errors: 被跳过文件的明细列表（磁盘丢失/打包失败），
+            供任务状态展示与前端提示
         :raises ValidationError: 未选择资产 / 超过数量或大小限制
         :raises NotFoundError: 资产或文件不存在
         """
         encrypted = bool(payload.get("encrypted", True))
-        assets = self._resolve_assets(payload)
-        self._validate_limits(assets)
-        zip_path = self._build_zip(assets, encrypted, progress_callback=progress_callback)
-        self._log_audit(assets, encrypted)
-        return zip_path, self._build_filename(encrypted)
+        if assets is None:
+            assets = self._resolve_assets(payload)
+            self._validate_limits(assets)
+        zip_path, skipped = self._build_zip(assets, encrypted, progress_callback=progress_callback)
+        self._log_audit(assets, encrypted, skipped_count=len(skipped))
+        return zip_path, self._build_filename(encrypted), skipped
 
     def resolve_assets(self, payload: dict):
         """仅解析待导出资产（用于异步任务初始化，提前获取总数/总大小）"""
@@ -70,14 +76,59 @@ class ExportService(BaseService):
         self._validate_limits(assets)
         return assets
 
+    def preview_export(self, payload: dict, max_items: int = 200) -> dict:
+        """预览导出范围：命中资产统计 + 明细（不打包、不记审计日志）
+
+        供导出界面在选择条件变化时实时展示"将导出哪些数据资产"，
+        并提前暴露超限风险（文件数/总大小），避免用户提交后才被拒绝。
+        """
+        assets = self._resolve_assets(payload, require_nonempty=False)
+        total_count = len(assets)
+        total_size = sum(int(a.file_size or 0) for a in assets)
+
+        subject_ids = {a.subject_id for a in assets}
+        subjects = {}
+        if subject_ids:
+            subjects = {s.id: s for s in Subject.query.filter(Subject.id.in_(subject_ids)).all()}
+
+        by_type, by_layer = {}, {}
+        items = []
+        for a in assets:
+            dt = a.data_type.value if a.data_type else "unknown"
+            ly = a.layer.value if a.layer else "unknown"
+            by_type[dt] = by_type.get(dt, 0) + 1
+            by_layer[ly] = by_layer.get(ly, 0) + 1
+            if len(items) < max_items:
+                subject = subjects.get(a.subject_id)
+                items.append({
+                    "asset_id": a.id,
+                    "file_name": a.file_name,
+                    "data_type": dt,
+                    "layer": ly,
+                    "file_size": int(a.file_size or 0),
+                    "pseudo_id": subject.pseudo_id if subject else f"subject_{a.subject_id}",
+                })
+
+        return {
+            "total_count": total_count,
+            "total_size": total_size,
+            "exceeds_count_limit": total_count > self.EXPORT_MAX_FILE_COUNT,
+            "exceeds_size_limit": total_size > self.EXPORT_MAX_TOTAL_SIZE,
+            "max_file_count": self.EXPORT_MAX_FILE_COUNT,
+            "by_type": by_type,
+            "by_layer": by_layer,
+            "items": items,
+        }
+
     # ==================== 私有辅助 ====================
 
-    def _resolve_assets(self, payload: dict) -> List[DataAsset]:
+    def _resolve_assets(self, payload: dict, require_nonempty: bool = True) -> List[DataAsset]:
         """根据 payload 解析待导出资产列表
 
         优先使用 asset_ids；否则按 subject_ids/data_types/layers 批量筛选
         （为兼容旧调用方，单值 subject_id/data_type/layer 会自动并入复数集合）
-        空集合 = 不限制该维度（即"全部"）
+        :param require_nonempty: True 时无匹配资产抛 ValidationError（导出流程）；
+                                 False 时返回空列表（预览流程，前端显示"无匹配资产"）
         """
         asset_ids = payload.get("asset_ids") or []
         if asset_ids:
@@ -131,7 +182,7 @@ class ExportService(BaseService):
             query = query.filter(DataAsset.layer.in_(valid_layers))
 
         assets = query.order_by(DataAsset.created_at.desc()).all()
-        if not assets:
+        if not assets and require_nonempty:
             raise ValidationError("未选择任何数据资产")
         return assets
 
@@ -148,13 +199,14 @@ class ExportService(BaseService):
             )
 
     def _build_zip(self, assets: List[DataAsset], encrypted: bool,
-                   progress_callback=None) -> str:
+                   progress_callback=None) -> Tuple[str, list]:
         """构建 zip 临时文件
 
         - encrypted=True：原 DMEC 加密文件直接打包，arcname 追加 .dmec 后缀
         - encrypted=False：解密后打包原文件，arcname 不追加 .dmec
-        - 部分文件丢失：跳过，记入 errors（不写入 zip，仅用于审计）
+        - 部分文件丢失：跳过，记入 errors（不写入 zip，返回给调用方展示/审计）
         - progress_callback(processed, total, size_done, size_total)：可选进度回调
+        :return: (zip_tmp_path, skipped_errors)
         """
         storage_root = current_app.config["DATA_LAKE_DIR"]
         # 预加载受试者 pseudo_id（避免 N+1 查询）
@@ -232,9 +284,9 @@ class ExportService(BaseService):
             _remove_file_safely(zip_path)
             raise
 
-        return zip_path
+        return zip_path, errors
 
-    def _log_audit(self, assets: List[DataAsset], encrypted: bool):
+    def _log_audit(self, assets: List[DataAsset], encrypted: bool, skipped_count: int = 0):
         """记录导出审计日志（在 send_file 之前 commit）"""
         operator = self._operator_user()
         asset_ids = [a.id for a in assets]
@@ -247,13 +299,15 @@ class ExportService(BaseService):
         # 预加载 pseudo_id 用于日志
         subjects = {s.id: s for s in Subject.query.filter(Subject.id.in_(subject_ids)).all()}
         pseudo_ids = [subjects[sid].pseudo_id for sid in subject_ids if sid in subjects]
+        skipped_note = f"，跳过 {skipped_count} 个缺失文件" if skipped_count else ""
         log_operation(
             "export", "data_asset", ids_display,
             detail=(
                 f"导出 {len(assets)} 个数据资产"
                 f"（{'加密' if encrypted else '明文'}模式，"
                 f"总大小 {total_size / 1024 / 1024:.1f} MB，"
-                f"受试者: {', '.join(pseudo_ids[:10])}{'...' if len(pseudo_ids) > 10 else ''}）"
+                f"受试者: {', '.join(pseudo_ids[:10])}{'...' if len(pseudo_ids) > 10 else ''}"
+                f"{skipped_note}）"
             ),
             operator=operator,
         )
@@ -264,11 +318,6 @@ class ExportService(BaseService):
         mode = "encrypted" if encrypted else "plain"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"data_export_{mode}_{timestamp}.zip"
-
-    def _operator_username(self) -> str:
-        """获取操作员用户名"""
-        u = self._operator_user()
-        return u.username if u else "anonymous"
 
 
 # ==================== 异步导出任务管理 ====================
@@ -314,9 +363,9 @@ class ExportTaskManager:
             "processed_size": 0,
             "zip_path": "",
             "filename": "",
+            "skipped_files": 0,   # 因磁盘丢失/打包失败被跳过的文件数
             "error": "",
             "created_at": time.time(),
-            "downloaded": False,
         }
         with self._lock:
             self._tasks[task_id] = task
@@ -345,7 +394,7 @@ class ExportTaskManager:
                 svc = ExportService(operator_id=operator_id, operator_role=operator_role)
                 encrypted = bool(payload.get("encrypted", True))
 
-                # 先解析资产，获取总数/总大小
+                # 先解析资产，获取总数/总大小（结果传给 prepare_export 复用，避免重复查询）
                 assets = svc.resolve_assets(payload)
                 task["total_files"] = len(assets)
                 task["total_size"] = sum(int(a.file_size or 0) for a in assets)
@@ -361,12 +410,17 @@ class ExportTaskManager:
                         f"（{format_size(size_done)} / {format_size(size_total)}）"
                     )
 
-                zip_path, filename = svc.prepare_export(payload, progress_callback=on_progress)
+                zip_path, filename, skipped = svc.prepare_export(
+                    payload, progress_callback=on_progress, assets=assets)
                 task["zip_path"] = zip_path
                 task["filename"] = filename
+                task["skipped_files"] = len(skipped)
                 task["percent"] = 100
                 task["status"] = "success"
-                task["status_text"] = "压缩完成，准备下载"
+                if skipped:
+                    task["status_text"] = f"压缩完成（{len(skipped)} 个文件被跳过），准备下载"
+                else:
+                    task["status_text"] = "压缩完成，准备下载"
             except ValidationError as e:
                 # 业务校验错误（超限/未选择等）：消息可直接提示用户
                 task["status"] = "failed"
@@ -394,12 +448,11 @@ class ExportTaskManager:
             return dict(task)
 
     def download_task(self, task_id: str):
-        """获取任务结果（zip 路径 + 文件名），标记已下载"""
+        """获取任务结果（zip 路径 + 文件名）"""
         with self._lock:
             task = self._tasks.get(task_id)
             if not task or task["status"] != "success":
                 return None
-            task["downloaded"] = True
             return task["zip_path"], task["filename"]
 
     def cleanup_task(self, task_id: str):
@@ -432,6 +485,28 @@ class ExportTaskManager:
                 self._tasks.pop(tid, None)
                 if t.get("zip_path") and os.path.exists(t["zip_path"]):
                     _remove_file_safely(t["zip_path"])
+
+
+# ==================== 启动清扫 ====================
+
+def cleanup_orphan_export_zips(logger=None):
+    """应用启动时清扫残留的导出临时 zip
+
+    进程被 kill / 崩溃时 TTL 清理不会执行，export_*.zip 会残留在
+    系统临时目录（tempfile.gettempdir()），启动时统一删除。
+    仅适用于单进程部署：多 worker 下其他 worker 可能正在打包导出文件。
+    """
+    import glob
+    removed = 0
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "export_*.zip")):
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    if removed and logger:
+        logger.info("启动清扫：已删除 %d 个残留导出临时文件", removed)
+    return removed
 
 
 def format_size(bytes_val):

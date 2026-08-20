@@ -26,8 +26,9 @@ from app.extensions import db
 from app.models import Role, Subject, DataAsset, DataType, DataLayer
 from app.services import (
     SubjectService, AssetService, DataProcessingService, SnapshotService,
-    export_task_manager,
+    ExportService, export_task_manager,
 )
+from app.services.base import ValidationError
 from app.utils.response import success, fail
 from app.utils.media_auth import media_auth_required
 
@@ -569,6 +570,25 @@ def play_asset(asset_id):
     return resp
 
 
+@data_bp.route("/assets/export/preview", methods=["POST"])
+@role_required(Role.ADMIN)
+def export_assets_preview():
+    """预览导出范围（仅 ADMIN）
+
+    请求体与 /export/start 相同（subject_ids/data_types/layers），
+    返回命中资产的统计（总数/总大小/类型分布/超限标志）与明细列表，
+    不打包、不记审计日志。供导出界面实时展示"将导出哪些数据资产"。
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        result = ExportService(
+            operator_id=int(get_jwt_identity()), operator_role=current_role(),
+        ).preview_export(data)
+    except ValidationError as e:
+        return fail(str(e), 422)
+    return success(result)
+
+
 @data_bp.route("/assets/export/start", methods=["POST"])
 @role_required(Role.ADMIN)
 def export_assets_start():
@@ -604,12 +624,14 @@ def export_assets_progress(task_id):
         percent, status_text,
         total_files, processed_files,
         total_size, processed_size,
-        filename, error
+        skipped_files, filename, error
     }
+    zip_path 为服务器内部临时路径，不随进度接口返回（避免路径信息泄露）。
     """
     task = export_task_manager.get_task(task_id)
     if not task:
         return fail("任务不存在或已过期", 404)
+    task.pop("zip_path", None)
     return success(task)
 
 

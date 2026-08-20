@@ -347,6 +347,10 @@ def create_app(env=None):
     for sub in ("raw", "cleaned", "feature", "annotation"):
         os.makedirs(os.path.join(app.config["DATA_LAKE_DIR"], sub), exist_ok=True)
 
+    # 清扫上次进程异常退出残留的导出临时 zip（单进程部署）
+    from app.services.export_service import cleanup_orphan_export_zips
+    cleanup_orphan_export_zips(logger=app.logger)
+
     # 初始化文件加密主密钥（启用加密时自动生成 master.key）
     if app.config.get("ENCRYPT_DATA_LAKE", True):
         try:

@@ -690,6 +690,43 @@
                   </div>
                 </div>
 
+                <el-divider style="margin: 8px 0" />
+
+                <!-- 导出预览：命中资产统计 -->
+                <div style="margin-bottom: 16px">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
+                    <span style="font-weight: 600">导出预览</span>
+                    <el-tag v-if="exportPreview.loading" size="small" type="info">统计中...</el-tag>
+                    <el-button v-else size="small" text :icon="Refresh" style="padding: 0" @click="refreshExportPreview">刷新</el-button>
+                  </div>
+                  <div v-if="exportPreview.loaded">
+                    <div style="font-size: 13px; color: #606266">
+                      命中
+                      <b style="color: #409eff; font-size: 16px">{{ exportPreview.totalCount }}</b>
+                      个资产，共 <b>{{ formatFileSize(exportPreview.totalSize) }}</b>
+                    </div>
+                    <div v-if="exportPreview.totalCount === 0" style="font-size: 12px; color: #909399; margin-top: 4px">
+                      当前条件下没有可导出的数据资产
+                    </div>
+                    <div v-else style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px">
+                      <el-tag v-for="(count, type) in exportPreview.byType" :key="type" size="small" type="info">
+                        {{ exportTypeText(type) }} × {{ count }}
+                      </el-tag>
+                    </div>
+                  </div>
+                  <div v-else-if="!exportPreview.loading" style="font-size: 12px; color: #909399">
+                    预览加载失败，导出功能不受影响
+                  </div>
+                  <el-alert
+                    v-if="exportLimitWarning"
+                    type="warning"
+                    :closable="false"
+                    :title="exportLimitWarning"
+                    show-icon
+                    style="margin-top: 8px"
+                  />
+                </div>
+
                 <el-button
                   type="primary"
                   :icon="Download"
@@ -729,6 +766,53 @@
               </el-card>
             </el-col>
           </el-row>
+
+          <!-- 命中资产明细：展示当前条件下将导出的具体数据资产 -->
+          <el-card shadow="never" style="margin-top: 16px">
+            <template #header>
+              <div style="display: flex; justify-content: space-between; align-items: center">
+                <span>
+                  将导出的数据资产明细
+                  <span style="color: #909399; font-size: 12px; font-weight: normal; margin-left: 6px">
+                    共 {{ exportPreview.totalCount }} 条{{ exportPreview.items.length && exportPreview.items.length < exportPreview.totalCount ? `（仅显示前 ${exportPreview.items.length} 条）` : '' }}
+                  </span>
+                </span>
+                <el-tag v-if="exportPreview.loaded && exportPreview.totalCount > 0" size="small" type="info">
+                  {{ formatFileSize(exportPreview.totalSize) }}
+                </el-tag>
+              </div>
+            </template>
+            <el-table
+              v-loading="exportPreview.loading"
+              :data="exportPreview.items"
+              border
+              stripe
+              size="small"
+              height="280"
+            >
+              <el-table-column label="所属受试者" min-width="130" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.pseudo_id }}</template>
+              </el-table-column>
+              <el-table-column label="文件名" min-width="240" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.file_name || `资产 #${row.asset_id}` }}</template>
+              </el-table-column>
+              <el-table-column label="类型" width="80" align="center">
+                <template #default="{ row }">{{ exportTypeText(row.data_type) }}</template>
+              </el-table-column>
+              <el-table-column label="数据层" width="90" align="center">
+                <template #default="{ row }">{{ exportLayerText(row.layer) }}</template>
+              </el-table-column>
+              <el-table-column label="大小" width="90" align="right">
+                <template #default="{ row }">{{ formatFileSize(row.file_size) }}</template>
+              </el-table-column>
+              <template #empty>
+                <el-empty
+                  :description="exportPreview.loading ? '正在统计...' : '当前条件下没有可导出的数据资产'"
+                  :image-size="60"
+                />
+              </template>
+            </el-table>
+          </el-card>
         </el-tab-pane>
       </el-tabs>
 
@@ -1415,7 +1499,8 @@ import {
   getSubjectTemplateApi,
   saveSubjectTemplateApi,
 } from '@/api/system'
-import { getSubjectsApi, exportStartApi, exportProgressApi, exportDownloadApi } from '@/api/data'
+import { getSubjectsApi, exportStartApi, exportProgressApi, exportDownloadApi, exportPreviewApi } from '@/api/data'
+import { fetchAllPages } from '@/utils/fetchAll'
 import { fetchSignedUrlApi } from '@/api/media'
 import VersionHistoryDialog from '@/components/VersionHistoryDialog.vue'
 
@@ -2214,14 +2299,88 @@ const exportRiskTagType = (level) => {
 
 const loadExportSubjects = async () => {
   try {
-    const res = await getSubjectsApi({ page: 1, page_size: 1000 })
-    exportSubjectList.value = res.data.items || []
+    exportSubjectList.value = await fetchAllPages(getSubjectsApi)
   } catch (e) {
     ElMessage.error('加载受试者列表失败')
   }
 }
 
+// 导出预览：选择条件（受试者/类型/层）变化时实时展示命中的数据资产
+const exportPreview = reactive({
+  loading: false,
+  loaded: false,     // 是否已成功加载（区分"无匹配资产"与"未加载/失败"）
+  totalCount: 0,
+  totalSize: 0,
+  byType: {},
+  byLayer: {},
+  exceedsCountLimit: false,
+  exceedsSizeLimit: false,
+  items: [],
+})
+
+let _exportPreviewTimer = null
+const refreshExportPreview = () => {
+  if (_exportPreviewTimer) clearTimeout(_exportPreviewTimer)
+  _exportPreviewTimer = setTimeout(_doRefreshExportPreview, 400)
+}
+
+const _doRefreshExportPreview = async () => {
+  exportPreview.loading = true
+  try {
+    const res = await exportPreviewApi({
+      subject_ids: exportSelectedSubjects.value.map(s => s.id),
+      data_types: exportForm.data_types,
+      layers: exportForm.layers,
+    })
+    const d = res.data || {}
+    exportPreview.totalCount = d.total_count || 0
+    exportPreview.totalSize = d.total_size || 0
+    exportPreview.byType = d.by_type || {}
+    exportPreview.byLayer = d.by_layer || {}
+    exportPreview.exceedsCountLimit = !!d.exceeds_count_limit
+    exportPreview.exceedsSizeLimit = !!d.exceeds_size_limit
+    exportPreview.items = d.items || []
+    exportPreview.loaded = true
+  } catch {
+    exportPreview.loaded = false
+  } finally {
+    exportPreview.loading = false
+  }
+}
+
+watch(
+  [exportSelectedSubjects, () => exportForm.data_types, () => exportForm.layers],
+  refreshExportPreview,
+  { deep: true },
+)
+
+const exportTypeText = (t) => {
+  const opt = exportDataTypeOptions.find(o => o.value === t)
+  return opt ? opt.label.split(' ')[0] : t
+}
+const exportLayerText = (ly) => {
+  const m = { raw: '原始层', cleaned: '清洗层', feature: '特征层', annotation: '标注层' }
+  return m[ly] || ly
+}
+const exportLimitWarning = computed(() => {
+  const parts = []
+  if (exportPreview.exceedsCountLimit) parts.push('文件数超过上限 200 个')
+  if (exportPreview.exceedsSizeLimit) parts.push('总大小超过上限 2048 MB')
+  return parts.length ? `${parts.join('，')}，导出将被拒绝，请缩小范围分批导出` : ''
+})
+
 const handleExport = async () => {
+  // 未勾选受试者时后端按"全部受试者"导出，二次确认防误触全量导出
+  if (!exportSelectedSubjects.value.length) {
+    try {
+      await ElMessageBox.confirm(
+        '当前未勾选任何受试者，将导出系统中全部受试者的数据，可能耗时较长。确定继续吗？',
+        '全量导出确认',
+        { type: 'warning', confirmButtonText: '继续导出', cancelButtonText: '返回选择' }
+      )
+    } catch { return }
+  }
+
   // 重置进度
   exportProgress.visible = true
   exportProgress.percent = 0
@@ -2237,6 +2396,7 @@ const handleExport = async () => {
     exportProgressTimer.value = null
   }
 
+  let finishedTask = null
   try {
     const subject_ids = exportSelectedSubjects.value.map(s => s.id)
     // 1. 启动异步导出任务
@@ -2292,7 +2452,7 @@ const handleExport = async () => {
           reject(e)
         }
       }, 500)
-    })
+    }).then(task => { finishedTask = task })
 
     // 3. 下载 zip
     // 优先用短期签名 URL 直接导航下载（浏览器原生流式落盘，不整读内存，与后端流式响应配套）；
@@ -2325,7 +2485,12 @@ const handleExport = async () => {
 
     exportProgress.percent = 100
     exportProgress.status = '导出完成'
-    ElMessage.success('导出成功')
+    const skipped = finishedTask?.skipped_files || 0
+    if (skipped > 0) {
+      ElMessage.warning(`导出完成，但 ${skipped} 个文件因磁盘丢失或读取失败被跳过，详见操作日志`)
+    } else {
+      ElMessage.success('导出成功')
+    }
     setTimeout(() => { exportProgress.visible = false }, 3000)
   } catch (e) {
     exportProgress.status = '导出失败'
@@ -2536,6 +2701,10 @@ onBeforeUnmount(() => {
     _exportPollReject(new Error('页面已关闭，导出中断'))
     _exportPollReject = null
   }
+  if (_exportPreviewTimer) {
+    clearTimeout(_exportPreviewTimer)
+    _exportPreviewTimer = null
+  }
 })
 
 // 切换到脱敏配置 Tab 时加载配置
@@ -2548,6 +2717,7 @@ watch(activeTab, (val) => {
   }
   if (val === 'export') {
     loadExportSubjects()
+    refreshExportPreview()
   }
 })
 
