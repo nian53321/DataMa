@@ -11,6 +11,7 @@
 import os
 import re
 import json
+import time
 import logging
 import threading
 from datetime import datetime
@@ -46,6 +47,22 @@ _PSEUDO_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{3,64}$")
 
 # sex 字段数值到中文映射（0/1 二值）
 _SEX_MAP = {0: "男", 1: "女", "0": "男", "1": "女"}
+
+# 文件写入稳定窗口：mtime 距今不足该秒数的文件视为仍在写入
+_FILE_STABLE_SECONDS = 30
+
+
+def _is_file_writing(path):
+    """判断文件是否可能仍在被写入（mtime 距今过近）
+
+    外部采集工具向监控目录渐进写入文件，扫描线程可能读到半截密文，
+    此时解密必然失败（长度非 16 倍数 / PKCS7 去填充失败），
+    会被误报为"密钥不匹配"。mtime 很新的文件应推迟到下一轮扫描。
+    """
+    try:
+        return (time.time() - os.path.getmtime(path)) < _FILE_STABLE_SECONDS
+    except OSError:
+        return True  # stat 失败（文件被独占锁定/已删除）按仍在写入处理
 
 
 def _get_db_external_keys():
@@ -149,6 +166,13 @@ def _read_file_plaintext(src_path, failure_collector=None):
             except Exception as e:
                 last_error = e
 
+        # 解密失败时排除文件仍在写入的情况（仅扫描场景：collector 模式下静默
+        # 推迟到下一轮重试，半截密文解密必然失败，与密钥是否正确无关）。
+        # 手动上传接口走临时文件（刚创建，mtime 必然很新），不做此判断，
+        # 避免把真正的密钥错误误报为"文件仍在写入"
+        if failure_collector is not None and _is_file_writing(src_path):
+            return None  # 静默推迟，下一轮扫描自动重试
+
         # 数据库密钥全部失败或无可用密钥
         if not db_keys:
             last_error_msg = "数据库无可用外部密钥"
@@ -185,11 +209,15 @@ def _find_user_info(sub_dir, failure_collector=None):
     # 优先级 1: 明文 userInfo.json
     plain_path = os.path.join(sub_dir, "userInfo.json")
     if os.path.isfile(plain_path):
+        if _is_file_writing(plain_path):
+            return None, None  # 文件仍在写入，下一轮扫描再解析
         return plain_path, _parse_user_info(plain_path)
 
     # 优先级 2: 外部加密 userInfo.json.enc
     enc_path = os.path.join(sub_dir, "userInfo.json.enc")
     if os.path.isfile(enc_path):
+        if _is_file_writing(enc_path):
+            return None, None  # 文件仍在写入，下一轮扫描再解析
         try:
             plaintext = _read_file_plaintext(
                 enc_path, failure_collector=failure_collector,
@@ -212,6 +240,26 @@ def _find_user_info(sub_dir, failure_collector=None):
             return None, None
 
     return None, None
+
+
+def _backfill_subject_fields(subject, sub_dir, failure_collector=None):
+    """为已存在受试者补齐 userInfo 字段（仅填充空字段，不覆盖已有值）
+
+    场景：受试者首次扫描时 userInfo.json(.enc) 仍在写入，解析失败导致
+    受试者创建时缺失元数据。后续扫描检测到关键字段（年龄/性别）均为空
+    时重新解析并补齐，写入由调用方统一 commit。
+    """
+    if subject.age is not None or subject.gender:
+        return  # 已有 userInfo 数据，无需补齐
+    _, fields = _find_user_info(sub_dir, failure_collector=failure_collector)
+    if not fields:
+        return
+    for k, v in fields.items():
+        # pseudo_id 以目录名为准，不覆盖
+        if k == "pseudo_id":
+            continue
+        if getattr(subject, k, None) in (None, ""):
+            setattr(subject, k, v)
 
 
 
@@ -371,17 +419,27 @@ def scan_watch_dir(config):
                 # 检查是否已存在
                 existing = Subject.query.filter_by(pseudo_id=pseudo_id).first()
                 if existing:
-                    # 受试者已存在：检查是否有未导入的新类型文件（增量导入）
+                    # 受试者已存在：检查是否有未导入的新文件（增量导入）
                     if config.auto_upload_files:
-                        existing_types = {
-                            a.data_type.value for a in
-                            DataAsset.query.filter_by(subject_id=existing.id).all()
-                        }
+                        # 文件级增量去重：按（原始文件名+原始大小）跳过已导入文件，
+                        # 与 upload_asset 幂等键一致。之前解密失败/被推迟的文件
+                        # 不在集合中，下一轮自动重试（密钥补传后无需手动干预）
+                        existing_files = set()
+                        for a in DataAsset.query.filter_by(subject_id=existing.id).all():
+                            meta = a.metadata_json or {}
+                            existing_files.add(
+                                (meta.get("original_filename"), meta.get("original_size"))
+                            )
                         _import_files_for_subject(
                             sub_dir, existing,
-                            skip_data_types=existing_types,
+                            skip_files=existing_files,
                             failure_collector=result["failures"],
                         )
+                    # userInfo 字段自愈：首次扫描时 userInfo 尚在写入导致解析失败，
+                    # 受试者创建时无元数据；此处检测到关键字段为空则重新解析补齐
+                    _backfill_subject_fields(
+                        existing, sub_dir, failure_collector=result["failures"],
+                    )
                     continue
                 # 创建新受试者
                 subject = Subject(
@@ -432,7 +490,7 @@ def scan_watch_dir(config):
         _scan_run_lock.release()
 
 
-def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_collector=None):
+def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collector=None):
     """将子文件夹内的数据文件导入为数据资产
 
     自动适配三种源文件格式：
@@ -444,7 +502,10 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
     跳过 userInfo.json / userInfo.json.enc
     解密失败的文件记录到 failure_collector 并跳过（不中断扫描）
 
-    :param skip_data_types: 已导入的数据类型集合（set[str]），这些类型的文件将被跳过（增量导入去重）
+    :param skip_files: 已导入文件集合 {(original_filename, original_size), ...}，
+                       命中的文件跳过（文件级增量去重，与 upload_asset 幂等键一致）；
+                       未命中文件（含之前解密失败的）正常处理，实现失败自动重试
+    :param failure_collector: 失败信息收集列表（None 时不收集，直接抛异常）
     """
     from flask import current_app
     from app.utils.naming import get_naming_standard
@@ -476,6 +537,17 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
         # 跳过临时文件（Office 锁文件 ~$ 开头、. 开头的隐藏文件）
         if fname.startswith("~$") or fname.startswith("."):
             continue
+        # 文件仍在写入（mtime 过新）：本轮跳过，避免读到半截内容，
+        # 下一轮扫描文件稳定后再导入
+        if _is_file_writing(src_path):
+            continue
+        try:
+            src_size = os.path.getsize(src_path)
+        except OSError:
+            continue
+        # 增量导入去重：跳过已导入的文件（原始文件名+原始大小）
+        if skip_files and (fname, src_size) in skip_files:
+            continue
         # 剥离 .enc 后缀得到原始文件名（用于识别类型与应用命名规范）
         original_name = _strip_enc_suffix(fname)
         ext = original_name.rsplit(".", 1)[-1] if "." in original_name else ""
@@ -490,9 +562,6 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
             data_type = "scale"
         else:
             data_type = _detect_data_type(fname)
-        # 增量导入去重：跳过已导入的数据类型
-        if skip_data_types and data_type in skip_data_types:
-            continue
         # 应用命名规范（按模态精确匹配命名规范，回退到通用规范）
         new_name = original_name
         naming_std = get_naming_standard(data_type)
@@ -561,7 +630,6 @@ def _import_files_for_subject(sub_dir, subject, skip_data_types=None, failure_co
         rel_path = f"{layer_name}/{subject.pseudo_id}/{data_type}/{new_name}"
         # 元数据：记录原始文件名+大小（与 upload_asset 一致，支持幂等去重）
         # 眼动/量表数据额外解析 JSON 字段存入 metadata_json
-        src_size = os.path.getsize(src_path)
         asset_metadata = {
             "original_filename": fname,
             "original_size": src_size,

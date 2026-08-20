@@ -14,7 +14,9 @@ services:
       - GUNICORN_THREADS=16
       - GUNICORN_TIMEOUT=0
     volumes:
-      - backend-data:/app/data_lake
+      # 数据湖改为宿主机绑定挂载：容器内加密后的文件直接落盘到 ./back/data_lake
+      # （保持 raw/cleaned/feature/annotation 四层结构，见 README）
+      - ./back/data_lake:/app/data_lake
       - backend-logs:/app/logs
       - ./back/keys:/app/keys
       # 宿主机采集服务录制输出目录（后端需写入预览 mp4，故挂载为读写）
@@ -68,7 +70,7 @@ services:
     env_file:
       - ./back/.env
     volumes:
-      - backend-data:/app/data_lake
+      - ./back/data_lake:/app/data_lake
       - ./back/keys:/app/keys
     depends_on:
       redis:
@@ -86,6 +88,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  backend-data:
+  # backend-data 已改为宿主机绑定挂载 ./back/data_lake，不再使用命名卷
   backend-logs:
   mysql-data:
