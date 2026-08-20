@@ -3,8 +3,8 @@
     :model-value="modelValue"
     @update:model-value="$emit('update:modelValue', $event)"
     title="视频采集"
-    width="1280px"
-    top="4vh"
+    width="1100px"
+    top="3vh"
     :close-on-click-modal="false"
     @open="onOpen"
     @closed="onClosed"
@@ -1867,8 +1867,8 @@ const releaseCamera = () => {
   align-items: center;
   flex-wrap: wrap;
   gap: 4px;
-  margin-bottom: 12px;
-  padding: 8px 12px;
+  margin-bottom: 8px;
+  padding: 6px 12px;
   background: #f5f7fa;
   border-radius: 4px;
 }
@@ -1883,8 +1883,8 @@ const releaseCamera = () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 12px;
-  padding: 8px 12px;
+  margin-bottom: 8px;
+  padding: 6px 12px;
   background: #fdf6ec;
   border: 1px solid #faecd8;
   border-radius: 4px;
@@ -1894,8 +1894,8 @@ const releaseCamera = () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 12px;
-  padding: 8px 12px;
+  margin-bottom: 8px;
+  padding: 6px 12px;
   background: #ecf5ff;
   border: 1px solid #d9ecff;
   border-radius: 4px;
