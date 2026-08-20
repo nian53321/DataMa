@@ -225,6 +225,30 @@ def delete_asset(asset_id):
     return success(message="数据资产已删除")
 
 
+@data_bp.route("/assets/ingest-digest", methods=["POST"])
+@jwt_required()
+def assets_ingest_digest():
+    """按伪ID批量查询资产导入摘要（原始文件名+原始大小）
+
+    浏览器目录扫描增量去重的对账接口：前端 localStorage 的「已上传记录」
+    无法感知平台侧删除（资产删除/受试者级联删除），删除过的文件会被本地
+    记录永久判定为"已上传"而跳过。前端每次扫描前调用本接口对账，作废
+    后端已无对应资产的本地记录，使删除过的文件可重新入库。
+
+    请求：{"pseudo_ids": ["A001", ...]}
+    返回：{"A001": [["eeg_xxx.csv", 12345], ...], ...}
+    （不存在或已无资产的受试者不出现在结果中，前端均视为本地记录失效）
+    """
+    data = request.get_json(silent=True) or {}
+    pseudo_ids = data.get("pseudo_ids")
+    if not isinstance(pseudo_ids, list):
+        return fail("pseudo_ids 必须为列表", 422)
+    if len(pseudo_ids) > 2000:
+        return fail("pseudo_ids 数量超过上限 2000", 422)
+    result = _svc_asset().ingest_digest(pseudo_ids)
+    return success(result)
+
+
 @data_bp.route("/parse-userinfo", methods=["POST"])
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def parse_userinfo():

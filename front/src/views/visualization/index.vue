@@ -1138,22 +1138,21 @@ const toggleAllEegChannels = (show) => {
 }
 
 // 渲染真实 ECG 数据（单通道波形）
-// 后端返回结构：{ meta: { channels, sampleRate, duration, device, points }, data: [v1, v2, ...] }
+// 后端返回结构：{ meta: { channels, sampleRate, duration, device, points, baseline }, data: [[时间秒, 幅值], ...] }
 const updateEcgChart = (ecg) => {
   if (!ecg) return
   ecgMeta.value = ecg.meta || null
   if (!ecgChart) return
+  // 后端返回 [[时间秒, 幅值], ...]：时间轴已按采样率重建（降采样不压缩时间轴），
+  // 幅值已扣除 ADC 基线，波形围绕 0 展示
   const data = ecg.data || []
   if (!data.length) {
     ecgChart.setOption({ series: [] }, true)
     return
   }
-  const sr = ecg.meta?.sampleRate || 250
-  // X 轴为时间（秒），按采样率换算
-  const xData = data.map((_, i) => Number((i / sr).toFixed(3)))
   // 计算 Y 轴范围，给上下留 5% 余量
   let yMin = Infinity, yMax = -Infinity
-  for (const v of data) {
+  for (const [, v] of data) {
     if (v < yMin) yMin = v
     if (v > yMax) yMax = v
   }
@@ -1162,19 +1161,21 @@ const updateEcgChart = (ecg) => {
   ecgChart.setOption({
     tooltip: {
       trigger: 'axis',
-      valueFormatter: (v) => (v == null ? '' : Number(v).toFixed(3)),
+      valueFormatter: (v) => (Array.isArray(v) ? v[1]?.toFixed(3) : (v == null ? '' : Number(v).toFixed(3))),
     },
     grid: { left: 56, right: 16, top: 30, bottom: 40 },
     xAxis: {
-      type: 'category',
-      data: xData,
+      type: 'value',
+      min: 0,
+      max: ecg.meta?.duration || undefined,
       name: '时间(s)',
       nameLocation: 'middle',
       nameGap: 22,
+      axisLabel: { formatter: (v) => Number(v).toFixed(1) },
     },
     yAxis: {
       type: 'value',
-      name: 'mV',
+      name: '幅值',
       min: Number((yMin - pad).toFixed(3)),
       max: Number((yMax + pad).toFixed(3)),
       nameLocation: 'end',

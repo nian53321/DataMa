@@ -8,11 +8,14 @@
  * - 纯前端编排，文件通过 HTTP 上传，前后端可部署在不同设备
  * - 复用后端现有接口：/data/parse-userinfo、/data/subjects、/data/assets/upload
  * - 本地持久化「已上传文件记录」与「受试者缓存」，避免重复请求/上传
+ * - 每次扫描与后端资产摘要对账（/data/assets/ingest-digest），
+ *   作废平台侧已删除的资产/受试者对应的本地记录，保证删除过的文件可重新入库
  * - 后端 upload_asset 本身有幂等去重（同受试者+同模态+同原始文件名+同原始大小），双保险
  */
 import { scanDirectory, verifyPermission, diffFiles } from '@/utils/dirWatcher'
 import {
   parseUserInfoApi, createSubjectApi, uploadAssetApi, getSubjectsApi,
+  getIngestDigestApi,
 } from '@/api/data'
 
 // 伪ID合法格式：3-64位字母/数字/下划线/短横线（与后端 scanner 一致）
@@ -127,14 +130,14 @@ export async function loadSubjectCache() {
   return _subjectCache
 }
 
-/** 从缓存或后端查询受试者ID */
+/** 从后端实时确认受试者ID（不信任本地缓存，处理"受试者已被删除"场景） */
 async function resolveSubjectId(pseudoId) {
-  if (_subjectCache && _subjectCache[pseudoId]) return _subjectCache[pseudoId]
-  // 缓存未命中：按关键词查并精确比对 pseudo_id
+  // 受试者可能在平台被删除后需重新扫描创建：本地缓存里的旧 id 已失效，
+  // 必须实时向后端确认该伪ID是否仍存在——存在返回 id，不存在返回 null（走"新建受试者"分支）。
   const res = await getSubjectsApi({ page: 1, page_size: 50, keyword: pseudoId })
   const hit = (res.data?.items || []).find((s) => s.pseudo_id === pseudoId)
   const id = hit?.id || null
-  if (_subjectCache) _subjectCache[pseudoId] = id // 回填缓存
+  if (_subjectCache) _subjectCache[pseudoId] = id // 回填缓存（仅作展示，不再影响存在性判断）
   return id
 }
 
@@ -174,6 +177,47 @@ export function saveUploadedMap(map) {
       for (const k of keys.slice(-1000)) trimmed[k] = map[k]
       localStorage.setItem(UPLOADED_KEY, JSON.stringify(trimmed))
     } catch { /* 仍失败则放弃持久化 */ }
+  }
+}
+
+// ==================== 与后端资产对账 ====================
+
+/**
+ * 作废「后端已不存在对应资产」的本地已上传记录（就地修改 effectiveMap）
+ *
+ * localStorage 的已上传记录无法感知平台侧删除动作：资产删除/受试者级联
+ * 删除后，磁盘上未变化的文件仍会命中本地记录被 diff 跳过，表现为
+ * "删除过的文件再也扫不到"。按（原始文件名+原始大小，与后端 upload_asset
+ * 幂等键一致）与后端资产摘要对账，失效记录作废后由 diffFiles 重新发现：
+ * - 单个资产被删 → 该文件重新上传入库
+ * - 受试者被删（级联删资产）→ 该受试者全部记录作废，触发重建受试者 + 全量上传
+ *
+ * 对账失败（网络错误/旧版后端无此接口）时静默降级为纯本地增量，不阻断扫描。
+ */
+async function reconcileUploadedMap(effectiveMap) {
+  const paths = Object.keys(effectiveMap)
+  if (!paths.length) return
+  const pseudoIds = [...new Set(
+    paths.map((p) => p.split('/')[0]).filter(Boolean)
+  )]
+  let digest
+  try {
+    const res = await getIngestDigestApi(pseudoIds)
+    digest = res.data || {}
+  } catch {
+    return
+  }
+  for (const p of paths) {
+    const segs = p.split('/')
+    const entries = digest[segs[0]]
+    const fname = segs[segs.length - 1]
+    const { size } = effectiveMap[p]
+    // 摘要条目缺 original_size（老数据）时仅按文件名匹配，保守视为仍在库，
+    // 避免作废重传与库内既有资产形成重复记录
+    const hit = Array.isArray(entries) && entries.some(
+      ([fn, sz]) => fn === fname && (sz == null || sz === size)
+    )
+    if (!hit) delete effectiveMap[p]
   }
 }
 
@@ -217,6 +261,16 @@ export async function runScanFromFiles(allFiles, options = {}) {
 
   // 3. diff 出新增/变更文件（增量扫描，避免全量重传）
   const effectiveMap = { ...uploadedMap }
+  // 清理已上传记录中「当前扫描树已不存在」的路径（目录/文件被删除、受试者目录被移除等）。
+  // 若不清理，陈旧记录会让删除后重新出现的同名目录/文件被永久判定为"已上传"而跳过，
+  // 表现为"目录删掉后重新扫描扫不到"。这里每次扫描同步一次，记录只保留当前仍存在的文件。
+  const currentPaths = new Set(allFiles.map((f) => f.path))
+  for (const p of Object.keys(effectiveMap)) {
+    if (!currentPaths.has(p)) delete effectiveMap[p]
+  }
+  // 与后端资产对账：平台侧删除过的资产/受试者，本地记录未感知会永久跳过
+  // 这些文件，作废失效记录后由 diff 重新发现（重新上传入库/重建受试者）
+  await reconcileUploadedMap(effectiveMap)
   const newFiles = diffFiles(allFiles, effectiveMap)
 
   if (!newFiles.length) {

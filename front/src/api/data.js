@@ -25,6 +25,10 @@ export const uploadAssetApi = (formData, onProgress) =>
     timeout: 0, // 不超时，大文件（视频等）上传不受 30s 限制
   })
 
+// 按伪ID批量查询资产导入摘要（浏览器扫描对账：识别平台侧已删除的资产/受试者）
+export const getIngestDigestApi = (pseudoIds) =>
+  request.post('/data/assets/ingest-digest', { pseudo_ids: pseudoIds })
+
 // 解析 userInfo.json 文件（支持明文/外部加密），返回受试者字段映射
 export const parseUserInfoApi = (formData) =>
   request.post('/data/parse-userinfo', formData, {

@@ -446,21 +446,61 @@ def ecg_asset_parse(asset_id):
         if total == 0:
             return fail("CSV 无有效数据行", 422)
 
-        # 降采样到最多 2000 点
-        max_points = 2000
-        step = max(1, total // max_points)
-        downsampled = [round(data_values[i], 2) for i in range(0, total, step)]
-
         # 计算采样率和时长
         sample_rate = 0
         duration_sec = 0
+        exact_rate = 250.0
         if len(time_values) >= 2:
             dt = time_values[-1] - time_values[0]
             duration_sec = round(dt, 2)
             if dt > 0:
                 sample_rate = round(total / dt)
+                # 时间轴用未取整的精确采样率，避免整条轴末端
+                # 偏离 duration 被 X 轴 max 裁剪
+                exact_rate = total / dt
         elif total > 1:
             sample_rate = 250  # 默认假设
+
+        # 基线校正：value 为 ADC 原始计数（12bit，基线约 2048），
+        # 直接绘制会把波形整体抬到 2048 附近且 Y 轴单位失真。
+        # 减去中位数基线（对 R 波尖峰鲁棒），使波形围绕 0 展示
+        sorted_vals = sorted(data_values)
+        mid = total // 2
+        baseline = ((sorted_vals[mid - 1] + sorted_vals[mid]) / 2
+                    if total % 2 == 0 else sorted_vals[mid])
+
+        # 均匀时间轴：time_sec 列存在抖动（相邻间隔微秒级且偶有负值），
+        # 按精确采样率以采样序号重建时间轴，保证时间跨度与真实时长一致
+        rate = exact_rate
+
+        # 降采样：min-max 桶聚合。心电 R 波是窄尖峰，跨步采样（每 N 点取 1）
+        # 会削平/混叠尖峰；每桶按时间顺序输出最小值与最大值两点，
+        # 完整保留波形包络。返回 [[时间秒, 幅值], ...] 数据对
+        max_buckets = 2000
+        points = []
+        if total <= max_buckets:
+            for i in range(total):
+                points.append([round(i / rate, 4),
+                               round(data_values[i] - baseline, 2)])
+        else:
+            bucket = total / max_buckets
+            for b in range(max_buckets):
+                start = int(b * bucket)
+                end = min(int((b + 1) * bucket), total)
+                if start >= end:
+                    continue
+                seg = data_values[start:end]
+                vmin, vmax = min(seg), max(seg)
+                if vmin == vmax:
+                    points.append([round(start / rate, 4), round(vmin - baseline, 2)])
+                    continue
+                # 桶内极值按原始时间顺序输出，保持包络的时序形态
+                pair = sorted([
+                    (start + seg.index(vmin), vmin),
+                    (start + seg.index(vmax), vmax),
+                ])
+                for idx, v in pair:
+                    points.append([round(idx / rate, 4), round(v - baseline, 2)])
 
         return success({
             "meta": {
@@ -468,9 +508,10 @@ def ecg_asset_parse(asset_id):
                 "sampleRate": sample_rate,
                 "duration": duration_sec,
                 "device": "CSV",
-                "points": len(downsampled),
+                "points": total,
+                "baseline": round(baseline, 2),
             },
-            "data": downsampled,
+            "data": points,
         })
     except (ValueError, IndexError) as e:
         current_app.logger.warning("心电文件解析失败: %s", e)

@@ -129,24 +129,31 @@ export async function pickDirectory() {
 export async function scanDirectory(handle) {
   const files = []
   async function walk(dirHandle, prefix = '') {
-    for await (const entry of dirHandle.values()) {
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name
-      if (entry.kind === 'file') {
-        try {
-          const file = await entry.getFile()
-          files.push({
-            file,
-            path,
-            name: entry.name,
-            size: file.size,
-            lastModified: file.lastModified,
-          })
-        } catch {
-          // 单个文件读取失败（权限/占用），跳过不中断整体扫描
+    // 对当前目录整体容错：目录被删除/权限不足/句柄失效时跳过该子树，
+    // 不中断整棵目录扫描（否则删除某个受试者子目录会让后续全部扫不到）
+    try {
+      for await (const entry of dirHandle.values()) {
+        const path = prefix ? `${prefix}/${entry.name}` : entry.name
+        if (entry.kind === 'file') {
+          try {
+            const file = await entry.getFile()
+            files.push({
+              file,
+              path,
+              name: entry.name,
+              size: file.size,
+              lastModified: file.lastModified,
+            })
+          } catch {
+            // 单个文件读取失败（权限/占用），跳过不中断整体扫描
+          }
+        } else if (entry.kind === 'directory') {
+          // 子目录单独容错：该子目录被删除/失效时不向上抛，直接跳过
+          await walk(entry, path).catch(() => {})
         }
-      } else if (entry.kind === 'directory') {
-        await walk(entry, path)
       }
+    } catch {
+      // 当前目录不可访问（已删除/句柄失效），跳过该子树
     }
   }
   await walk(handle)

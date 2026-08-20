@@ -163,15 +163,15 @@
       >
         <el-table-column type="selection" width="44" />
         <el-table-column prop="pseudo_id" label="伪ID" min-width="170" show-overflow-tooltip />
-        <el-table-column prop="real_name" label="姓名" width="110" show-overflow-tooltip>
+        <el-table-column prop="real_name" label="姓名" width="110" show-overflow-tooltip align="center" header-align="center">
           <template #default="{ row }">{{ row.real_name || '—' }}</template>
         </el-table-column>
         <el-table-column prop="age" label="年龄" width="60" align="center" header-align="center" />
         <el-table-column prop="gender" label="性别" width="60" align="center" header-align="center" />
-        <el-table-column prop="phone" label="联系电话" min-width="100" show-overflow-tooltip header-align="center">
+        <el-table-column prop="phone" label="联系电话" min-width="100" show-overflow-tooltip align="center" header-align="center">
           <template #default="{ row }">{{ row.phone || '—' }}</template>
         </el-table-column>
-        <el-table-column prop="id_card" label="身份证号" min-width="120" show-overflow-tooltip header-align="center">
+        <el-table-column prop="id_card" label="身份证号" min-width="120" show-overflow-tooltip align="center" header-align="center">
           <template #default="{ row }">{{ row.id_card || '—' }}</template>
         </el-table-column>
         <el-table-column prop="cognitive_risk_level" label="认知风险分级" width="120" align="center" header-align="center">
@@ -179,19 +179,19 @@
             <el-tag size="small" :type="riskTagType(row.cognitive_risk_level)">{{ riskText(row.cognitive_risk_level) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="mmse_score" label="MMSE" width="60" align="center" header-align="center">
+        <el-table-column prop="mmse_score" label="MMSE" width="70" align="center" header-align="center">
           <template #default="{ row }">{{ row.mmse_score ?? '—' }}</template>
         </el-table-column>
-        <el-table-column prop="moca_score" label="MoCA" width="60" align="center" header-align="center">
+        <el-table-column prop="moca_score" label="MoCA" width="70" align="center" header-align="center">
           <template #default="{ row }">{{ row.moca_score ?? '—' }}</template>
         </el-table-column>
-        <el-table-column prop="ad8_score" label="AD8" width="60" align="center" header-align="center">
+        <el-table-column prop="ad8_score" label="AD8" width="70" align="center" header-align="center">
           <template #default="{ row }">{{ row.ad8_score ?? '—' }}</template>
         </el-table-column>
-        <el-table-column prop="collection_batch" label="批次" width="100" show-overflow-tooltip header-align="center">
+        <el-table-column prop="collection_batch" label="批次" width="100" show-overflow-tooltip align="center" header-align="center">
           <template #default="{ row }">{{ row.collection_batch || '—' }}</template>
         </el-table-column>
-        <el-table-column prop="collection_scene" label="场景" width="100" show-overflow-tooltip header-align="center">
+        <el-table-column prop="collection_scene" label="场景" width="100" show-overflow-tooltip align="center" header-align="center">
           <template #default="{ row }">{{ row.collection_scene || '—' }}</template>
         </el-table-column>
         <el-table-column label="视频采集" width="120" align="center" header-align="center">
@@ -213,7 +213,7 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column prop="created_at" label="创建时间" min-width="150" show-overflow-tooltip header-align="center" />
+        <el-table-column prop="created_at" label="创建时间" min-width="150" show-overflow-tooltip align="center" header-align="center" />
         <el-table-column label="操作" min-width="360" fixed="right">
           <template #default="{ row }">
             <div style="white-space: nowrap">

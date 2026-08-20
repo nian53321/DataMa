@@ -47,7 +47,7 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
 
   const setOnScanComplete = (fn) => { _onScanComplete = fn }
 
-  /** 初始化：恢复持久化的目录句柄与已上传记录（不自动启动扫描） */
+  /** 初始化：恢复持久化的目录句柄与已上传记录（增量去重，避免全量重传） */
   const init = async () => {
     if (!state.supported) return
     _uploadedMap = loadUploadedMap()
@@ -94,8 +94,9 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
       state.totalNewSubjects = 0
       state.totalUploaded = 0
       state.failures = []
-      _uploadedMap = {}
-      saveUploadedMap(_uploadedMap)
+      // 不重置「已上传文件记录」：避免重新选目录导致所有文件全量重传。
+      // 换成新目录后，不存在于新目录的旧路径会被 runScanFromFiles 的失效清理自动移除，
+      // 只会上传真正的新增/重放文件。
       state.pendingRestore = false
       // 重新选择目录视为新的开始：清除"主动停止"标志
       localStorage.removeItem(USER_STOPPED_KEY)
@@ -128,6 +129,8 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
     state.progress = { phase: 'scan', current: 0, total: 0, currentFile: '扫描目录…' }
     try {
       const result = await runBrowserScan(state.handle, {
+        // 增量扫描：带上已上传记录做 diff（正常文件跳过不重传）；
+        // 目录/文件删除后记录在 runScanFromFiles 内自动失效，重放后能重新入库
         uploadedMap: _uploadedMap,
         collectionBatch: state.collectionBatch || undefined,
         collectionScene: state.collectionScene || undefined,

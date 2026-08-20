@@ -62,17 +62,17 @@
           RealSense 深度相机
         </el-radio-button>
       </el-radio-group>
-      <el-tag v-if="deviceSource === 'orbbec'" size="small" type="success" style="margin-left: 8px">
+      <el-tag v-if="deviceSource === 'orbbec'" size="small" type="success">
         序列号：{{ orbbecSerial || '—' }}
       </el-tag>
-      <el-tag v-if="deviceSource === 'realsense'" size="small" type="success" style="margin-left: 8px">
+      <el-tag v-if="deviceSource === 'realsense'" size="small" type="success">
         序列号：{{ realSenseSerial || '—' }}
       </el-tag>
-      <el-tag v-if="orbbecChecked && !orbbecAvailable" size="small" type="info" style="margin-left: 8px">
-        Orbbec 深度相机未检测到
+      <el-tag v-if="orbbecChecked && !orbbecAvailable" size="small" type="info">
+        Orbbec 未检测到
       </el-tag>
-      <el-tag v-if="realSenseChecked && !realSenseAvailable" size="small" type="info" style="margin-left: 8px">
-        RealSense 深度相机未检测到
+      <el-tag v-if="realSenseChecked && !realSenseAvailable" size="small" type="info">
+        RealSense 未检测到
       </el-tag>
       <!-- 普通摄像头：设备选择（深度相机 RGB 亦作为普通摄像头列出） -->
       <template v-if="deviceSource === 'webcam'">
@@ -81,7 +81,7 @@
         <el-select
           v-model="selectedDeviceId"
           size="small"
-          style="width: 280px"
+          style="width: 200px"
           placeholder="选择摄像头"
           :disabled="phase === 'recording' || phase === 'paused'"
           @change="onDeviceChange"
@@ -1893,13 +1893,27 @@ const releaseCamera = () => {
 .source-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-bottom: 8px;
   padding: 6px 12px;
   background: #ecf5ff;
   border: 1px solid #d9ecff;
   border-radius: 4px;
   flex-wrap: wrap;
+}
+
+/* 设备源/摄像头栏紧凑化：压缩 radio 按钮与分隔线间距，使整行在弹窗宽度内单行排下 */
+.source-bar :deep(.el-radio-button__inner) {
+  padding: 8px 12px;
+}
+.source-bar :deep(.el-radio-group) {
+  white-space: nowrap;
+}
+.source-bar :deep(.el-divider--vertical) {
+  margin: 0 2px;
+}
+.source-bar :deep(.el-select) {
+  min-width: 140px;
 }
 
 .type-label {

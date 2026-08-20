@@ -12,7 +12,11 @@
 - 列表按角色脱敏（admin 不脱敏）
 """
 import os
+import logging
+import shutil
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from app.extensions import db
 from app.models import Subject, DataAsset, DataType
@@ -229,6 +233,25 @@ class SubjectService(BaseService):
         for file_path, transcode_path in pending_files:
             _remove_file_safely(file_path)
             _remove_file_safely(transcode_path)
+        # 清理该受试者在数据湖各分层下的目录（含上述 remove 后的空目录，
+        # 以及无资产记录/游离文件），避免 data_lake 残留
+        self._remove_subject_datalake_dirs(storage_root, pseudo_id)
+
+    def _remove_subject_datalake_dirs(self, storage_root: str, pseudo_id: str):
+        """删除受试者在数据湖各分层（raw/cleaned/feature/annotation）下的整目录
+
+        DB 提交成功后才执行，best-effort：目录不存在/被占用时仅记录，不抛错。
+        pseudo_id 在创建时已过格式校验（3-64 位字母/数字/下划线/短横线，无路径穿越），
+        因此 join 出的 target 是安全可控的受试者专属目录。
+        """
+        for layer in ("raw", "cleaned", "feature", "annotation"):
+            target = os.path.join(storage_root, layer, pseudo_id)
+            if not os.path.isdir(target):
+                continue
+            try:
+                shutil.rmtree(target)
+            except OSError:
+                logger.exception("删除受试者数据湖目录失败: %s", target)
 
     def _operator_user(self):
         """获取操作员 User 对象（用于审计日志与快照）

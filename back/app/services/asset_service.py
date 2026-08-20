@@ -176,6 +176,39 @@ class AssetService(BaseService):
         _remove_file_safely(pending_files[0])
         _remove_file_safely(pending_files[1])
 
+    def ingest_digest(self, pseudo_ids: list, chunk_size: int = 500):
+        """按伪ID批量返回资产导入摘要 {pseudo_id: [[original_filename, original_size], ...]}
+
+        浏览器目录扫描增量去重的对账数据源：前端 localStorage 的「已上传记录」
+        无法感知平台侧删除动作（资产删除 / 受试者级联删除），删除过的文件会被
+        本地记录永久判定为"已上传"而跳过。前端每次扫描前调用本接口对账，
+        作废后端已不存在对应资产的本地记录，使删除过的文件可重新入库。
+
+        无 original_filename 的资产（手动登记等）不参与摘要：此类资产本就不在
+        上传幂等键覆盖范围内，浏览器扫描重传时会按既有幂等规则新建记录。
+        """
+        cleaned = [str(p).strip() for p in (pseudo_ids or []) if p and str(p).strip()]
+        if not cleaned:
+            return {}
+        # in 查询分批执行，避免超长 SQL
+        digest = {}
+        for i in range(0, len(cleaned), chunk_size):
+            chunk = cleaned[i:i + chunk_size]
+            rows = (
+                db.session.query(Subject.pseudo_id, DataAsset.metadata_json)
+                .join(DataAsset, DataAsset.subject_id == Subject.id)
+                .filter(Subject.pseudo_id.in_(chunk))
+                .all()
+            )
+            for pseudo_id, meta in rows:
+                fn = (meta or {}).get("original_filename")
+                if fn is None:
+                    continue
+                digest.setdefault(pseudo_id, []).append(
+                    [fn, (meta or {}).get("original_size")]
+                )
+        return digest
+
     def batch_create_assets(self, subject_id: int, items: list):
         """批量登记数据资产（支持整个文件夹导入）"""
         if not subject_id:

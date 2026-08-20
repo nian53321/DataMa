@@ -27,7 +27,7 @@ from app.utils.crypto import (
     is_external_encrypted_file,
     decrypt_external_file_auto,
 )
-from app.utils.naming import apply_naming_standard
+from app.utils.naming import apply_naming_standard, _safe_segment, BEIJING_TZ
 from app.utils.eye_tracking_adapter import (
     load_sync_data, is_sync_data_file,
 )
@@ -561,7 +561,8 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
         # 量表数据（MoCA/MMSE/AD8 等）→ data_type=scale, layer=feature
         is_scale = is_scale_data_file(original_name)
         # userInfo 元数据文件：剥离 .enc 后若为 userInfo.json，作为 json 资产入库
-        # （保留原名，不套命名规范便于识别；内容与其他模态同样 DMEC 加密落盘）
+        # （重命名时显式加上 "userInfo" 标识词并附伪ID/日期，便于在数据资产中识别这是
+        #   哪个受试者的 userInfo JSON；内容与其他模态同样 DMEC 加密落盘）
         is_userinfo = original_name.lower() == "userinfo.json"
         if is_userinfo:
             data_type = "json"
@@ -571,7 +572,7 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
             data_type = "scale"
         else:
             data_type = _detect_data_type(fname)
-        # 应用命名规范（按模态精确匹配命名规范，回退到通用规范）；userInfo 保留原名
+        # 应用命名规范（按模态精确匹配命名规范，回退到通用规范）；userInfo 单独命名
         new_name = original_name
         naming_std = None if is_userinfo else get_naming_standard(data_type)
         if naming_std:
@@ -591,6 +592,14 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
                     ext = norm_ext
             except Exception:
                 new_name = original_name
+        # userInfo 文件：文件名显式带上 "userInfo" 标识词 + 伪ID + 日期，
+        # 让人一看就知道这是哪个受试者的 userInfo JSON（不再使用笼统的 userInfo.json）
+        if is_userinfo:
+            new_name = "userInfo_{}_{}.json".format(
+                _safe_segment(subject.pseudo_id) if subject else "NA",
+                datetime.now(BEIJING_TZ).strftime("%Y%m%d"),
+            )
+            ext = "json"
 
         # 根据数据类型选择存储目录和分层
         # 目录结构: data_lake/{layer}/{pseudo_id}/{data_type}/{filename}，与 upload_asset 保持一致
