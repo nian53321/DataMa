@@ -17,7 +17,7 @@
   depth_raw.zst     原始深度序列（DZST v2：量化+差分 zstd 压缩，解码后为毫米深度值，供分析）
   frames.jsonl      逐帧同步记录（MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
   calibration.json  相机标定（depth_scale / RGB 内参 / 畸变 / 分辨率 / 序列号 / 对齐状态）
-  meta.json         序列号 / 分辨率 / 帧时间戳 / 编码信息
+  meta.json         序列号 / 分辨率 / 编码信息（逐帧数据在 frames.jsonl）
 
 子命令：
   probe                        探测设备，输出 "OK <count> <serial>" 与 "DETAIL <json>"
@@ -27,6 +27,7 @@
 import os
 import queue
 import sys
+import tempfile
 import threading
 from datetime import datetime
 
@@ -50,6 +51,36 @@ _STREAM_COMBOS = (
     (848, 480, 848, 480),
     (640, 480, 640, 480),
 )
+
+# 上次启动成功的流组合缓存（fps+分辨率，见 _start_pipeline）：USB2 链路下降级链
+# 前面的组合必然失败，每次失败重试含 USB 带宽协商（usbip 下数秒）；缓存命中后
+# 一次 pipe.start 即成功。存 /tmp，容器重建自动失效（USB 链路升级后重新协商）。
+_COMBO_CACHE = os.path.join(tempfile.gettempdir(), "realsense_combo.json")
+
+
+def _load_combo_cache():
+    """读取上次成功的 (fps, cw, ch, dw, dh)；无缓存/损坏/不在合法组合内返回 None"""
+    import json
+    try:
+        with open(_COMBO_CACHE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        combo = (int(d["fps"]), int(d["cw"]), int(d["ch"]), int(d["dw"]), int(d["dh"]))
+        if combo[0] in (60, 30, 15, 5) and combo[1:] in _STREAM_COMBOS:
+            return combo
+    except Exception:
+        pass
+    return None
+
+
+def _save_combo_cache(combo):
+    """记录本次成功的流组合，供下次启动优先尝试"""
+    import json
+    try:
+        with open(_COMBO_CACHE, "w", encoding="utf-8") as f:
+            json.dump({"fps": combo[0], "cw": combo[1], "ch": combo[2],
+                       "dw": combo[3], "dh": combo[4]}, f)
+    except Exception:
+        pass
 
 # 保存原始 stdout 的 fd，供 C 库日志重定向后仍能输出结果/帧
 _saved_stdout_fd = None
@@ -132,25 +163,37 @@ def _start_pipeline(rs, fps):
     帧率优先：先以请求 fps 试所有分辨率（USB2 内 640x480@30 约 46MB/s 可命中），
     全失败再降 fps（15fps 命中 848x480，5fps 才跑得起原生 1280x800）。
 
+    上次成功组合优先尝试（缓存于 _COMBO_CACHE）：降级链前面的组合在 USB2 下
+    每次启动都要重复失败重试，缓存命中后一次 pipe.start 即成功。
+
     返回 (pipeline, profile, color_w, color_h, depth_w, depth_h, actual_fps)；
     profile 用于读取实际设备信息（型号/固件/深度缩放）。所有组合均失败时抛异常。
     """
+    chain = [(f, cw, ch, dw, dh)
+             for f in _fps_chain(fps)
+             for (cw, ch, dw, dh) in _STREAM_COMBOS]
+    cached = _load_combo_cache()
+    # cached in chain 隐含 cached fps <= 请求 fps（chain 只含请求 fps 及以下档位）
+    if cached in chain:
+        attempts = [cached] + [c for c in chain if c != cached]
+    else:
+        attempts = chain
     last_err = None
-    for f in _fps_chain(fps):
-        for (cw, ch, dw, dh) in _STREAM_COMBOS:
-            pipe = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
-            cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, f)
+    for (f, cw, ch, dw, dh) in attempts:
+        pipe = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
+        cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, f)
+        try:
+            profile = pipe.start(cfg)
+            _save_combo_cache((f, cw, ch, dw, dh))
+            return pipe, profile, cw, ch, dw, dh, f
+        except Exception as e:
+            last_err = e
             try:
-                profile = pipe.start(cfg)
-                return pipe, profile, cw, ch, dw, dh, f
-            except Exception as e:
-                last_err = e
-                try:
-                    pipe.stop()
-                except Exception:
-                    pass
+                pipe.stop()
+            except Exception:
+                pass
     raise RuntimeError(f"启动 RealSense 相机失败（{last_err}）")
 
 
@@ -271,7 +314,9 @@ def cmd_stream(fps):
         rs = _import_rs()
         count, _serial = _query_devices()
         if count == 0:
-            _emit_jpeg(_placeholder_frame("未检测到 RealSense 相机"))
+            # 输出 ERR 让父进程立即失败（父进程 _wait_child_ready 只认 READY/ERR 行，
+            # 若此处输出占位 JPEG 帧，父进程会等满 15s 超时才报"相机启动超时"）
+            _safe_print("ERR 未检测到 RealSense 相机")
             return 1
         pipe, profile, cw, ch, dw, dh, actual_fps = _start_pipeline(rs, int(fps))
 
@@ -303,15 +348,6 @@ def cmd_stream(fps):
     except Exception as e:
         _safe_print(f"ERR {e}")
         return 1
-
-
-def _placeholder_frame(text):
-    """生成一张深灰色占位提示帧（640x480），设备不可用时显示给用户"""
-    import numpy as np
-    import cv2
-    img = np.full((480, 640, 3), 28, dtype=np.uint8)
-    cv2.putText(img, text, (24, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (240, 240, 240), 2)
-    return img
 
 
 # ==================== record ====================
@@ -407,16 +443,15 @@ def cmd_record(path, fps):
     产物（输出目录保留，不打包；全部为最终格式，无需二次转码）：
       <path>/color.mp4         彩色视频（H.264，libx264 CRF 18，浏览器可播）
       <path>/depth_raw.zst     原始深度序列（DZST v2：8mm 量化 + 帧间差分 zstd，解码后为毫米深度值）
-      <path>/frames.jsonl      逐帧记录：mp4_frame/zst_frame + RGB/深度硬件时间戳(ms) + 硬件帧号
+      <path>/frames.jsonl      逐帧记录：mp4_frame/zst_frame + RGB/深度硬件时间戳 + 硬件帧号
       <path>/calibration.json  相机标定：depth_scale/RGB 内参/畸变/分辨率/序列号/对齐状态
-      <path>/meta.json         序列号 / 配置 / 每帧时间戳 / 编码信息
+      <path>/meta.json         序列号 / 配置 / 编码信息
     深度伪彩色不再录制：可视化播放时由后端从原始深度实时转码（depth-video 端点）。
     输出 "DONE <out_dir> <frames>" 或 "ERR <原因>" 到 stdout。
     """
     import json
     import queue
     import struct
-    import time as _time
 
     try:
         rs = _import_rs()
@@ -569,15 +604,20 @@ def cmd_record(path, fps):
             "depth_units_mm": depth_units_mm,
             "fps": actual_fps,
             "start_time": datetime.now().isoformat(timespec="seconds"),
-            "frames": [],
         }
-        # 就绪行：所有编码器/写线程就绪后才输出，父进程据此确认录制已可用
-        _safe_print(f"READY {actual_fps}")
+        # 就绪行：所有编码器/写线程就绪后才输出，父进程据此确认录制已可用；
+        # 携带设备信息（fps/序列号/型号/固件），父进程免再跑一次 probe 探测
+        # （probe 需额外拉起 Python+pyrealsense2 枚举 USB，usbip 下约 2~4s）
+        _safe_print("READY " + json.dumps({
+            "fps": actual_fps,
+            "serial": _serial,
+            "name": device_name,
+            "firmware": firmware,
+        }, ensure_ascii=False))
         try:
             while not stop_event.is_set():
                 frames = pipe.wait_for_frames()
                 frames = align.process(frames)  # 深度对齐到彩色坐标系
-                ts = _time.time()
                 color = frames.get_color_frame()
                 depth = frames.get_depth_frame()
                 items = [None, None]
@@ -614,7 +654,6 @@ def cmd_record(path, fps):
                         frames_q.put_nowait(rec)
                     except queue.Full:
                         pass  # 背压：帧同步记录非关键，丢弃
-                meta["frames"].append({"index": frame_idx, "t": round(ts, 4)})
                 frame_idx += 1
         finally:
             try:
