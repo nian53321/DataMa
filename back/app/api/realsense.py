@@ -29,7 +29,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 from datetime import datetime
 
 from flask import request, Response, send_file, current_app
@@ -54,9 +53,6 @@ REALSENSE_REC_DIR = "/app/realsense_recordings"
 _BACK_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CHILD_SCRIPT = os.path.join(_BACK_DIR, "scripts", "realsense_child.py")
 DEFAULT_FPS = 30
-# 子进程退出后 USB 设备释放余量（秒）：pyrealsense2 子进程退出后立即重启
-# 新进程（预览↔录制切换）可能因设备未完全释放导致 pipe.start() 失败/卡住
-USB_RELEASE_DELAY = 2.0
 
 
 def _run_child(args, timeout=30, **kw):
@@ -99,25 +95,13 @@ _proc_lock = threading.Lock()
 _stream_proc = None   # 预览子进程（stdin 写 stop 优雅退出）
 _rec_proc = None      # 录制子进程
 
-# USB 释放跟踪：记录最近一次子进程停止时刻，启动新进程前等待设备完全释放
-_last_stop_ts = 0.0
-_stop_ts_lock = threading.Lock()
-
-
-def _mark_stopped():
-    """记录一次子进程停止时刻（进程退出即释放 USB，供下次启动前等待）"""
-    global _last_stop_ts
-    with _stop_ts_lock:
-        _last_stop_ts = time.time()
-
-
-def _wait_usb_free():
-    """启动新子进程前等待 USB 设备释放完成，避免跨进程重开相机失败/卡住"""
-    with _stop_ts_lock:
-        last = _last_stop_ts
-    remain = USB_RELEASE_DELAY - (time.time() - last)
-    if remain > 0:
-        time.sleep(remain)
+# 录制收尾事件：record/stop 立即返回后，子进程收尾（编码器 flush/写元数据）
+# 在后台线程进行，期间相机仍被占用。set=无收尾进行中；record/start 与
+# preview/start 启动新子进程前先等它，避免相机被收尾中的旧进程占用而失败
+_rec_stop_event = threading.Event()
+_rec_stop_event.set()
+# 正在收尾的录制输出目录（收尾中 color.mp4 可能尚未写完，upload 需拒绝）
+_finishing_dir = None
 
 
 def _wait_child_ready(proc, timeout=20):
@@ -169,6 +153,7 @@ _rec_state = {
     "frames": 0,
     "meta": {},
     "done": False,
+    "error": None,
 }
 _rec_state_lock = threading.Lock()
 
@@ -191,7 +176,6 @@ def _start_proc(args, rec=False):
 def _stop_proc(proc, wait=30):
     """向子进程 stdin 写 stop 并等待退出，返回 (returncode, stdout_text)"""
     if proc is None or proc.poll() is not None:
-        _mark_stopped()
         return proc.returncode if proc else 0, ""
     try:
         if proc.stdin:
@@ -204,8 +188,17 @@ def _stop_proc(proc, wait=30):
     except subprocess.TimeoutExpired:
         proc.kill()
         out, _ = proc.communicate(timeout=10)
-    _mark_stopped()
     return proc.returncode, (out or b"").decode("utf-8", "replace")
+
+
+def _signal_proc_stop(proc):
+    """向子进程发停止信号但不等待退出（相机释放由下一子进程内的忙重试等待）"""
+    try:
+        if proc is not None and proc.poll() is None and proc.stdin:
+            proc.stdin.write(b"stop\n")
+            proc.stdin.flush()
+    except Exception:
+        pass
 
 
 def _stop_rec_proc(proc, wait=30):
@@ -216,7 +209,6 @@ def _stop_rec_proc(proc, wait=30):
     供 DONE/ERR 行解析。返回 (returncode, tail_text)。
     """
     if proc is None or proc.poll() is not None:
-        _mark_stopped()
         return proc.returncode if proc else 0, ""
     try:
         if proc.stdin:
@@ -247,7 +239,6 @@ def _stop_rec_proc(proc, wait=30):
             proc.wait(timeout=10)
         except Exception:
             pass
-    _mark_stopped()
     return proc.returncode, (tail[0] if tail else b"").decode("utf-8", "replace")
 
 
@@ -344,11 +335,14 @@ def preview_start():
             return success({"stream": "/api/realsense/preview/stream"}, message="实时预览已启动")
         if _rec_proc is not None and _rec_proc.poll() is None:
             return fail("录制进行中，不能启动实时预览", 409)
-    _wait_usb_free()
+    # 上一段录制可能仍在后台收尾（record/stop 立即返回），相机被其占用；
+    # 等收尾完成再启动（正常收尾 2~4s），避免子进程 pipe.start 与收尾进程抢相机
+    if not _rec_stop_event.wait(timeout=20):
+        return fail("上一段录制仍在收尾，请稍后重试", 409)
     # 不再预先 probe 探测：额外拉起一个 Python+pyrealsense2 子进程枚举 USB 设备
     # （usbip 下约 2~4s），stream 子进程自身会检测设备并在无设备时输出 ERR
     proc = _start_proc(["stream", str(DEFAULT_FPS)])
-    ok, msg, _ready = _wait_child_ready(proc, timeout=15)
+    ok, msg, _ready = _wait_child_ready(proc, timeout=20)
     if not ok:
         with _proc_lock:
             if _stream_proc is proc:
@@ -417,20 +411,27 @@ def record_start():
     with _proc_lock:
         if _rec_proc is not None and _rec_proc.poll() is None:
             return fail("已有录制进行中", 409)
-        if _stream_proc is not None and _stream_proc.poll() is None:
-            # 录制与预览互斥：先停预览
-            _stop_proc(_stream_proc, wait=10)
-            _stream_proc = None
-    # 预览子进程刚退出，等待 USB 释放后再启动录制，避免 pipe.start() 失败
-    _wait_usb_free()
-    # 不再预先 probe 探测设备：额外拉起一个 Python+pyrealsense2 子进程枚举
-    # USB（usbip 下约 2~4s），录制子进程自身会检测设备并在无设备时输出 ERR
+        # 录制与预览互斥：先停预览
+        old_stream = _stream_proc
+        _stream_proc = None
+    # 上一段录制可能仍在后台收尾（record/stop 立即返回），等其完成再启动
+    if not _rec_stop_event.wait(timeout=20):
+        with _proc_lock:
+            if _stream_proc is None:
+                _stream_proc = old_stream  # 启动失败恢复预览进程引用
+        return fail("上一段录制仍在收尾，请稍后重试", 409)
+    # 预览子进程发停止信号但不等待退出：录制子进程的启动耗时（Python+import
+    # 约 2s）与预览退出（pipe.stop 在 usbip 下 1~2.5s）重叠；相机独占由录制
+    # 子进程 _start_pipeline 的设备忙重试等待，整体启动时间明显缩短
+    _signal_proc_stop(old_stream)
+    if old_stream is not None:
+        threading.Thread(target=old_stream.wait, daemon=True).start()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(REALSENSE_REC_DIR, f"realsense_{ts}")
     os.makedirs(out_dir, exist_ok=True)
     fps = int(data.get("fps", DEFAULT_FPS))
     proc = _start_proc(["record", out_dir, str(fps)], rec=True)
-    ok, msg, ready = _wait_child_ready(proc, timeout=20)
+    ok, msg, ready = _wait_child_ready(proc, timeout=25)
     if not ok:
         with _proc_lock:
             if _rec_proc is proc:
@@ -453,6 +454,7 @@ def record_start():
             "preview_rel": None,
             "frames": 0,
             "done": False,
+            "error": None,
             "meta": {
                 "device_type": "realsense",
                 "device_serial": info.get("serial") or "",
@@ -469,36 +471,57 @@ def record_start():
 @jwt_required()
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def record_stop():
-    """停止录制（子进程优雅停止，输出 DONE <dir> <frames>）"""
-    global _rec_proc
+    """停止录制：发停止信号后立即返回，收尾在后台线程完成
+
+    子进程收尾（pipe.stop + 编码器 flush + 写元数据）在 usbip 下需 2~4s，
+    同步等待会让前端"停止采集"按钮卡顿数秒；改为后台收尾后结果经
+    /record/status 轮询获取（frames 完成后才有值）。收尾期间相机仍被
+    子进程占用，record/start 与 preview/start 会等收尾事件。
+    """
+    global _rec_proc, _finishing_dir
     with _proc_lock:
         proc = _rec_proc
         _rec_proc = None
     if proc is None or proc.poll() is not None:
         return fail("没有进行中的录制", 409)
-    # 深度 zstd 序列不走 ffmpeg，停止时仅需等彩色 libx264 EOF flush（秒级）；
-    # 30s 上限兜底 USB 掉线等异常，避免阻塞请求线程过长。
-    # 录制中 stdout 持续输出 MJPEG 预览帧，用流式解析（丢弃帧数据，只取 DONE/ERR 行）
-    rc, out = _stop_rec_proc(proc, wait=30)
-    ok, result, frames = _parse_done(out)
-    if not ok or rc != 0:
-        with _rec_state_lock:
-            _rec_state["done"] = True
-        return fail(result, 409)
-    out_dir = result
-    color_rel = os.path.relpath(os.path.join(out_dir, "color.mp4"),
-                                REALSENSE_REC_DIR).replace(os.sep, "/")
     with _rec_state_lock:
-        _rec_state.update({
-            "dir": out_dir,
-            "preview_ready": True,
-            "preview_rel": color_rel,
-            "frames": frames,
-            "done": True,
-            "meta": dict(_rec_state["meta"], **{"end_time": datetime.now().isoformat(timespec="seconds"),
-                                                "frame_count": frames}),
-        })
-    return success({"path": out_dir, "frames": frames}, message="录制已停止")
+        stop_dir = _rec_state.get("dir")
+        _rec_state.update({"done": False, "error": None})
+    _rec_stop_event.clear()
+    _finishing_dir = stop_dir
+
+    def _finalize():
+        global _finishing_dir
+        try:
+            # 30s 上限兜底 USB 掉线等异常；录制中 stdout 持续输出 MJPEG 预览帧，
+            # 流式解析（丢弃帧数据，只取 DONE/ERR 行）
+            rc, out = _stop_rec_proc(proc, wait=30)
+            ok, result, frames = _parse_done(out)
+            if not ok or rc != 0:
+                with _rec_state_lock:
+                    _rec_state.update({"done": True, "error": result or "录制收尾失败"})
+                return
+            out_dir = result
+            color_rel = os.path.relpath(os.path.join(out_dir, "color.mp4"),
+                                        REALSENSE_REC_DIR).replace(os.sep, "/")
+            with _rec_state_lock:
+                _rec_state.update({
+                    "dir": out_dir,
+                    "preview_ready": True,
+                    "preview_rel": color_rel,
+                    "frames": frames,
+                    "done": True,
+                    "error": None,
+                    "meta": dict(_rec_state["meta"], **{
+                        "end_time": datetime.now().isoformat(timespec="seconds"),
+                        "frame_count": frames}),
+                })
+        finally:
+            _finishing_dir = None
+            _rec_stop_event.set()
+
+    threading.Thread(target=_finalize, daemon=True).start()
+    return success({"path": stop_dir}, message="录制已停止")
 
 
 @realsense_bp.route("/record/status", methods=["GET"])
@@ -555,6 +578,10 @@ def upload_recorded():
     if not (out_dir == REALSENSE_REC_DIR
             or out_dir.startswith(REALSENSE_REC_DIR + os.sep)):
         return fail("无效的录制目录", 422)
+    # record/stop 异步收尾中 color.mp4 可能尚未写完（编码器 flush 未完成），
+    # 拒绝上传避免入库截断损坏的文件
+    if _finishing_dir and os.path.normpath(_finishing_dir) == out_dir:
+        return fail("录制仍在收尾中，请稍候重试", 409)
     color_mp4 = os.path.join(out_dir, "color.mp4")
     if not os.path.isfile(color_mp4):
         return fail(f"录制文件不存在：{color_mp4}", 404)

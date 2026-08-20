@@ -1348,6 +1348,8 @@ const stopRealSenseRecord = async () => {
 }
 
 // 轮询录制后处理状态（预览生成），最多约 90s；组件卸载后立即退出，不再轮询
+// record/stop 立即返回，收尾（编码器 flush/写元数据）在后台完成：
+// 帧数/最终目录/错误经此轮询补齐（stop 响应只带 path）
 const pollRealSensePreview = async () => {
   realSensePreviewReady.value = false
   for (let i = 0; i < 60; i++) {
@@ -1359,6 +1361,17 @@ const pollRealSensePreview = async () => {
       if (_disposed) return
       const d = res.data || {}
       if (d.done) {
+        // 收尾失败（子进程 ERR/超时）：明确报错并回到空闲态，不能停留在"仍可上传"
+        if (d.error) {
+          ElMessage.error(d.error)
+          phase.value = 'idle'
+          return
+        }
+        // 补齐异步收尾结果：最终目录与帧数（stop 响应无 frames）
+        if (d.dir && realSenseRecordMeta.value) {
+          realSenseRecordMeta.value.path = d.dir
+          if (typeof d.frames === 'number') realSenseRecordMeta.value.frames = d.frames
+        }
         if (d.preview_rel && realSenseRecordMeta.value) {
           realSenseRecordMeta.value.preview_rel = d.preview_rel
           if (d.meta) {
