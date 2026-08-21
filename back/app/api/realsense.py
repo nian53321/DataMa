@@ -535,9 +535,28 @@ def record_stop():
                     _rec_state.update({"done": True, "error": result or "录制收尾失败"})
                 return
             out_dir = result
-            color_rel = os.path.relpath(os.path.join(out_dir, "color.mp4"),
-                                        REALSENSE_REC_DIR).replace(os.sep, "/")
+            color_mp4 = os.path.join(out_dir, "color.mp4")
+            color_rel = os.path.relpath(color_mp4, REALSENSE_REC_DIR).replace(os.sep, "/")
+            # 读取视频真实时长（秒）供前端展示。不能用 start/end 时间戳差值——
+            # 那包含录制启动与收尾（编码 flush）开销，会导致显示的"录制完成时长"
+            # 虚长（实测偏大约 30s）。与 Orbbec 处理一致：用 ffprobe 读实际视频时长。
+            duration_sec = None
+            try:
+                fp = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", color_mp4],
+                    capture_output=True, timeout=30,
+                )
+                if fp.returncode == 0:
+                    duration_sec = round(float(fp.stdout.strip()))
+            except Exception:
+                duration_sec = None
             with _rec_state_lock:
+                meta = dict(_rec_state["meta"], **{
+                    "end_time": datetime.now().isoformat(timespec="seconds"),
+                    "frame_count": frames})
+                if duration_sec:
+                    meta["duration_sec"] = duration_sec
                 _rec_state.update({
                     "dir": out_dir,
                     "preview_ready": True,
@@ -545,9 +564,7 @@ def record_stop():
                     "frames": frames,
                     "done": True,
                     "error": None,
-                    "meta": dict(_rec_state["meta"], **{
-                        "end_time": datetime.now().isoformat(timespec="seconds"),
-                        "frame_count": frames}),
+                    "meta": meta,
                 })
         finally:
             _finishing_dir = None
