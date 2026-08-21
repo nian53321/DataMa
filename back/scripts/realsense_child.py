@@ -822,15 +822,54 @@ def cmd_record(path, fps):
         return 1
 
 
+# ==================== standby ====================
+def cmd_standby():
+    """常驻热备：提前完成 Python+pyrealsense2 导入并等待 stdin 命令。
+
+    父进程取走热备后向其 stdin 写入 "stream <fps>" / "record <path> <fps>" /
+    "probe" 即立即执行，省掉每次冷启动约 1.5~2s 的进程启动与 C 库导入。
+    执行完毕即退出（父进程同时异步拉起新热备）。热备阶段不触碰 USB 设备，
+    只完成导入；刻意不输出任何行，避免污染后续 MJPEG 流。
+    """
+    _import_rs()  # 预热导入（含 numpy 等 C 库加载），后续 cmd_* 复用已导入模块
+    try:
+        for line in sys.stdin:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            cmd = parts[0]
+            if cmd == "quit":
+                return 0
+            if cmd == "probe":
+                return cmd_probe()
+            if cmd == "stream":
+                fps = int(parts[1]) if len(parts) > 1 else DEFAULT_FPS
+                return cmd_stream(fps)
+            if cmd == "record":
+                if len(parts) < 3:
+                    _safe_print("ERR usage: record <path> <fps>")
+                    return 2
+                return cmd_record(parts[1], int(parts[2]))
+    except Exception as e:
+        try:
+            _safe_print(f"ERR standby: {e}")
+        except Exception:
+            pass
+        return 1
+    return 0
+
+
 # ==================== main ====================
 def main():
     if len(sys.argv) < 2:
-        _safe_print("usage: realsense_child.py probe | stream [fps] | record <path> <fps>")
+        _safe_print("usage: realsense_child.py probe | stream [fps] | record <path> <fps> | standby")
         return 2
     # 先重定向 C 库日志（必须在任何 pyrealsense2 导入之前）
     _setup_c_log_redirect()
     cmd = sys.argv[1]
     try:
+        if cmd == "standby":
+            return cmd_standby()
         if cmd == "probe":
             return cmd_probe()
         if cmd == "stream":
