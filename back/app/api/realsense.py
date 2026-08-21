@@ -62,72 +62,16 @@ def _run_child(args, timeout=30, **kw):
     return proc.returncode, proc.stdout.decode("utf-8", "replace")
 
 
-# ==================== 热备子进程 ====================
-# 常驻热备：提前完成 Python + pyrealsense2 导入（每次冷启动约 1.5~2s），
-# 执行命令时直接写 stdin 省掉导入耗时，预览/录制/探测的启动因此提速。
-# 热备被取走后立即异步拉起新热备；热备退出/写入失败时回退冷启动。
-_standby_proc = None
-_standby_lock = threading.Lock()
-
-
-def _spawn_standby():
-    """拉起热备子进程（后台导入 pyrealsense2 并等待 stdin 命令）"""
-    global _standby_proc
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, CHILD_SCRIPT, "standby"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-    except Exception:
-        return
-    with _standby_lock:
-        _standby_proc = proc
-
-
-def _take_standby():
-    """取走热备进程（已退出则丢弃返回 None），并异步补齐新热备"""
-    global _standby_proc
-    with _standby_lock:
-        proc = _standby_proc
-        _standby_proc = None
-    if proc is not None and proc.poll() is not None:
-        proc = None
-    threading.Thread(target=_spawn_standby, daemon=True).start()
-    return proc
-
-
-def _write_standby_cmd(proc, args):
-    """向热备子进程 stdin 写命令（导入完成后才会读取，管道缓冲可容纳）"""
-    try:
-        proc.stdin.write((" ".join(args) + "\n").encode("utf-8"))
-        proc.stdin.flush()
-        return True
-    except Exception:
-        return False
-
-
 # ==================== 设备检测 ====================
 def _probe():
     """检测 RealSense 设备，返回 (count, serial, detail)；失败返回 (0, None, {})
 
     detail 为子进程 DETAIL 行携带的设备信息（name / firmware_version / product_line），
-    用于确认设备型号（如 D455F）与固件版本。优先复用热备子进程（省 ~2s 导入）。
+    用于确认设备型号（如 D455F）与固件版本。
     """
     count, serial, detail = 0, None, {}
     try:
-        proc = _take_standby()
-        if proc is None:
-            code, out = _run_child(["probe"], timeout=15)
-        else:
-            if not _write_standby_cmd(proc, ["probe"]):
-                proc = None
-                code, out = _run_child(["probe"], timeout=15)
-            else:
-                try:
-                    out, _ = proc.communicate(timeout=15)
-                    code = proc.returncode
-                except Exception:
-                    code, out = -1, ""
+        code, out = _run_child(["probe"], timeout=15)
         if code == 0:
             for line in out.splitlines():
                 line = line.strip()
@@ -215,26 +159,12 @@ _rec_state_lock = threading.Lock()
 
 
 def _start_proc(args, rec=False):
-    """启动子进程（stdin/stdout 管道）。rec=True 时同时更新录制状态。
-
-    优先复用热备子进程（已导入 pyrealsense2，省 ~1.5~2s 冷启动）；热备
-    不可用（None/已退出/写命令失败）时回退冷启动。热备由 _take_standby
-    异步补齐，下一次启动仍是热的。
-    """
+    """启动子进程（stdin/stdout 管道）。rec=True 时同时更新录制状态。"""
     global _stream_proc, _rec_proc
-    proc = _take_standby()
-    if proc is not None and _write_standby_cmd(proc, args):
-        pass
-    else:
-        if proc is not None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        proc = subprocess.Popen(
-            [sys.executable, CHILD_SCRIPT] + args,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
+    proc = subprocess.Popen(
+        [sys.executable, CHILD_SCRIPT] + args,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
     with _proc_lock:
         if rec:
             _rec_proc = proc
@@ -608,9 +538,6 @@ def record_stop():
             color_rel = os.path.relpath(os.path.join(out_dir, "color.mp4"),
                                         REALSENSE_REC_DIR).replace(os.sep, "/")
             with _rec_state_lock:
-                # 真实录制时长 = 帧数 / 实际帧率（不含启动等待与收尾耗时）；
-                # 前端优先使用该值展示，避免 start/end 时间差偏大
-                _fps = int(_rec_state["meta"].get("fps") or 0) or 1
                 _rec_state.update({
                     "dir": out_dir,
                     "preview_ready": True,
@@ -620,9 +547,7 @@ def record_stop():
                     "error": None,
                     "meta": dict(_rec_state["meta"], **{
                         "end_time": datetime.now().isoformat(timespec="seconds"),
-                        "frame_count": frames,
-                        "duration_sec": round(frames / _fps, 2),
-                    }),
+                        "frame_count": frames}),
                 })
         finally:
             _finishing_dir = None

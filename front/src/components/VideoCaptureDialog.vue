@@ -1354,8 +1354,7 @@ const pollRealSensePreview = async () => {
   realSensePreviewReady.value = false
   for (let i = 0; i < 60; i++) {
     if (_disposed) return
-    // 首次立即查询（stop 后收尾可能已经完成），之后每 1.5s 轮询
-    if (i > 0) await new Promise(r => setTimeout(r, 1500))
+    await new Promise(r => setTimeout(r, 1500))
     if (_disposed) return
     try {
       const res = await getRealSenseRecordStatusApi()
