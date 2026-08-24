@@ -1,21 +1,27 @@
 # -*- coding: utf-8 -*-
 """Intel RealSense D455f 深度摄像头接口（容器内 pyrealsense2 直连 USB）
 
-与 /api/orbbec/* 接口协议保持一致（status/preview/record/upload），前端交互模式相同。
-pyrealsense2 是 C 库，所有调用通过子进程 realsense_child.py 隔离（崩溃不影响 Flask worker）。
+pyrealsense2 是 C 库，崩溃会杀死 Flask worker，所有调用通过子进程
+realsense_child.py 隔离。预览与录制共用一个常驻会话子进程（session 模式）：
+pipeline 只打开一次，开始/停止录制只是向子进程发 JSON 命令（stdin），结果
+经独立 fd 管道回传（RS_SESSION_FD），MJPEG 预览流持续走 stdout——录制切换
+零进程重启、零设备释放等待。
 
 录制产物（容器内 /app/realsense_recordings/<ts>/）：
   color.mp4          彩色视频（H.264，libx264 直接编码，浏览器可播）
-  depth.mp4          深度伪彩色视频（H.264，jet 色标，0=深灰无效）
-  depth_raw.mkv      原始深度序列（ffv1 无损，z16 16 位精度，入库供分析）
+  depth_raw.zst      原始深度序列（DZST v2，解码后为毫米深度值，入库供分析）
+  frames.jsonl       逐帧同步记录（MP4/ZST 帧序号 + 硬件时间戳）
+  calibration.json   相机标定
   meta.json          序列号 / 分辨率 / 帧时间戳 / 编码信息
 
 路由：
 - GET  /api/realsense/status           设备状态（无设备时 available=false）
-- POST /api/realsense/preview/start    启动实时预览（MJPEG 流）
-- POST /api/realsense/preview/stop     停止实时预览
-- GET  /api/realsense/preview/stream   MJPEG 流（<img> 直接播放）
+- POST /api/realsense/preview/start    启动相机会话（常驻子进程）
+- POST /api/realsense/preview/stop     停止相机会话
+- GET  /api/realsense/preview/stream   MJPEG 流（<img> 直接播放，录制中不断流）
 - POST /api/realsense/record/start     启动录制
+- POST /api/realsense/record/pause     暂停录制（帧不入编码器，预览继续）
+- POST /api/realsense/record/resume    恢复录制
 - POST /api/realsense/record/stop      停止录制
 - GET  /api/realsense/record/status    查询录制状态
 - GET  /api/realsense/preview          返回录制预览 mp4
@@ -90,60 +96,16 @@ def _probe():
     return count, serial, detail
 
 
-# ==================== 子进程会话管理 ====================
+# ==================== 常驻会话子进程 ====================
+# 单一子进程承载预览+录制（realsense_child.py session 模式）：
+#   stdin  发 JSON 命令（start_rec/stop_rec/quit）
+#   fd 管道（RS_SESSION_FD）回传 JSON 事件（ready/rec_started/rec_done/...）
+#   stdout 持续输出 MJPEG 预览（preview/stream 直接透传，录制中不断流）
+# 录制开始/停止只是向常驻进程发命令：无进程切换、无相机释放等待（旧双进程
+# 架构每次切换需等旧进程退出+内核释放 USB，实测开始采集延迟 4~5s）
 _proc_lock = threading.Lock()
-_stream_proc = None   # 预览子进程（stdin 写 stop 优雅退出）
-_rec_proc = None      # 录制子进程
-
-# 录制收尾事件：record/stop 立即返回后，子进程收尾（编码器 flush/写元数据）
-# 在后台线程进行，期间相机仍被占用。set=无收尾进行中；record/start 与
-# preview/start 启动新子进程前先等它，避免相机被收尾中的旧进程占用而失败
-_rec_stop_event = threading.Event()
-_rec_stop_event.set()
-# 正在收尾的录制输出目录（收尾中 color.mp4 可能尚未写完，upload 需拒绝）
-_finishing_dir = None
-
-
-def _wait_child_ready(proc, timeout=20):
-    """等待子进程输出就绪行（READY 成功 / ERR 失败），并消费该行。
-
-    返回 (ok, message, ready_text)：ready_text 为 READY 行原文（录制子进程
-    携带设备信息 JSON），失败/超时为空串。超时未就绪则杀掉进程并报错，
-    避免残留进程或未消费的输出污染后续 MJPEG 流。
-    """
-    import queue
-    ready_q = queue.Queue(maxsize=1)
-
-    def _reader():
-        try:
-            for raw in proc.stdout:
-                text = raw.decode("utf-8", "replace").strip()
-                if text.startswith(("READY", "ERR ")):
-                    try:
-                        ready_q.put_nowait(text)
-                    except Exception:
-                        pass
-                    return
-        except Exception:
-            pass
-
-    threading.Thread(target=_reader, daemon=True).start()
-    try:
-        text = ready_q.get(timeout=timeout)
-    except queue.Empty:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            # 等待进程真正退出，避免孤儿进程继续占用 USB 导致后续启动失败
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-        return False, "RealSense 相机启动超时", ""
-    if text.startswith("READY"):
-        return True, "", text
-    return False, text[4:], ""
+_cmd_lock = threading.Lock()
+_sess = None  # 当前会话：{"proc","out","ready_evt","rec_evt","rec_payload","fatal","info"}
 
 # 录制状态（前端轮询 /record/status）
 _rec_state = {
@@ -154,73 +116,194 @@ _rec_state = {
     "meta": {},
     "done": False,
     "error": None,
+    "recording": False,
+    "paused": False,
 }
 _rec_state_lock = threading.Lock()
+# 收尾中的目录集合：rec_done 事件前同目录 upload 拒绝（color.mp4 可能尚未写完）
+_finishing_dirs = set()
+_finishing_lock = threading.Lock()
 
 
-def _start_proc(args, rec=False):
-    """启动子进程（stdin/stdout 管道）。rec=True 时同时更新录制状态。"""
-    global _stream_proc, _rec_proc
-    proc = subprocess.Popen(
-        [sys.executable, CHILD_SCRIPT] + args,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+def _session_reader(sess):
+    """读取会话子进程协议事件行并更新状态；EOF 即子进程退出，清理会话"""
+    global _sess
+    out = sess["out"]
+    try:
+        while True:
+            line = out.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue
+            et = evt.get("evt")
+            if et == "ready":
+                sess["info"] = evt
+                sess["ready_evt"].set()
+            elif et == "fatal":
+                sess["fatal"] = evt.get("err") or "相机启动失败"
+                sess["ready_evt"].set()
+            elif et == "rec_started":
+                sess["rec_payload"] = evt
+                sess["rec_evt"].set()
+            elif et == "rec_start_err":
+                sess["rec_payload"] = {"err": evt.get("err") or "录制启动失败"}
+                sess["rec_evt"].set()
+            elif et == "rec_paused":
+                with _rec_state_lock:
+                    _rec_state["paused"] = True
+            elif et == "rec_resumed":
+                with _rec_state_lock:
+                    _rec_state["paused"] = False
+            elif et == "rec_done":
+                _on_rec_done(evt)
+            elif et == "rec_done_err":
+                _on_rec_done_err(evt)
+    except Exception:
+        pass
+    finally:
+        with _proc_lock:
+            if _sess is sess:
+                _sess = None
+        try:
+            out.close()
+        except Exception:
+            pass
+        # 子进程退出（崩溃/被杀）：录制中标记中断，前端轮询可见错误
+        with _rec_state_lock:
+            if _rec_state.get("recording"):
+                _rec_state.update({
+                    "done": True, "recording": False,
+                    "error": "相机会话进程退出，录制中断"})
+
+
+def _ffprobe_duration(color_mp4):
+    """读视频真实时长（秒）。不能用 start/end 时间戳差值——那包含录制启动与
+    收尾（编码 flush）开销，会导致显示的"录制完成时长"虚长。"""
+    try:
+        fp = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", color_mp4],
+            capture_output=True, timeout=30,
+        )
+        if fp.returncode == 0:
+            return round(float(fp.stdout.strip()))
+    except Exception:
+        pass
+    return None
+
+
+def _on_rec_done(evt):
+    """录制收尾成功：补齐帧数/预览/时长（rec_done 到达时文件均已写完）"""
+    out_dir = evt.get("dir") or ""
+    frames = int(evt.get("frames") or 0)
+    color_mp4 = os.path.join(out_dir, "color.mp4")
+    color_rel = os.path.relpath(color_mp4, REALSENSE_REC_DIR).replace(os.sep, "/")
+    duration_sec = _ffprobe_duration(color_mp4)
+    with _rec_state_lock:
+        meta = dict(_rec_state["meta"], **{
+            "end_time": datetime.now().isoformat(timespec="seconds"),
+            "frame_count": frames})
+        if duration_sec:
+            meta["duration_sec"] = duration_sec
+        _rec_state.update({
+            "dir": out_dir,
+            "preview_ready": True,
+            "preview_rel": color_rel,
+            "frames": frames,
+            "done": True,
+            "error": None,
+            "recording": False,
+            "paused": False,
+            "meta": meta,
+        })
+    with _finishing_lock:
+        _finishing_dirs.discard(out_dir)
+
+
+def _on_rec_done_err(evt):
+    out_dir = evt.get("dir") or ""
+    with _rec_state_lock:
+        _rec_state.update({
+            "done": True,
+            "recording": False,
+            "paused": False,
+            "error": evt.get("err") or "录制收尾失败",
+        })
+    with _finishing_lock:
+        _finishing_dirs.discard(out_dir)
+
+
+def _ensure_session(timeout=25):
+    """确保常驻会话子进程在运行，返回 (sess, err)"""
+    global _sess
     with _proc_lock:
-        if rec:
-            _rec_proc = proc
-        else:
-            _stream_proc = proc
-    return proc
-
-
-def _stop_proc(proc, wait=30):
-    """向子进程 stdin 写 stop 并等待退出，返回 (returncode, stdout_text)"""
-    if proc is None or proc.poll() is not None:
-        return proc.returncode if proc else 0, ""
+        sess = _sess
+        if sess is not None and sess["proc"].poll() is None:
+            return sess, ""
+    # 协议通道走独立 fd 管道：stdout 承载 MJPEG 帧流，不能混入协议行
+    # （fd 编号不固定，pass_fds 只保证继承，编号经环境变量告知子进程）
+    r_fd, w_fd = os.pipe()
+    env = dict(os.environ)
+    env["RS_SESSION_FD"] = str(w_fd)
+    # stderr 落盘（循环覆盖）：librealsense C 库崩溃/帧超时日志原被 DEVNULL
+    # 吞掉，gunicorn 环境下曾出现 ready 后 0 帧，需要现场证据
+    err_log = open("/tmp/rs_session_err.log", "ab")
     try:
-        if proc.stdin:
-            proc.stdin.write(b"stop\n")
-            proc.stdin.flush()
-    except Exception:
-        pass
-    try:
-        out, _ = proc.communicate(timeout=wait)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, _ = proc.communicate(timeout=10)
-    return proc.returncode, (out or b"").decode("utf-8", "replace")
+        proc = subprocess.Popen(
+            [sys.executable, CHILD_SCRIPT, "session", str(DEFAULT_FPS)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=err_log, env=env, pass_fds=(w_fd,),
+        )
+    except Exception as e:
+        os.close(r_fd)
+        os.close(w_fd)
+        return None, f"相机会话进程启动失败：{e}"
+    finally:
+        err_log.close()
+    os.close(w_fd)
+    out = os.fdopen(r_fd, "rb", buffering=0)
+    sess = {
+        "proc": proc, "out": out,
+        "ready_evt": threading.Event(),
+        "rec_evt": threading.Event(),
+        "rec_payload": {}, "fatal": None, "info": {},
+    }
+    with _proc_lock:
+        _sess = sess
+    threading.Thread(target=_session_reader, args=(sess,), daemon=True).start()
+    if not sess["ready_evt"].wait(timeout=timeout):
+        _kill_session()
+        return None, "RealSense 相机启动超时"
+    if sess["fatal"]:
+        err = sess["fatal"]
+        _kill_session()
+        return None, err
+    return sess, ""
 
 
-def _signal_proc_stop(proc):
-    """向子进程发停止信号但不等待退出（相机释放由下一子进程内的忙重试等待）"""
-    try:
-        if proc is not None and proc.poll() is None and proc.stdin:
-            proc.stdin.write(b"stop\n")
-            proc.stdin.flush()
-    except Exception:
-        pass
-
-
-# 旧预览进程强制回收宽限（秒）：发 stop 信号后允许其自行退出的时间上限。
-# 预览子进程已跳过 pipe.stop()（usbip 下该调用卡死 10s+），正常 1~2s 即
-# 退出；若子进程卡在 wait_for_frames 等 C 库调用，超过宽限必须 kill，否则
-# 相机被永久占用，后续所有采集启动都报 EBUSY。
-STREAM_EXIT_GRACE_SECONDS = 5.0
-
-
-def _ensure_stream_exited(proc):
-    """后台监督旧预览进程退出：STREAM_EXIT_GRACE_SECONDS 内未退出则 kill。
-
-    与录制子进程的启动并行执行（录制子进程 Python+import 约 2s，预览正常
-    退出 2~5s，两者重叠缩短切换耗时）；录制子进程 pipe.start 的 EBUSY 忙
-    重试（12s 预算）等待内核释放。预览卡死时本线程 kill 兜底，忙重试在
-    kill 后内核释放窗口内即可成功。
-    """
-    if proc is None or proc.poll() is not None:
+def _kill_session():
+    """停止会话子进程：发 quit 优雅退出（录制中先收尾），超时 kill 兜底"""
+    global _sess
+    with _proc_lock:
+        sess = _sess
+        _sess = None
+    if sess is None:
         return
+    proc = sess["proc"]
     try:
-        proc.wait(timeout=STREAM_EXIT_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
+        proc.stdin.write(b'{"cmd":"quit"}\n')
+        proc.stdin.flush()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
         try:
             proc.kill()
         except Exception:
@@ -231,58 +314,15 @@ def _ensure_stream_exited(proc):
             pass
 
 
-def _stop_rec_proc(proc, wait=30):
-    """停止录制子进程并解析结果行（stdout 混有 MJPEG 实时预览帧）
-
-    录制子进程在录制期间持续向 stdout 输出 MJPEG 帧，若用 communicate 会把全程
-    预览帧读入内存；这里改为后台线程流式消费并丢弃帧数据，只保留尾部最近 64KB
-    供 DONE/ERR 行解析。返回 (returncode, tail_text)。
-    """
-    if proc is None or proc.poll() is not None:
-        return proc.returncode if proc else 0, ""
+def _send_cmd(sess, obj):
+    """向会话子进程发一条 JSON 命令"""
     try:
-        if proc.stdin:
-            proc.stdin.write(b"stop\n")
-            proc.stdin.flush()
-    except Exception:
-        pass
-    tail = []
-
-    def _drain():
-        buf = b""
-        try:
-            for raw in proc.stdout:
-                buf = (buf + raw)[-65536:]
-        except Exception:
-            pass
-        tail.append(buf)
-
-    threading.Thread(target=_drain, daemon=True).start()
-    try:
-        proc.wait(timeout=wait)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=10)
-        except Exception:
-            pass
-    return proc.returncode, (tail[0] if tail else b"").decode("utf-8", "replace")
-
-
-def _parse_done(out):
-    """解析子进程输出的 DONE/ERR 行，返回 (ok, dir_or_err, frames)"""
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("DONE "):
-            parts = line.split()
-            if len(parts) >= 3:
-                return True, parts[1], int(parts[2])
-        elif line.startswith("ERR "):
-            return False, line[4:], 0
-    return False, "子进程未输出结果", 0
+        with _cmd_lock:
+            sess["proc"].stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+            sess["proc"].stdin.flush()
+        return None
+    except Exception as e:
+        return f"相机会话通信失败：{e}"
 
 
 # ==================== 路由 ====================
@@ -293,8 +333,9 @@ def status():
     """检测 RealSense 设备状态（型号/固件来自子进程 DETAIL，非硬编码）"""
     count, serial, detail = _probe()
     with _proc_lock:
-        recording = _rec_proc is not None and _rec_proc.poll() is None
-        previewing = _stream_proc is not None and _stream_proc.poll() is None
+        previewing = _sess is not None and _sess["proc"].poll() is None
+    with _rec_state_lock:
+        recording = bool(_rec_state.get("recording"))
     return success({
         "available": count > 0,
         "count": count,
@@ -323,9 +364,10 @@ def passthrough_start():
     脚本含 P3/P4 USB 总线复位：若远程联网网卡在受影响总线上会断网 10-30 秒，
     期间本接口与 /passthrough/status 轮询可能短暂失败，前端需容忍重试。
     """
+    with _rec_state_lock:
+        recording = bool(_rec_state.get("recording"))
     with _proc_lock:
-        recording = _rec_proc is not None and _rec_proc.poll() is None
-        previewing = _stream_proc is not None and _stream_proc.poll() is None
+        previewing = _sess is not None and _sess["proc"].poll() is None
     if recording:
         return fail("深度相机录制进行中，请先停止采集再透传", 409)
     if previewing:
@@ -358,72 +400,55 @@ def passthrough_status():
 @jwt_required()
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def preview_start():
-    """启动实时预览（子进程 stream，输出 MJPEG 到 stdout）"""
-    global _stream_proc
-    with _proc_lock:
-        if _stream_proc is not None and _stream_proc.poll() is None:
-            return success({"stream": "/api/realsense/preview/stream"}, message="实时预览已启动")
-        if _rec_proc is not None and _rec_proc.poll() is None:
-            return fail("录制进行中，不能启动实时预览", 409)
-    # 上一段录制可能仍在后台收尾（record/stop 立即返回），相机被其占用；
-    # 等收尾完成再启动（正常收尾 2~4s），避免子进程 pipe.start 与收尾进程抢相机
-    if not _rec_stop_event.wait(timeout=20):
-        return fail("上一段录制仍在收尾，请稍后重试", 409)
-    # 不再预先 probe 探测：额外拉起一个 Python+pyrealsense2 子进程枚举 USB 设备
-    # （usbip 下约 2~4s），stream 子进程自身会检测设备并在无设备时输出 ERR
-    proc = _start_proc(["stream", str(DEFAULT_FPS)])
-    ok, msg, _ready = _wait_child_ready(proc, timeout=20)
-    if not ok:
-        with _proc_lock:
-            if _stream_proc is proc:
-                _stream_proc = None
-        return fail(msg, 409)
+    """启动相机会话（常驻子进程；录制共用同一会话，预览流全程不断）"""
+    sess, err = _ensure_session()
+    if err:
+        return fail(err, 409)
     return success({"stream": "/api/realsense/preview/stream"}, message="实时预览已启动")
 
 
 @realsense_bp.route("/preview/stop", methods=["POST"])
 @jwt_required()
 def preview_stop():
-    """停止实时预览（子进程优雅退出）"""
-    global _stream_proc
-    with _proc_lock:
-        proc = _stream_proc
-        _stream_proc = None
-    _stop_proc(proc, wait=10)
+    """停止相机会话（子进程退出释放设备；录制收尾自动完成）"""
+    _kill_session()
     return success(message="实时预览已停止")
+
+
+# 流读取互斥锁：同一时刻只允许一个消费者读会话子进程 stdout。
+# <img> 的 src 轮换（签名 URL 刷新）会让浏览器断旧连接、发起新请求，新旧
+# gen() 并发读同一 BufferedReader 会撕裂 MJPEG 帧——两个连接都无法解码。
+# 排队等锁：旧消费者随浏览器断开由 gunicorn 关闭生成器后释放，新消费者接管。
+_stream_read_lock = threading.Lock()
 
 
 @realsense_bp.route("/preview/stream", methods=["GET"])
 @media_auth_required("realsense_stream")
 def preview_stream():
-    """实时预览 MJPEG 流：透传子进程 stdout（multipart/x-mixed-replace）
+    """实时预览 MJPEG 流：透传会话子进程 stdout（multipart/x-mixed-replace）
 
     鉴权：优先 ?media_token=<短期签名>，兼容 JWT（header / access_token query）。
-    录制中预览子进程已停止，改透传录制子进程 stdout（record 子进程同步输出 MJPEG 帧）。
+    预览与录制共用会话子进程，开始/停止录制不影响本流。
     """
     with _proc_lock:
-        if _stream_proc is not None and _stream_proc.poll() is None:
-            proc = _stream_proc
-        else:
-            proc = _rec_proc
-    if proc is None or proc.poll() is not None:
+        sess = _sess
+    if sess is None or sess["proc"].poll() is not None:
         return fail("预览未启动", 409)
+    proc = sess["proc"]
 
     def gen():
+        acquired = _stream_read_lock.acquire(timeout=10)
         try:
+            if not acquired:
+                return  # 前一个消费者迟迟不退出（异常态），本次放弃，前端轮换 URL 后会重试
             while proc.poll() is None:
-                # 停止/切换时让出 stdout 读取权（避免与 _stop_rec_proc 的解析线程竞争）
-                with _proc_lock:
-                    still_live = (_stream_proc is proc) or (_rec_proc is proc)
-                if not still_live:
-                    break
                 chunk = proc.stdout.read(8192)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            # 客户端断开：子进程 _safe_write 检测到管道关闭会自我退出
-            pass
+            if acquired:
+                _stream_read_lock.release()
 
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -435,51 +460,30 @@ def preview_stream():
 @jwt_required()
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def record_start():
-    """启动录制（子进程 record，彩色 MP4 + 深度 zstd 序列）"""
-    global _rec_proc, _stream_proc
+    """启动录制（会话内发 start_rec 命令；无进程切换，秒级开始）"""
     data = request.get_json(silent=True) or {}
-    with _proc_lock:
-        if _rec_proc is not None and _rec_proc.poll() is None:
+    with _rec_state_lock:
+        if _rec_state.get("recording"):
             return fail("已有录制进行中", 409)
-        # 录制与预览互斥：先停预览
-        old_stream = _stream_proc
-        _stream_proc = None
-    # 上一段录制可能仍在后台收尾（record/stop 立即返回），等其完成再启动
-    if not _rec_stop_event.wait(timeout=20):
-        with _proc_lock:
-            if _stream_proc is None:
-                _stream_proc = old_stream  # 启动失败恢复预览进程引用
-        return fail("上一段录制仍在收尾，请稍后重试", 409)
-    # 停旧预览：发 stop 信号后由后台线程监督退出（10s 未退出则 kill 兜底），
-    # 不等其退出即启动录制子进程——录制子进程 Python+import（约 2s）与预览
-    # 退出（pipe.stop 2~5s）并行，pipe.start 的 EBUSY 忙重试（12s 预算）等待
-    # 内核释放。EBUSY 重试已不依赖缓存组合（见 realsense_child.py），预览
-    # 卡死场景由监督线程 kill 兜底，忙重试在 kill 后释放窗口内成功。
-    _signal_proc_stop(old_stream)
-    if old_stream is not None:
-        threading.Thread(target=_ensure_stream_exited,
-                         args=(old_stream,), daemon=True).start()
+    sess, err = _ensure_session()
+    if err:
+        return fail(err, 409)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(REALSENSE_REC_DIR, f"realsense_{ts}")
     os.makedirs(out_dir, exist_ok=True)
     fps = int(data.get("fps", DEFAULT_FPS))
-    proc = _start_proc(["record", out_dir, str(fps)], rec=True)
-    ok, msg, ready = _wait_child_ready(proc, timeout=25)
-    if not ok:
-        with _proc_lock:
-            if _rec_proc is proc:
-                _rec_proc = None
+    sess["rec_evt"].clear()
+    sess["rec_payload"] = {}
+    err = _send_cmd(sess, {"cmd": "start_rec", "path": out_dir, "fps": fps})
+    if err:
+        return fail(f"录制启动失败：{err}", 409)
+    if not sess["rec_evt"].wait(timeout=15):
+        return fail("录制启动超时", 409)
+    payload = sess["rec_payload"]
+    if payload.get("err"):
         import shutil
         shutil.rmtree(out_dir, ignore_errors=True)  # 启动失败清理空目录
-        return fail(f"录制启动失败：{msg}", 409)
-    # 设备信息由录制子进程 READY 行携带（协商出的实际帧率/序列号/型号/固件）
-    info = {}
-    try:
-        _v = json.loads(ready[len("READY"):].strip() or "{}")
-        if isinstance(_v, dict):
-            info = _v
-    except Exception:
-        info = {}
+        return fail(f"录制启动失败：{payload['err']}", 409)
     with _rec_state_lock:
         _rec_state.update({
             "dir": out_dir,
@@ -488,12 +492,14 @@ def record_start():
             "frames": 0,
             "done": False,
             "error": None,
+            "recording": True,
+            "paused": False,
             "meta": {
                 "device_type": "realsense",
-                "device_serial": info.get("serial") or "",
-                "device_name": info.get("name") or "",
-                "firmware_version": info.get("firmware") or "",
-                "fps": int(info.get("fps") or fps),
+                "device_serial": payload.get("serial") or "",
+                "device_name": payload.get("name") or "",
+                "firmware_version": payload.get("firmware") or "",
+                "fps": int(payload.get("fps") or fps),
                 "start_time": datetime.now().isoformat(timespec="seconds"),
             },
         })
@@ -504,74 +510,76 @@ def record_start():
 @jwt_required()
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def record_stop():
-    """停止录制：发停止信号后立即返回，收尾在后台线程完成
+    """停止录制：发 stop_rec 后立即返回，收尾在子进程后台线程完成
 
-    子进程收尾（pipe.stop + 编码器 flush + 写元数据）在 usbip 下需 2~4s，
-    同步等待会让前端"停止采集"按钮卡顿数秒；改为后台收尾后结果经
-    /record/status 轮询获取（frames 完成后才有值）。收尾期间相机仍被
-    子进程占用，record/start 与 preview/start 会等收尾事件。
+    结果（帧数/最终目录/错误）经 /record/status 轮询获取（rec_done 事件补齐）。
+    收尾期间预览持续、相机不释放，可立即开始下一段录制。
     """
-    global _rec_proc, _finishing_dir
-    with _proc_lock:
-        proc = _rec_proc
-        _rec_proc = None
-    if proc is None or proc.poll() is not None:
-        return fail("没有进行中的录制", 409)
     with _rec_state_lock:
+        if not _rec_state.get("recording"):
+            return fail("没有进行中的录制", 409)
         stop_dir = _rec_state.get("dir")
         _rec_state.update({"done": False, "error": None})
-    _rec_stop_event.clear()
-    _finishing_dir = stop_dir
-
-    def _finalize():
-        global _finishing_dir
-        try:
-            # 30s 上限兜底 USB 掉线等异常；录制中 stdout 持续输出 MJPEG 预览帧，
-            # 流式解析（丢弃帧数据，只取 DONE/ERR 行）
-            rc, out = _stop_rec_proc(proc, wait=30)
-            ok, result, frames = _parse_done(out)
-            if not ok or rc != 0:
-                with _rec_state_lock:
-                    _rec_state.update({"done": True, "error": result or "录制收尾失败"})
-                return
-            out_dir = result
-            color_mp4 = os.path.join(out_dir, "color.mp4")
-            color_rel = os.path.relpath(color_mp4, REALSENSE_REC_DIR).replace(os.sep, "/")
-            # 读取视频真实时长（秒）供前端展示。不能用 start/end 时间戳差值——
-            # 那包含录制启动与收尾（编码 flush）开销，会导致显示的"录制完成时长"
-            # 虚长（实测偏大约 30s）。与 Orbbec 处理一致：用 ffprobe 读实际视频时长。
-            duration_sec = None
-            try:
-                fp = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", color_mp4],
-                    capture_output=True, timeout=30,
-                )
-                if fp.returncode == 0:
-                    duration_sec = round(float(fp.stdout.strip()))
-            except Exception:
-                duration_sec = None
-            with _rec_state_lock:
-                meta = dict(_rec_state["meta"], **{
-                    "end_time": datetime.now().isoformat(timespec="seconds"),
-                    "frame_count": frames})
-                if duration_sec:
-                    meta["duration_sec"] = duration_sec
-                _rec_state.update({
-                    "dir": out_dir,
-                    "preview_ready": True,
-                    "preview_rel": color_rel,
-                    "frames": frames,
-                    "done": True,
-                    "error": None,
-                    "meta": meta,
-                })
-        finally:
-            _finishing_dir = None
-            _rec_stop_event.set()
-
-    threading.Thread(target=_finalize, daemon=True).start()
+    with _proc_lock:
+        sess = _sess
+    if sess is None or sess["proc"].poll() is not None:
+        # 会话已死：reader 清理路径会标记错误，这里兜底返回
+        with _rec_state_lock:
+            _rec_state.update({"done": True, "recording": False,
+                               "error": "相机会话进程退出，录制中断"})
+        return fail("录制会话已中断", 409)
+    err = _send_cmd(sess, {"cmd": "stop_rec"})
+    if err:
+        return fail(err, 409)
+    if stop_dir:
+        with _finishing_lock:
+            _finishing_dirs.add(stop_dir)
     return success({"path": stop_dir}, message="录制已停止")
+
+
+@realsense_bp.route("/record/pause", methods=["POST"])
+@jwt_required()
+@role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
+def record_pause():
+    """暂停录制：帧不再进入编码器（视频里不存在暂停区间），预览流不受影响"""
+    with _rec_state_lock:
+        if not _rec_state.get("recording"):
+            return fail("没有进行中的录制", 409)
+        if _rec_state.get("paused"):
+            return fail("录制已处于暂停状态", 409)
+    with _proc_lock:
+        sess = _sess
+    if sess is None or sess["proc"].poll() is not None:
+        return fail("相机会话已中断", 409)
+    err = _send_cmd(sess, {"cmd": "pause_rec"})
+    if err:
+        return fail(err, 409)
+    # 状态由子进程 rec_paused 事件回填；此处乐观置位，前端按钮即时切换
+    with _rec_state_lock:
+        _rec_state["paused"] = True
+    return success(message="录制已暂停")
+
+
+@realsense_bp.route("/record/resume", methods=["POST"])
+@jwt_required()
+@role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
+def record_resume():
+    """恢复录制（从上次暂停处继续采集）"""
+    with _rec_state_lock:
+        if not _rec_state.get("recording"):
+            return fail("没有进行中的录制", 409)
+        if not _rec_state.get("paused"):
+            return fail("录制未处于暂停状态", 409)
+    with _proc_lock:
+        sess = _sess
+    if sess is None or sess["proc"].poll() is not None:
+        return fail("相机会话已中断", 409)
+    err = _send_cmd(sess, {"cmd": "resume_rec"})
+    if err:
+        return fail(err, 409)
+    with _rec_state_lock:
+        _rec_state["paused"] = False
+    return success(message="录制已继续")
 
 
 @realsense_bp.route("/record/status", methods=["GET"])
@@ -628,10 +636,11 @@ def upload_recorded():
     if not (out_dir == REALSENSE_REC_DIR
             or out_dir.startswith(REALSENSE_REC_DIR + os.sep)):
         return fail("无效的录制目录", 422)
-    # record/stop 异步收尾中 color.mp4 可能尚未写完（编码器 flush 未完成），
+    # 录制收尾中 color.mp4 可能尚未写完（编码器 flush 未完成），
     # 拒绝上传避免入库截断损坏的文件
-    if _finishing_dir and os.path.normpath(_finishing_dir) == out_dir:
-        return fail("录制仍在收尾中，请稍候重试", 409)
+    with _finishing_lock:
+        if os.path.normpath(out_dir) in {os.path.normpath(d) for d in _finishing_dirs}:
+            return fail("录制仍在收尾中，请稍候重试", 409)
     color_mp4 = os.path.join(out_dir, "color.mp4")
     if not os.path.isfile(color_mp4):
         return fail(f"录制文件不存在：{color_mp4}", 404)

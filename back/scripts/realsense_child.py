@@ -1,33 +1,49 @@
 # -*- coding: utf-8 -*-
 """pyrealsense2 子进程执行器（Intel RealSense D455F 深度相机）
 
-背景：与 orbbec_camera_proc.py 相同——pyrealsense2 底层 C 库（librealsense）在 USB 不可达
-或初始化失败时可能崩溃，C 扩展的崩溃无法被 Python try/except 捕获，会杀死 Flask worker。
-所有 pyrealsense2 调用都通过 subprocess 在本脚本（独立进程）中执行，即使 C 库崩溃
-也只影响本子进程。
-
-数据流：与 Orbbec 一致，只采集 彩色 + 深度 两路（**不启用红外流**）：
-  - 彩色：D455F 原生 1280x800（bgr8，1MP 全局快门），分辨率自动协商逐级降级
-  - 深度：D455F 原生 1280x720（z16，单位 mm），DZST v2 存储（16mm 量化 + 帧间差分 + zstd，
-    量化误差 ±8mm 低于中远距深度噪声，体积约为逐帧 zstd 的 1/4 ~ 1/3）
-  - 深度量程：D455F 理想范围 0.6m-6m（深度 200mm-8000mm 归一化到伪彩色）
-
-录制产物（输出目录，全部为最终格式）：
-  color.mp4         彩色 H.264（libx264 CRF 18，浏览器可播）
-  depth_raw.zst     原始深度序列（DZST v2：量化+差分 zstd 压缩，解码后为毫米深度值，供分析）
-  frames.jsonl      逐帧同步记录（MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
-  calibration.json  相机标定（depth_scale / RGB 内参 / 畸变 / 分辨率 / 序列号 / 对齐状态）
-  meta.json         序列号 / 分辨率 / 编码信息（逐帧数据在 frames.jsonl）
+背景：pyrealsense2 底层 C 库（librealsense）在 USB 不可达或初始化失败时可能
+崩溃，C 扩展的崩溃无法被 Python try/except 捕获，会杀死 Flask worker。
+所有 pyrealsense2 调用都通过 subprocess 在本脚本（独立进程）中执行，即使
+C 库崩溃也只影响本子进程。
 
 子命令：
-  probe                        探测设备，输出 "OK <count> <serial>" 与 "DETAIL <json>"
-  stream                       输出彩色 MJPEG 流到 stdout（含 --frame 边界）
-  record <path> <fps>          录制（彩色 MP4 + 原始深度 zstd + 逐帧同步与标定 JSON），stdin 收到 "stop" 后优雅停止
+  probe                短命探测设备，输出 "OK <count> <serial>" 与 "DETAIL <json>"
+  session <fps>        常驻会话：预览+录制共用同一 pipeline，父进程全程持有
+
+session 架构（消除预览↔录制切换的进程重启与设备抢占竞态）：
+- 启动即以原生最高规格（RGB 1280x800 bgr8 + 深度 1280x720 z16）打开 pipeline，
+  无试错降级（实测 D455F 可直启，~0.1s）
+- stdout 持续输出彩色 MJPEG（multipart/x-mixed-replace）；无消费者时写线程
+  阻塞+丢帧（_put_latest 丢最旧），不回压采集循环
+- stdin 每行一条 JSON 命令：
+    {"cmd":"start_rec","path":"<目录>"}   开始录制
+    {"cmd":"pause_rec"}                   暂停录制（帧不入编码器，预览继续）
+    {"cmd":"resume_rec"}                  恢复录制
+    {"cmd":"stop_rec"}                    停止录制（收尾后台线程完成）
+    {"cmd":"quit"}                        退出会话
+- 结果事件经独立 fd（环境变量 RS_SESSION_FD，父进程 os.pipe+pass_fds 提供）
+  每行一条 JSON（与 stdout 帧流不混流，父进程免解析）：
+    {"evt":"ready",...}            pipeline 就绪（fps/serial/name/firmware）
+    {"evt":"fatal","err":...}      会话启动失败
+    {"evt":"rec_started",...}      录制就绪（编码器已启动，目录已创建）
+    {"evt":"rec_start_err","err"}  录制启动失败
+    {"evt":"rec_done",...}         录制收尾完成（dir/frames）
+    {"evt":"rec_done_err","err"}   录制收尾失败
+- stop_rec 后收尾（编码 flush/文件校验/元数据）在后台线程，采集循环不中断、
+  预览持续输出；紧接 start_rec 立即开始新录制（不同输出目录互不冲突）
+
+数据流：只采集 彩色 + 深度 两路（不启用红外流），深度对齐到彩色坐标系。
+录制产物（输出目录，全部为最终格式）：
+  color.mp4         彩色 H.264（libx264 CRF 18，浏览器可播）
+  depth_raw.zst     原始深度序列（DZST v2：16mm 量化+帧间差分+zstd，解码后为毫米）
+  frames.jsonl      逐帧同步记录（MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
+  calibration.json  相机标定（depth_scale / RGB 内参 / 畸变 / 分辨率 / 序列号）
+  meta.json         序列号 / 分辨率 / 帧数 / 编码信息
 """
+import json
 import os
 import queue
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -37,59 +53,16 @@ SCRIPTS_DIR = os.path.join(BACK_DIR, "scripts")
 sys.path.insert(0, BACK_DIR)
 sys.path.insert(0, SCRIPTS_DIR)
 
-# 默认流配置：D455F 原生 RGB 1280x800（1MP 全局快门） + 深度 1280x720，30fps 起。
-# D455F 深度最高 90fps、RGB 最高 60fps；usbip 透传带宽有限，默认 30fps 稳定。
+# 默认流配置：D455F 原生 RGB 1280x800（1MP 全局快门） + 深度 1280x720，30fps。
 DEFAULT_FPS = 30
-# 分辨率协商降级链 (color_w, color_h, depth_w, depth_h)：
-# usbip 透传 USB2（480Mbps，实测 speed=480）下各组合带宽估算：
-#   1280x800@30+1280x720@30 ≈ 147MB/s 超 USB2（仅 5fps 可跑）
-#   848x480@15 ≈ 30MB/s / 640x480@30 ≈ 46MB/s 在 USB2 带宽内（可命中高帧率）
-# 帧率优先策略（_start_pipeline 先降分辨率再降 fps）会优先命中 640x480@30
-# 或 848x480@15，USB 链路升级到 USB3（5000M）后才能跑原生分辨率高帧率。
-_STREAM_COMBOS = (
-    (1280, 800, 1280, 720),   # D455F 原生（USB2 下仅 5fps）
-    (1280, 720, 1280, 720),
-    (848, 480, 848, 480),
-    (640, 480, 640, 480),
-)
+# 流配置：原生最高规格直接启动，不做分辨率/帧率试错降级（实测可直启）
+STREAM_COLOR = (1280, 800)
+STREAM_DEPTH = (1280, 720)
 
-# 上次启动成功的流组合缓存（fps+分辨率，见 _start_pipeline）：USB2 链路下降级链
-# 前面的组合必然失败，每次失败重试含 USB 带宽协商（usbip 下数秒）；缓存命中后
-# 一次 pipe.start 即成功。存 /tmp，容器重建自动失效（USB 链路升级后重新协商）。
-_COMBO_CACHE = os.path.join(tempfile.gettempdir(), "realsense_combo.json")
-
-# 设备忙重试预算（秒）：父进程停止上一子进程（预览/录制）后启动本进程，
-# 上一进程退出（pipe.stop 在 usbip 下需 2~5s）与 USB 内核释放期间
-# pipe.start 会失败，属"设备忙"而非配置不匹配，短间隔重试即可等到。
-# 12s 覆盖：卡死的上一进程被父进程 kill（STREAM_EXIT_GRACE_SECONDS=10）
-# 后内核释放 USB 的窗口。
+# 设备忙重试预算（秒）：上一会话进程退出后内核释放 USB 需要 1~2.5s，期间
+# pipe.start 报 EBUSY，短间隔重试等到释放即可；预算耗尽仍忙则失败。
 BUSY_RETRY_SECONDS = 12.0
 BUSY_RETRY_INTERVAL = 0.5
-
-
-def _load_combo_cache():
-    """读取上次成功的 (fps, cw, ch, dw, dh)；无缓存/损坏/不在合法组合内返回 None"""
-    import json
-    try:
-        with open(_COMBO_CACHE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        combo = (int(d["fps"]), int(d["cw"]), int(d["ch"]), int(d["dw"]), int(d["dh"]))
-        if combo[0] in (60, 30, 15, 5) and combo[1:] in _STREAM_COMBOS:
-            return combo
-    except Exception:
-        pass
-    return None
-
-
-def _save_combo_cache(combo):
-    """记录本次成功的流组合，供下次启动优先尝试"""
-    import json
-    try:
-        with open(_COMBO_CACHE, "w", encoding="utf-8") as f:
-            json.dump({"fps": combo[0], "cw": combo[1], "ch": combo[2],
-                       "dw": combo[3], "dh": combo[4]}, f)
-    except Exception:
-        pass
 
 # 保存原始 stdout 的 fd，供 C 库日志重定向后仍能输出结果/帧
 _saved_stdout_fd = None
@@ -138,9 +111,7 @@ def _distortion_name(rs, model):
 
 
 def _query_devices():
-    """枚举 RealSense 设备，返回 (count, serial)
-    只枚举不打开流，避免长时间占用设备。
-    """
+    """枚举 RealSense 设备，返回 (count, serial)；只枚举不打开流"""
     rs = _import_rs()
     ctx = rs.context()
     devices = ctx.query_devices()
@@ -154,21 +125,8 @@ def _query_devices():
     return count, serial
 
 
-def _fps_chain(fps):
-    """请求 fps -> 逐级降级链（只降不升），如 30 -> [30, 15, 5]"""
-    std = [60, 30, 15, 5]
-    chain = []
-    for f in [int(fps)] + std:
-        if f not in chain and f <= int(fps):
-            chain.append(f)
-    return chain
-
-
 def _is_no_device(err):
-    """pipe.start 失败是否疑似无设备在位（区别于设备忙/带宽配置失败）
-
-    仅作疑似判断：命中后由 _query_devices 枚举确认，避免误报。
-    """
+    """pipe.start 失败是否疑似无设备在位（区别于设备忙/配置失败）"""
     s = str(err).lower()
     return any(k in s for k in (
         "no device", "no devices", "device not found",
@@ -176,13 +134,7 @@ def _is_no_device(err):
 
 
 def _is_device_busy(err):
-    """判断 pipe.start 失败是否属设备被占用（V4L2 EBUSY，errno=16）
-
-    usbip 下上一子进程退出后内核释放 USB 需要 1~2.5s，期间 pipe.start 报
-    "xioctl(VIDIOC_S_FMT) failed, errno=16 ... Device or resource busy"。
-    该错误与流配置无关（设备被占时换任何组合同样失败），识别出来以便
-    _start_pipeline 原地重试等释放，而不是浪费降级链。
-    """
+    """判断 pipe.start 失败是否属设备被占用（V4L2 EBUSY，errno=16）"""
     s = str(err).lower()
     return any(k in s for k in (
         "errno=16", "errno 16", "device or resource busy",
@@ -190,86 +142,53 @@ def _is_device_busy(err):
 
 
 def _start_pipeline(rs, fps):
-    """启动 pipeline（彩色 + 深度），帧率优先降级，失败自动降档。
+    """启动 pipeline（彩色 + 深度，原生最高规格直接启动）
 
-    usbip 透传下 RealSense 被识别为 USB2（480Mbps，实测 speed=480），带宽预算约
-    40-60MB/s，D455F 原生 1280x800@30+1280x720@30 需约 147MB/s 必然失败。
-    帧率优先：先以请求 fps 试所有分辨率（USB2 内 640x480@30 约 46MB/s 可命中），
-    全失败再降 fps（15fps 命中 848x480，5fps 才跑得起原生 1280x800）。
+    不做分辨率/帧率试错降级：D455F 原生 1280x800+1280x720 可直启，
+    降级链每次失败的 pipe.start 耗时数秒，纯浪费。
 
-    上次成功组合优先尝试（缓存于 _COMBO_CACHE）：降级链前面的组合在 USB2 下
-    每次启动都要重复失败重试，缓存命中后一次 pipe.start 即成功。
-
-    设备忙重试：EBUSY 错误无论有无缓存组合都原地重试（共享 8s 总预算）。
-    父进程发出停止信号后不等上一子进程退出即启动本进程（缩短启动耗时），
-    本进程 import 完成时上一进程可能仍持有相机（pipe.stop 在 usbip 下需
-    1~2.5s），pipe.start 失败属"设备忙"而非配置不匹配，短间隔重试等到释放
-    即可；预算耗尽仍忙则直接失败（继续降级无意义）。非 busy 失败仍只对缓存
-    组合重试——组合可能因带宽不足失败，重试无意义，直接走降级链。
+    设备忙重试：上一会话进程退出与内核释放 USB 期间 pipe.start 报 EBUSY，
+    属"设备忙"而非配置问题，短间隔重试等到释放即可；预算耗尽仍忙则失败。
 
     返回 (pipeline, profile, color_w, color_h, depth_w, depth_h, actual_fps)；
-    profile 用于读取实际设备信息（型号/固件/深度缩放）。所有组合均失败时抛异常。
+    profile 用于读取实际设备信息（型号/固件/深度缩放）。启动失败时抛异常。
     """
-    chain = [(f, cw, ch, dw, dh)
-             for f in _fps_chain(fps)
-             for (cw, ch, dw, dh) in _STREAM_COMBOS]
-    cached = _load_combo_cache()
-    # cached in chain 隐含 cached fps <= 请求 fps（chain 只含请求 fps 及以下档位）
-    if cached in chain:
-        attempts = [cached] + [c for c in chain if c != cached]
-    else:
-        attempts = chain
+    fps = int(fps)
+    cw, ch = STREAM_COLOR
+    dw, dh = STREAM_DEPTH
     last_err = None
-    busy_until = 0.0  # 首次遇到 EBUSY 时起算的共享重试预算（设备忙与组合无关）
-    for combo in attempts:
-        (f, cw, ch, dw, dh) = combo
-        # 非 busy 失败时缓存组合（上次成功过）的重试预算：容忍短暂抖动
-        retry_until = (time.monotonic() + BUSY_RETRY_SECONDS
-                       if cached is not None and combo == cached else 0.0)
-        while True:
-            pipe = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, f)
-            cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, f)
+    busy_until = 0.0  # 首次遇到 EBUSY/瞬时抖动时起算的共享重试预算
+    while True:
+        pipe = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, cw, ch, rs.format.bgr8, fps)
+        cfg.enable_stream(rs.stream.depth, dw, dh, rs.format.z16, fps)
+        try:
+            profile = pipe.start(cfg)
+            return pipe, profile, cw, ch, dw, dh, fps
+        except Exception as e:
+            last_err = e
             try:
-                profile = pipe.start(cfg)
-                _save_combo_cache(combo)
-                return pipe, profile, cw, ch, dw, dh, f
-            except Exception as e:
-                last_err = e
+                pipe.stop()
+            except Exception:
+                pass
+            if _is_no_device(e):
+                # 疑似无设备：枚举确认（仅失败路径枚举）后立即失败。
+                # 设备在位却报该错属瞬时抖动，继续重试
                 try:
-                    pipe.stop()
+                    count, _serial = _query_devices()
                 except Exception:
-                    pass
-                if _is_no_device(e):
-                    # 疑似无设备：枚举确认（仅失败路径枚举）后立即失败，
-                    # 不跑完整个降级链。设备在位却报该错属瞬时抖动，
-                    # 按普通失败继续降级。
-                    try:
-                        count, _serial = _query_devices()
-                    except Exception:
-                        count = 0
-                    if count == 0:
-                        raise RuntimeError("未检测到 RealSense 相机") from e
-                    last_err = e
-                    break
-                if _is_device_busy(e):
-                    # 设备忙与流配置无关：原地重试等上一进程释放。
-                    # 无缓存时同样生效（原先仅缓存组合重试，容器重建后缓存
-                    # 丢失会导致预览→录制切换的首次启动必然失败）
-                    if busy_until == 0.0:
-                        busy_until = time.monotonic() + BUSY_RETRY_SECONDS
-                    if time.monotonic() < busy_until:
-                        time.sleep(BUSY_RETRY_INTERVAL)
-                        continue
-                elif time.monotonic() < retry_until:
-                    time.sleep(BUSY_RETRY_INTERVAL)
-                    continue
-                break
-        if busy_until and _is_device_busy(last_err) and time.monotonic() >= busy_until:
-            break  # 忙预算耗尽：设备仍被占用，继续降级无意义
-    # 所有组合均失败：枚举一次确认设备状态，给出准确错误（仅失败路径
-    # 枚举，正常路径零枚举开销）
+                    count = 0
+                if count == 0:
+                    raise RuntimeError("未检测到 RealSense 相机") from e
+            elif not _is_device_busy(e):
+                break  # 非"忙"类失败（配置/带宽）：重试无意义，直接报错
+            if busy_until == 0.0:
+                busy_until = time.monotonic() + BUSY_RETRY_SECONDS
+            if time.monotonic() >= busy_until:
+                break  # 忙预算耗尽：设备仍被占用
+            time.sleep(BUSY_RETRY_INTERVAL)
+    # 启动失败：枚举一次确认设备状态，给出准确错误
     try:
         count, _serial = _query_devices()
     except Exception:
@@ -286,7 +205,7 @@ def _frame_array(frame):
 
     pyrealsense2 的 frame.get_data() 在 numpy 可用时返回 ndarray，但在部分
     numpy/OpenCV 组合下（如容器内 opencv 5.x）会回退返回 bytes；统一在此转换，
-    供 stream（cv2 编码）与 record（ffmpeg 原始帧）共用。
+    供预览（cv2 编码）与录制（ffmpeg 原始帧）共用。
     """
     import numpy as np
     data = frame.get_data()
@@ -295,17 +214,6 @@ def _frame_array(frame):
         return np.frombuffer(data, dtype=np.uint8).reshape(
             frame.get_height(), frame.get_width(), -1)
     return np.ascontiguousarray(data)
-
-
-def _emit_jpeg(frame, quality=80):
-    """将一帧编码为 JPEG 并写入 stdout（含 MJPEG 边界）"""
-    import cv2
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        return
-    _safe_write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-    _safe_write(buf.tobytes())
-    _safe_write(b"\r\n")
 
 
 def _put_latest(q, item):
@@ -326,17 +234,45 @@ def _put_latest(q, item):
 
 
 def _preview_writer(q, w, h):
-    """录制中实时预览写线程：从队列取彩色帧编码 JPEG 写 stdout（multipart 边界）
+    """预览写线程：从队列取彩色帧编码 JPEG 写 stdout（multipart 边界）
 
-    必须独立于采集循环：预览帧（~100KB）超过 stdout 管道缓冲（64KB），录制
-    刚开始前端尚未重连预览流（无消费者）时写管道会阻塞——曾内联在采集循环
-    里执行，开头阻塞 ~1s 导致 librealsense 帧队列溢出丢 29 帧（硬件帧号
-    1→31）。独立线程后管道背压只阻塞本线程，采集循环满帧率运行；队列满
-    丢最旧帧，消费者恢复后立即跟上最新画面。
+    必须独立于采集循环：预览帧超过 stdout 管道缓冲（64KB），无消费者时写
+    管道会阻塞——独立线程后管道背压只阻塞本线程，采集循环满帧率运行；
+    队列满丢最旧帧，消费者恢复后立即跟上最新画面。
+
+    写入采用非阻塞 fd + 分块 + 单帧超时：消费者断开后（浏览器刷新/URL 轮换）
+    管道缓冲写满，阻塞写会让本线程永久挂死——此后任何新的流请求都等不到
+    数据，预览画面永久消失。非阻塞分块写超时后丢弃整帧，保证写线程永不
+    挂死：无消费者时静默丢帧，新消费者接入立即恢复出图。
     """
     import cv2
+    import fcntl
     import numpy as np
+    import select
     fd = _saved_stdout_fd if _saved_stdout_fd is not None else 1
+    try:
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    except (OSError, AttributeError):
+        pass  # 非 Linux（本不该发生）：退化为原阻塞行为
+
+    FRAME_WRITE_TIMEOUT = 2.0  # 单帧写入预算（秒）：消费者断开/极慢时丢帧
+
+    def _write_frame(data, deadline):
+        """非阻塞分块写：超时/EPIPE 返回 False（丢帧），写完返回 True"""
+        view = memoryview(data)
+        while view:
+            try:
+                n = os.write(fd, view)
+                view = view[n:]
+            except BlockingIOError:
+                if time.time() > deadline:
+                    return False
+                select.select([], [fd], [], 0.2)
+            except OSError:
+                return False
+        return True
+
     while True:
         item = q.get()
         if item is None:
@@ -344,10 +280,14 @@ def _preview_writer(q, w, h):
         try:
             frame = np.frombuffer(item, np.uint8).reshape(h, w, 3)
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            if ok:
-                os.write(fd, b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-                os.write(fd, buf.tobytes())
-                os.write(fd, b"\r\n")
+            if not ok:
+                continue
+            deadline = time.time() + FRAME_WRITE_TIMEOUT
+            if not _write_frame(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n", deadline):
+                continue
+            if not _write_frame(buf.tobytes(), deadline):
+                continue
+            _write_frame(b"\r\n", deadline)
         except (OSError, BrokenPipeError):
             continue
 
@@ -372,7 +312,6 @@ def cmd_probe():
                 serial = ""
         _safe_print(f"OK {count} {serial}")
         if count > 0:
-            import json as _json
             dev = devices[0]
             detail = {}
             for key, info in (
@@ -384,58 +323,14 @@ def cmd_probe():
                     detail[key] = dev.get_info(info) or ""
                 except Exception:
                     detail[key] = ""
-            _safe_print("DETAIL " + _json.dumps(detail, ensure_ascii=False))
+            _safe_print("DETAIL " + json.dumps(detail, ensure_ascii=False))
         return 0
     except Exception as e:
         _safe_print(f"ERR {e}")
         return 1
 
 
-# ==================== stream ====================
-def cmd_stream(fps):
-    """持续输出彩色 MJPEG 流。stdin 收到 "stop" 时优雅退出；父进程断连自动退出。"""
-    try:
-        rs = _import_rs()
-        # 不预先枚举设备：_start_pipeline 成功即设备在位；失败时由其内部
-        # 诊断（枚举确认无设备/被占用），正常路径省掉 usbip 下 1~2s 的
-        # USB 枚举耗时（仅失败时才枚举，错误信息同样准确）
-        pipe, profile, cw, ch, dw, dh, actual_fps = _start_pipeline(rs, int(fps))
-
-        stop_event = threading.Event()
-
-        def _watch_stdin():
-            try:
-                for line in sys.stdin:
-                    if line.strip() == "stop":
-                        stop_event.set()
-                        break
-            except Exception:
-                pass
-
-        threading.Thread(target=_watch_stdin, daemon=True).start()
-        # 就绪行：父进程据此确认 pipeline 已成功启动（stdin "stop" 即优雅退出）
-        _safe_print(f"READY {actual_fps}")
-        try:
-            while not stop_event.is_set():
-                frames = pipe.wait_for_frames()
-                color = frames.get_color_frame()
-                if color is None:
-                    continue
-                # color.get_data() 为 (h, w, 3) 的 BGR ndarray（bgr8 格式）
-                _emit_jpeg(_frame_array(color))
-        finally:
-            # 不调用 pipe.stop()：该 C 库调用在 usbip 下实测可能卡死 10s+
-            # （每次预览→录制切换都触发父进程 10s 兜底 kill，总耗时十几秒）。
-            # 预览无持久数据，直接退出由内核关闭 USB fd 释放设备（释放约
-            # 1s，与父进程 kill 兜底路径一致，且已验证下次 pipe.start 正常）。
-            pass
-        return 0
-    except Exception as e:
-        _safe_print(f"ERR {e}")
-        return 1
-
-
-# ==================== record ====================
+# ==================== session ====================
 def _spawn_ffmpeg(args, logf=None):
     """启动 ffmpeg 编码器子进程（stdin 收 rawvideo 帧；logf 非空时 stderr 追加到该文件）"""
     import subprocess
@@ -504,7 +399,6 @@ def _zstd_writer(q, fobj, w, h):
 
 def _jsonl_writer(q, fobj):
     """写线程：从队列取帧记录字典逐行写 JSONL；None 哨兵后关闭文件"""
-    import json
     try:
         while True:
             item = q.get()
@@ -522,130 +416,115 @@ def _jsonl_writer(q, fobj):
             pass
 
 
-def cmd_record(path, fps):
-    """录制彩色 H.264 MP4 + DZST v2 深度压缩序列 + 逐帧同步/标定信息
+def cmd_session(fps):
+    """常驻会话：预览+录制共用 pipeline（协议见模块 docstring）"""
+    fd_env = os.environ.get("RS_SESSION_FD")
+    proto = None
+    if fd_env:
+        try:
+            proto = os.fdopen(int(fd_env), "wb", buffering=0)
+        except OSError:
+            proto = None
 
-    产物（输出目录保留，不打包；全部为最终格式，无需二次转码）：
-      <path>/color.mp4         彩色视频（H.264，libx264 CRF 18，浏览器可播）
-      <path>/depth_raw.zst     原始深度序列（DZST v2：16mm 量化 + 帧间差分 zstd，解码后为毫米深度值）
-      <path>/frames.jsonl      逐帧记录：mp4_frame/zst_frame + RGB/深度硬件时间戳 + 硬件帧号
-      <path>/calibration.json  相机标定：depth_scale/RGB 内参/畸变/分辨率/序列号/对齐状态
-      <path>/meta.json         序列号 / 配置 / 编码信息
-    深度伪彩色不再录制：可视化播放时由后端从原始深度实时转码（depth-video 端点）。
-    输出 "DONE <out_dir> <frames>" 或 "ERR <原因>" 到 stdout。
-    """
-    import json
-    import queue
-    import struct
+    def send_evt(d):
+        if proto is None:
+            return
+        try:
+            proto.write((json.dumps(d, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError:
+            pass
 
     try:
         rs = _import_rs()
-        # 不预先枚举设备（省 usbip 下 1~2s）：无设备/被占用由 _start_pipeline
-        # 失败路径诊断报错；序列号改从已启动 pipeline 的设备对象读取
         pipe, profile, cw, ch, dw, dh, actual_fps = _start_pipeline(rs, int(fps))
+    except Exception as e:
+        send_evt({"evt": "fatal", "err": str(e)})
+        return 1
 
-        # 从已启动的 pipeline 读取设备信息（与录制同一设备），写入 meta 供入库
-        device = profile.get_device()
-        device_name = ""
-        firmware = ""
-        depth_units_mm = 1.0
-        _serial = ""
+    # 从已启动的 pipeline 读取设备信息（与会话同一设备），随事件上报父进程
+    device = profile.get_device()
+    dev_info = {}
+    for key, info in (("name", rs.camera_info.name),
+                      ("firmware", rs.camera_info.firmware_version),
+                      ("serial", rs.camera_info.serial_number)):
         try:
-            device_name = device.get_info(rs.camera_info.name) or ""
+            dev_info[key] = device.get_info(info) or ""
         except Exception:
-            pass
-        try:
-            firmware = device.get_info(rs.camera_info.firmware_version) or ""
-        except Exception:
-            pass
-        try:
-            _serial = device.get_info(rs.camera_info.serial_number) or ""
-        except Exception:
-            pass
-        try:
-            depth_units_mm = round(device.first_depth_sensor()
-                                   .get_option(rs.option.depth_units) * 1000.0, 3)
-        except Exception:
-            pass
+            dev_info[key] = ""
+    try:
+        dev_info["depth_units_mm"] = round(
+            device.first_depth_sensor().get_option(rs.option.depth_units) * 1000.0, 3)
+    except Exception:
+        dev_info["depth_units_mm"] = 1.0
 
-        # 深度对齐到彩色坐标系（depth aligned to color）：
-        # 对齐后深度图逐像素与彩色图对应（分辨率也变为彩色分辨率）
-        align = rs.align(rs.stream.color)
-        dw, dh = cw, ch  # 对齐后深度分辨率 = 彩色分辨率
+    # 深度对齐到彩色坐标系（对齐后深度逐像素对应彩色，分辨率也变为彩色分辨率）
+    align = rs.align(rs.stream.color)
 
-        stop_event = threading.Event()
+    quit_evt = threading.Event()
 
-        def _watch_stdin():
-            try:
-                for line in sys.stdin:
-                    if line.strip() == "stop":
-                        stop_event.set()
-                        break
-            except Exception:
-                pass
+    # 预览写线程（无消费者时阻塞+丢帧，不回压采集循环）
+    preview_q = queue.Queue(maxsize=2)
+    preview_writer = threading.Thread(
+        target=_preview_writer, args=(preview_q, cw, ch), daemon=True)
+    preview_writer.start()
 
-        threading.Thread(target=_watch_stdin, daemon=True).start()
+    # 录制状态：命令线程（stdin watcher）与采集循环共享，操作经 rec_lock 串行；
+    # 帧计数器仅在 active=True 期间被采集循环读写（start 时在锁内置零后才置
+    # active，stop 快照后立即置 False），无并发写冲突
+    rec_lock = threading.Lock()
+    rec = {"active": False}
+    finalize_threads = []
 
-        out_dir = os.path.abspath(path)
+    def handle_start_rec(path):
+        out_dir = os.path.abspath(path or "")
+        if not out_dir:
+            send_evt({"evt": "rec_start_err", "err": "缺少录制目录"})
+            return
+        with rec_lock:
+            if rec["active"]:
+                send_evt({"evt": "rec_start_err", "err": "已有录制进行中"})
+                return
         os.makedirs(out_dir, exist_ok=True)
-
         color_mp4 = os.path.join(out_dir, "color.mp4")
         depth_zst = os.path.join(out_dir, "depth_raw.zst")
-
-        # 编码器：仅彩色 bgr24 -> libx264（一次有损，直接 H.264 浏览器可播）
-        # 深度原始帧不走 ffmpeg，由 zstd 写线程直接压缩，省掉 ffv1 EOF flush 卡顿
         logf = None
         try:
             logf = open(os.path.join(out_dir, "ffmpeg.log"), "ab")
         except OSError:
             pass
-        encs = []
         try:
-            encs.append(_spawn_ffmpeg([
+            enc = _spawn_ffmpeg([
                 "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{cw}x{ch}",
                 "-r", str(actual_fps), "-i", "pipe:0",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "15",
-                "-movflags", "+faststart", "-an", color_mp4], logf))
+                "-movflags", "+faststart", "-an", color_mp4], logf)
         except Exception as e:
-            for p in encs:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
             if logf is not None:
                 try:
                     logf.close()
                 except Exception:
                     pass
-            _safe_print(f"ERR 启动编码器失败: {e}")
-            return 1
+            send_evt({"evt": "rec_start_err", "err": f"启动编码器失败: {e}"})
+            return
 
         color_q = queue.Queue(maxsize=30)
         color_writer = threading.Thread(
-            target=_enc_writer, args=(color_q, encs[0]), daemon=True)
+            target=_enc_writer, args=(color_q, enc), daemon=True)
         color_writer.start()
-
         depth_q = queue.Queue(maxsize=30)
         depth_fobj = open(depth_zst, "wb")
+        # 对齐后深度分辨率 = 彩色分辨率
         depth_writer = threading.Thread(
-            target=_zstd_writer, args=(depth_q, depth_fobj, dw, dh), daemon=True)
+            target=_zstd_writer, args=(depth_q, depth_fobj, cw, ch), daemon=True)
         depth_writer.start()
-
-        # 逐帧同步记录（frames.jsonl：MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
         frames_q = queue.Queue(maxsize=60)
         frames_fobj = open(os.path.join(out_dir, "frames.jsonl"), "w", encoding="utf-8")
         frames_writer = threading.Thread(
             target=_jsonl_writer, args=(frames_q, frames_fobj), daemon=True)
         frames_writer.start()
 
-        # 实时预览写线程（独立于采集循环，见 _preview_writer 注释）
-        preview_q = queue.Queue(maxsize=2)
-        preview_writer = threading.Thread(
-            target=_preview_writer, args=(preview_q, cw, ch), daemon=True)
-        preview_writer.start()
-
-        # 相机标定信息（每次录制保存一次，写入 out_dir/calibration.json）
+        # 相机标定信息（每次录制保存一次）
         color_intr = None
         try:
             color_intr = profile.get_stream(
@@ -653,12 +532,12 @@ def cmd_record(path, fps):
         except Exception:
             pass
         calib = {
-            "depth_scale": round(depth_units_mm / 1000.0, 6),  # 米/单位（depth_units）
+            "depth_scale": round(dev_info["depth_units_mm"] / 1000.0, 6),
             "rgb_intrinsics": None,
             "rgb_distortion": None,
             "rgb_resolution": f"{cw}x{ch}",
-            "depth_resolution": f"{dw}x{dh}",
-            "serial": _serial,
+            "depth_resolution": f"{cw}x{ch}",
+            "serial": dev_info["serial"],
             "depth_aligned_to_color": True,
             "align_note": "color/depth 已执行 align_to_color 对齐（深度分辨率与彩色一致）；时间戳为传感器硬件时钟(ms)",
         }
@@ -679,153 +558,232 @@ def cmd_record(path, fps):
         except Exception:
             pass  # 标定信息写盘失败不影响录制
 
-        frame_idx = 0
-        mp4_count = 0
-        zst_count = 0
-        meta = {
-            "device_type": "realsense",
-            "device_serial": _serial,
-            "device_name": device_name,
-            "firmware_version": firmware,
-            "color_resolution": f"{cw}x{ch}",
-            "depth_resolution": f"{dw}x{dh}",
-            "depth_units_mm": depth_units_mm,
-            "fps": actual_fps,
-            "start_time": datetime.now().isoformat(timespec="seconds"),
-        }
-        # 就绪行：所有编码器/写线程就绪后才输出，父进程据此确认录制已可用；
-        # 携带设备信息（fps/序列号/型号/固件），父进程免再跑一次 probe 探测
-        # （probe 需额外拉起 Python+pyrealsense2 枚举 USB，usbip 下约 2~4s）
-        _safe_print("READY " + json.dumps({
-            "fps": actual_fps,
-            "serial": _serial,
-            "name": device_name,
-            "firmware": firmware,
-        }, ensure_ascii=False))
+        with rec_lock:
+            rec.update({
+                "active": True, "dir": out_dir, "color_mp4": color_mp4,
+                "depth_zst": depth_zst, "enc": enc, "logf": logf,
+                "color_q": color_q, "depth_q": depth_q, "frames_q": frames_q,
+                "color_writer": color_writer, "depth_writer": depth_writer,
+                "frames_writer": frames_writer,
+                "frame_idx": 0, "mp4_count": 0, "zst_count": 0,
+                "start_time": datetime.now().isoformat(timespec="seconds"),
+                "paused": False, "pauses": [],
+            })
+        send_evt({"evt": "rec_started", "dir": out_dir, "fps": actual_fps,
+                  "serial": dev_info["serial"], "name": dev_info["name"],
+                  "firmware": dev_info["firmware"]})
+
+    def _finalize_rec(snap):
+        """录制收尾（后台线程）：哨兵→写线程 EOF→ffmpeg flush→校验→元数据→rec_done
+
+        采集循环不等待本线程：收尾期间相机继续预览，start_rec 可立即开始新录制。
+        """
+        out_dir = snap["dir"]
+        frame_idx = snap["frame_idx"]
         try:
-            while not stop_event.is_set():
-                frames = pipe.wait_for_frames()
-                frames = align.process(frames)  # 深度对齐到彩色坐标系
-                color = frames.get_color_frame()
-                depth = frames.get_depth_frame()
-                items = [None, None]
-                rec = {}
-                if color is not None:
-                    color_arr = _frame_array(color)
-                    items[0] = color_arr.tobytes()
-                    # 实时预览帧入队（复用 items[0] 的字节拷贝，零额外拷贝）：
-                    # 编码与写管道由预览线程承担，不占采集循环的帧率预算
-                    _put_latest(preview_q, items[0])
-                    rec["mp4_frame"] = mp4_count
-                    mp4_count += 1
-                    rec["rgb_ts_ms"] = round(color.get_timestamp(), 3)
-                    rec["rgb_frame"] = color.get_frame_number()
-                if depth is not None:
-                    items[1] = _frame_array(depth).tobytes()
-                    rec["zst_frame"] = zst_count
-                    zst_count += 1
-                    rec["depth_ts_ms"] = round(depth.get_timestamp(), 3)
-                    rec["depth_frame"] = depth.get_frame_number()
-                for q, item in zip((color_q, depth_q), items):
-                    if item is None:
-                        continue
-                    # 带超时入队：队列满表示编码/压缩背压（限速）；收到停止信号时丢弃该帧
-                    while True:
-                        try:
-                            q.put(item, timeout=0.5)
-                            break
-                        except queue.Full:
-                            if stop_event.is_set():
-                                break
-                if rec:
-                    try:
-                        frames_q.put_nowait(rec)
-                    except queue.Full:
-                        pass  # 背压：帧同步记录非关键，丢弃
-                frame_idx += 1
-        finally:
-            # 先不 pipe.stop()：与 stream 同理，该调用在 usbip 下可能卡死
-            # 10s+，拖慢收尾导致下一次"开始录制"长时间等待。数据收尾
-            # （ffmpeg flush / zstd finish / 元数据）不依赖设备停止；进程
-            # 退出时内核关闭 USB fd 释放设备，与预览 kill 兜底路径一致。
-            stop_event.set()
-            # 哨兵 → 写线程关闭 stdin → ffmpeg 读到 EOF 正常 flush 收尾
-            for q in (color_q, depth_q, frames_q):
+            for q in (snap["color_q"], snap["depth_q"], snap["frames_q"]):
                 try:
                     q.put(None)
                 except Exception:
                     pass
-            # 预览线程哨兵（丢旧策略，队列满也不阻塞收尾）并等它退出：
-            # 确保 DONE 结果行输出前不再有预览帧写 stdout，避免 JPEG 字节
-            # 与结果行交错导致父进程解析不到 DONE
-            _put_latest(preview_q, None)
-            preview_writer.join(timeout=5)
-            color_writer.join(timeout=60)
-            depth_writer.join(timeout=120)
-            frames_writer.join(timeout=60)
-            for p in encs:
+            snap["color_writer"].join(timeout=60)
+            snap["depth_writer"].join(timeout=120)
+            snap["frames_writer"].join(timeout=60)
+            try:
+                snap["enc"].wait(timeout=60)
+            except Exception:
                 try:
-                    p.wait(timeout=60)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
-            if logf is not None:
-                try:
-                    logf.close()
+                    snap["enc"].kill()
                 except Exception:
                     pass
-
-        if frame_idx == 0:
-            import shutil
-            shutil.rmtree(out_dir, ignore_errors=True)
-            _safe_print("ERR 未采集到任何帧")
-            return 1
-
-        color_ok = os.path.isfile(color_mp4) and os.path.getsize(color_mp4) > 0
-        # 深度有效性：解析 DZST 头部确认帧数>0（v2 头部 20 字节，0 帧空文件
-        # 也会超过旧的 ">16 字节" 阈值被误判有效；帧数未回填=写线程异常截断）
-        raw_ok = False
-        if os.path.isfile(depth_zst) and os.path.getsize(depth_zst) > 20:
+            if snap["logf"] is not None:
+                try:
+                    snap["logf"].close()
+                except Exception:
+                    pass
+            if frame_idx == 0:
+                import shutil
+                shutil.rmtree(out_dir, ignore_errors=True)
+                send_evt({"evt": "rec_done_err", "err": "未采集到任何帧"})
+                return
+            color_ok = os.path.isfile(snap["color_mp4"]) and os.path.getsize(snap["color_mp4"]) > 0
+            # 深度有效性：解析 DZST 头部确认帧数>0（帧数未回填=写线程异常截断）
+            raw_ok = False
+            if os.path.isfile(snap["depth_zst"]) and os.path.getsize(snap["depth_zst"]) > 20:
+                try:
+                    _dz = _load_depth_zst()
+                    with open(snap["depth_zst"], "rb") as f:
+                        _hdr = _dz.read_header(f)
+                    raw_ok = bool(_hdr and _hdr[3] > 0)
+                except Exception:
+                    raw_ok = False
+            if not color_ok:
+                send_evt({"evt": "rec_done_err", "err": "彩色视频编码失败（详见 ffmpeg.log）"})
+                return
+            meta = {
+                "device_type": "realsense",
+                "device_serial": dev_info["serial"],
+                "device_name": dev_info["name"],
+                "firmware_version": dev_info["firmware"],
+                "color_resolution": f"{cw}x{ch}",
+                "depth_resolution": f"{cw}x{ch}",
+                "depth_units_mm": dev_info["depth_units_mm"],
+                "fps": actual_fps,
+                "start_time": snap["start_time"],
+                "end_time": datetime.now().isoformat(timespec="seconds"),
+                "frame_count": frame_idx,
+                "depth_raw": bool(raw_ok),
+                "color_codec": "h264",
+                "depth_codec": "dzst2",
+                "pauses": snap.get("pauses") or [],
+            }
+            # 量化步长与 depth_zst.QUANTUM 保持一致（当前 16mm，误差 ±8mm）
             try:
-                _dz = _load_depth_zst()
-                with open(depth_zst, "rb") as f:
-                    _hdr = _dz.read_header(f)
-                raw_ok = bool(_hdr and _hdr[3] > 0)
+                meta["depth_quantum_mm"] = int(_load_depth_zst().QUANTUM)
             except Exception:
-                raw_ok = False
-        if not color_ok:
-            _safe_print("ERR 彩色视频编码失败（详见 ffmpeg.log）")
-            return 1
-
-        meta["end_time"] = datetime.now().isoformat(timespec="seconds")
-        meta["frame_count"] = frame_idx
-        meta["depth_raw"] = bool(raw_ok)
-        meta["color_codec"] = "h264"
-        meta["depth_codec"] = "dzst2"
-        # 量化步长与 depth_zst.QUANTUM 保持一致（当前 16mm，误差 ±8mm）
-        try:
-            meta["depth_quantum_mm"] = int(_load_depth_zst().QUANTUM)
-        except Exception:
-            meta["depth_quantum_mm"] = 16
-        try:
-            with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
+                meta["depth_quantum_mm"] = 16
+            try:
+                with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                send_evt({"evt": "rec_done_err", "err": f"写元数据失败: {e}"})
+                return
+            send_evt({"evt": "rec_done", "dir": out_dir, "frames": frame_idx})
         except Exception as e:
-            _safe_print(f"ERR 写元数据失败: {e}")
-            return 1
-        _safe_print(f"DONE {out_dir} {frame_idx}")
-        return 0
-    except Exception as e:
-        _safe_print(f"ERR {e}")
-        return 1
+            send_evt({"evt": "rec_done_err", "err": str(e)})
+
+    def handle_stop_rec():
+        with rec_lock:
+            if not rec["active"]:
+                return
+            rec["active"] = False
+            # 停止时仍在暂停中：补全暂停区间结束时间
+            if rec.get("paused") and rec["pauses"] and "end" not in rec["pauses"][-1]:
+                rec["pauses"][-1]["end"] = datetime.now().isoformat(timespec="seconds")
+            snap = dict(rec)
+        t = threading.Thread(target=_finalize_rec, args=(snap,), daemon=True)
+        finalize_threads.append(t)
+        t.start()
+
+    def handle_pause_rec():
+        with rec_lock:
+            if not rec["active"] or rec.get("paused"):
+                return
+            rec["paused"] = True
+            rec["pauses"].append(
+                {"start": datetime.now().isoformat(timespec="seconds")})
+        send_evt({"evt": "rec_paused"})
+
+    def handle_resume_rec():
+        with rec_lock:
+            if not rec["active"] or not rec.get("paused"):
+                return
+            rec["paused"] = False
+            if rec["pauses"] and "end" not in rec["pauses"][-1]:
+                rec["pauses"][-1]["end"] = datetime.now().isoformat(timespec="seconds")
+        send_evt({"evt": "rec_resumed"})
+
+    def _watch_stdin():
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    cmd = json.loads(line)
+                except Exception:
+                    continue
+                c = cmd.get("cmd")
+                if c == "start_rec":
+                    handle_start_rec(cmd.get("path") or "")
+                elif c == "stop_rec":
+                    handle_stop_rec()
+                elif c == "pause_rec":
+                    handle_pause_rec()
+                elif c == "resume_rec":
+                    handle_resume_rec()
+                elif c == "quit":
+                    quit_evt.set()
+                    break
+        except Exception:
+            pass
+        finally:
+            # 父进程退出/关闭 stdin（worker 重启）：退出释放相机
+            quit_evt.set()
+
+    threading.Thread(target=_watch_stdin, daemon=True).start()
+
+    send_evt({"evt": "ready", "fps": actual_fps, **dev_info})
+
+    try:
+        while not quit_evt.is_set():
+            frames = pipe.wait_for_frames()
+            color = frames.get_color_frame()
+            if color is not None:
+                _put_latest(preview_q, _frame_array(color).tobytes())
+            with rec_lock:
+                active = rec["active"]
+                paused = rec.get("paused")
+            # 暂停中：跳过录制入队（帧不进编码器），预览流继续输出
+            if not active or paused:
+                continue
+            aligned = align.process(frames)
+            a_color = aligned.get_color_frame()
+            a_depth = aligned.get_depth_frame()
+            items = [None, None]
+            frec = {}
+            if a_color is not None:
+                items[0] = _frame_array(a_color).tobytes()
+                frec["mp4_frame"] = rec["mp4_count"]
+                rec["mp4_count"] += 1
+                frec["rgb_ts_ms"] = round(a_color.get_timestamp(), 3)
+                frec["rgb_frame"] = a_color.get_frame_number()
+            if a_depth is not None:
+                items[1] = _frame_array(a_depth).tobytes()
+                frec["zst_frame"] = rec["zst_count"]
+                rec["zst_count"] += 1
+                frec["depth_ts_ms"] = round(a_depth.get_timestamp(), 3)
+                frec["depth_frame"] = a_depth.get_frame_number()
+            for q, item in zip((rec["color_q"], rec["depth_q"]), items):
+                if item is None:
+                    continue
+                # 带超时入队：队列满表示编码/压缩背压（限速）；停止后丢弃该帧
+                while True:
+                    try:
+                        q.put(item, timeout=0.5)
+                        break
+                    except queue.Full:
+                        if not rec["active"]:
+                            break
+            if frec:
+                try:
+                    rec["frames_q"].put_nowait(frec)
+                except queue.Full:
+                    pass  # 背压：帧同步记录非关键，丢弃
+            rec["frame_idx"] += 1
+    finally:
+        # 会话退出（quit / stdin EOF）：录制中则先收尾再退出，避免文件截断
+        with rec_lock:
+            if rec["active"]:
+                rec["active"] = False
+                if rec.get("paused") and rec["pauses"] and "end" not in rec["pauses"][-1]:
+                    rec["pauses"][-1]["end"] = datetime.now().isoformat(timespec="seconds")
+                snap = dict(rec)
+            else:
+                snap = None
+        if snap is not None:
+            t = threading.Thread(target=_finalize_rec, args=(snap,), daemon=True)
+            finalize_threads.append(t)
+            t.start()
+        for t in finalize_threads:
+            t.join(timeout=30)
+    return 0
 
 
 # ==================== main ====================
 def main():
     if len(sys.argv) < 2:
-        _safe_print("usage: realsense_child.py probe | stream [fps] | record <path> <fps>")
+        _safe_print("usage: realsense_child.py probe | session [fps]")
         return 2
     # 先重定向 C 库日志（必须在任何 pyrealsense2 导入之前）
     _setup_c_log_redirect()
@@ -833,11 +791,9 @@ def main():
     try:
         if cmd == "probe":
             return cmd_probe()
-        if cmd == "stream":
+        if cmd == "session":
             fps = int(sys.argv[2]) if len(sys.argv) >= 3 else DEFAULT_FPS
-            return cmd_stream(fps)
-        if cmd == "record" and len(sys.argv) >= 4:
-            return cmd_record(sys.argv[2], int(sys.argv[3]))
+            return cmd_session(fps)
     except Exception as e:
         try:
             _safe_print(f"ERR {e}")

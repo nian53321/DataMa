@@ -18,6 +18,12 @@ export const startRealSenseRecordApi = (data) =>
 export const stopRealSenseRecordApi = () =>
   request.post('/realsense/record/stop', {}, { skipErrorHandler: true })
 
+// 暂停/恢复录制（暂停期间帧不入编码器，预览流不受影响）
+export const pauseRealSenseRecordApi = () =>
+  request.post('/realsense/record/pause', {}, { skipErrorHandler: true })
+export const resumeRealSenseRecordApi = () =>
+  request.post('/realsense/record/resume', {}, { skipErrorHandler: true })
+
 // 查询录制后处理状态（预览是否生成）
 export const getRealSenseRecordStatusApi = () =>
   request.get('/realsense/record/status', { skipErrorHandler: true })

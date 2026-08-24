@@ -161,12 +161,16 @@
 
       <!-- RealSense 深度相机：采集前与录制中显示实时画面(MJPEG 流)，完成后播放预览视频 -->
       <template v-else-if="deviceSource === 'realsense'">
-        <!-- 采集前/录制中：实时预览画面（录制中与录制共用相机会话，画面不断流） -->
+        <!-- 采集前/录制中/暂停中：实时预览画面（录制中与录制共用相机会话，画面不断流）
+             onerror 自动重连：MJPEG <img> 流断开后浏览器不会自行恢复 -->
         <img
-          v-if="(phase === 'idle' || phase === 'recording') && realSenseLiveUrl"
+          v-if="(phase === 'idle' || phase === 'recording' || phase === 'paused') && realSenseLiveUrl"
           :src="realSenseLiveUrl"
           class="video-el"
+          :class="{ paused: phase === 'paused' }"
           alt="实时预览"
+          @error="onRealSenseLiveError"
+          @load="realSenseLiveRetryCount = 0"
         />
         <!-- 录制完成：播放预览视频（后端提取的 H.264 彩色轨） -->
         <video
@@ -262,7 +266,20 @@
             @click="startRealSenseRecord"
           >开始采集</el-button>
         </template>
-        <template v-else-if="phase === 'recording'">
+        <template v-else-if="phase === 'recording' || phase === 'paused'">
+          <el-button
+            v-if="phase === 'recording'"
+            :icon="VideoPause"
+            :disabled="pausingRealSense"
+            @click="pauseRealSenseRecord"
+          >暂停</el-button>
+          <el-button
+            v-else
+            type="success"
+            :icon="VideoPlay"
+            :disabled="pausingRealSense"
+            @click="resumeRealSenseRecord"
+          >继续</el-button>
           <el-button type="warning" :icon="CircleClose" :loading="stoppingRealSense" @click="stopRealSenseRecord">停止采集</el-button>
         </template>
         <template v-else-if="phase === 'done'">
@@ -461,6 +478,7 @@ import {
 } from '@/api/orbbec'
 import {
   getRealSenseStatusApi, startRealSenseRecordApi, stopRealSenseRecordApi,
+  pauseRealSenseRecordApi, resumeRealSenseRecordApi,
   uploadRealSenseRecordApi, getRealSenseRecordStatusApi,
   startRealSensePreviewApi, stopRealSensePreviewApi,
   startRealSensePassthroughApi, getRealSensePassthroughStatusApi,
@@ -915,6 +933,18 @@ const loadRealSenseLiveUrl = async () => {
   if (!_disposed && realSensePreviewing.value) realSenseLiveSignedUrl.value = url
 }
 
+// MJPEG 流断开自动重连：<img> 的流一旦中断（代理掐断/网络抖动）浏览器不会
+// 自行恢复；重新签发 URL 触发 src 变化强制重连。限次防风暴，成功出帧后复位。
+let realSenseLiveRetryCount = 0
+const onRealSenseLiveError = () => {
+  if (_disposed || !realSensePreviewing.value) return
+  if (realSenseLiveRetryCount >= 10) return
+  realSenseLiveRetryCount += 1
+  setTimeout(() => {
+    if (!_disposed && realSensePreviewing.value) loadRealSenseLiveUrl()
+  }, 2000)
+}
+
 // 录制完成后的预览视频 URL(后端从 mkv 提取的彩色轨 mp4;裁剪后优先显示本地裁剪版)
 const orbbecPreviewSignedUrl = ref('')
 const orbbecPreviewUrl = computed(() => orbbecTrimmedUrl.value || orbbecPreviewSignedUrl.value)
@@ -1286,7 +1316,13 @@ const uploadOrbbecRecord = async () => {
   }
 }
 
-// ==================== RealSense 录制（精简版：无裁剪） ====================
+// ==================== RealSense 录制（精简版：无裁剪，支持暂停） ====================
+// 计时采用"累计 + 段起点"两段式：暂停时冻结（累入 rsAccumMs），继续时重新
+// 起点计时——暂停区间不计入录制时长，与后端"暂停期间帧不入编码器"一致
+let rsAccumMs = 0
+let rsSegStartTs = 0
+const pausingRealSense = ref(false)
+
 const startRealSenseRecord = async () => {
   if (!realSenseAvailable.value) {
     ElMessage.warning('深度相机未就绪')
@@ -1300,34 +1336,58 @@ const startRealSenseRecord = async () => {
   realSensePreviewReady.value = false
   try {
     await startRealSenseRecordApi({ fps: 30 })
-    // 后端 record/start 会先停预览子进程并启动录制子进程；
-    // 录制子进程同步输出 MJPEG 实时画面（后端 preview/stream 透传录制流），
-    // 前端保持实时流不断开，录制中画面持续显示
-    // 预览源已切换为录制子进程，强制刷新流 URL（src 变化触发 img 重新连接）
-    realSenseLiveSignedUrl.value = ''
-    loadRealSenseLiveUrl()
-    // 计时器
-    const startTs = Date.now()
+    // 预览与录制共用常驻会话进程：实时流不断开，录制中画面持续显示
+    rsAccumMs = 0
+    rsSegStartTs = Date.now()
     if (realSenseRecordTimerId) clearInterval(realSenseRecordTimerId)
     realSenseRecordTimerId = setInterval(() => {
-      durationMs.value = Date.now() - startTs
+      if (phase.value === 'recording') {
+        durationMs.value = rsAccumMs + (Date.now() - rsSegStartTs)
+      }
     }, 200)
     ElMessage.success('录制已开始')
   } catch (e) {
-    // 录制启动失败（如 USB 未释放/设备占用）：后端预览子进程已停，恢复实时预览
+    // 录制启动失败：会话（预览流）仍存活，仅回到空闲态
     phase.value = 'idle'
-    realSensePreviewing.value = false
     ElMessage.error(e?.response?.data?.message || '启动录制失败')
-    startRealSenseLive()
+  }
+}
+
+// 暂停录制：后端暂停帧采集（视频不含暂停区间），实时预览继续显示
+const pauseRealSenseRecord = async () => {
+  if (pausingRealSense.value) return
+  pausingRealSense.value = true
+  try {
+    await pauseRealSenseRecordApi()
+    rsAccumMs += Date.now() - rsSegStartTs
+    durationMs.value = rsAccumMs
+    phase.value = 'paused'
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '暂停失败')
+  } finally {
+    pausingRealSense.value = false
+  }
+}
+
+// 继续录制：从暂停处恢复采集
+const resumeRealSenseRecord = async () => {
+  if (pausingRealSense.value) return
+  pausingRealSense.value = true
+  try {
+    await resumeRealSenseRecordApi()
+    rsSegStartTs = Date.now()
+    phase.value = 'recording'
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.message || '继续失败')
+  } finally {
+    pausingRealSense.value = false
   }
 }
 
 const stopRealSenseRecord = async () => {
   if (stoppingRealSense.value) return
   stoppingRealSense.value = true
-  // 先断开录制中的实时预览流（MJPEG 源为录制子进程），
-  // 停止时后端才能独占读取 stdout 解析 DONE 结果行
-  realSensePreviewing.value = false
+  // 实时预览流保持连接：收尾在会话进程后台线程完成，预览持续输出
   if (realSenseRecordTimerId) {
     clearInterval(realSenseRecordTimerId)
     realSenseRecordTimerId = null
@@ -1404,7 +1464,7 @@ const resetRealSenseCapture = () => {
   realSensePreviewReady.value = false
   durationMs.value = 0
   phase.value = 'idle'
-  // 子进程随录制结束已退出（相机自动关闭），重新采集需重新启动实时预览
+  // 会话进程常驻（预览流未断开时直接进入新一轮），已断开则重启实时预览
   startRealSenseLive()
 }
 
