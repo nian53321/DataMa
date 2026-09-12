@@ -843,6 +843,7 @@ const filteredFileAssets = computed(() => fileAssetList.value.filter((a) => {
 
 const riskText = (r) => ({
   normal: '正常', mci: '轻度认知障碍', dementia: '痴呆',
+  '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度',
 }[r] || (r || '未评估'))
 
 // 统计卡片
@@ -1486,7 +1487,7 @@ const updateRadarChart = () => {
           s.mmse_score ?? 0,
           s.moca_score ?? 0,
           s.ad8_score ?? 0,
-          { normal: 1, mci: 2, dementia: 3 }[s.cognitive_risk_level] ?? 0,
+          { normal: 1, mci: 2, dementia: 3, '无': 0, '轻度': 1, '中度': 2, '重度': 3 }[s.cognitive_risk_level] ?? 0,
         ],
         name: '量表得分',
       }],
@@ -1846,13 +1847,17 @@ const loadSubjects = async () => {
 // 概览图表：风险分级饼图 + 模态分布柱状图
 const updateOverviewCharts = () => {
   if (riskPieChart) {
-    const counts = { normal: 0, mci: 0, dementia: 0, unknown: 0 }
+    const counts = { normal: 0, mci: 0, dementia: 0, unknown: 0, '无': 0, '轻度': 0, '中度': 0, '重度': 0 }
     allSubjects.value.forEach((s) => {
       const r = s.cognitive_risk_level
       if (r in counts) counts[r]++
       else counts.unknown++
     })
     const data = [
+      { name: '无', value: counts['无'], itemStyle: { color: '#909399' } },
+      { name: '轻度', value: counts['轻度'], itemStyle: { color: '#e6a23c' } },
+      { name: '中度', value: counts['中度'], itemStyle: { color: '#f56c6c' } },
+      { name: '重度', value: counts['重度'], itemStyle: { color: '#f56c6c' } },
       { name: '正常', value: counts.normal, itemStyle: { color: '#67c23a' } },
       { name: '轻度认知障碍', value: counts.mci, itemStyle: { color: '#e6a23c' } },
       { name: '痴呆', value: counts.dementia, itemStyle: { color: '#f56c6c' } },

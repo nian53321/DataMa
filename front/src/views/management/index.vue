@@ -130,6 +130,10 @@
         </el-form-item>
         <el-form-item label="风险分级">
           <el-select v-model="filters.riskLevel" placeholder="全部" clearable style="width: 140px" @change="onSearch">
+            <el-option label="无" value="无" />
+            <el-option label="轻度" value="轻度" />
+            <el-option label="中度" value="中度" />
+            <el-option label="重度" value="重度" />
             <el-option label="正常" value="normal" />
             <el-option label="轻度认知障碍" value="mci" />
             <el-option label="痴呆" value="dementia" />
@@ -1218,7 +1222,7 @@ const dataTypeTextMap = {
   video: '视频', audio: '音频', eeg: '脑电', ecg: '心电',
   eye: '眼动', gait: '步态', scale: '量表', task: '任务', unknown: '未知',
 }
-const riskTextMap = { normal: '正常', mci: '轻度认知障碍', dementia: '痴呆', none: '未评估', unknown: '未知' }
+const riskTextMap = { normal: '正常', mci: '轻度认知障碍', dementia: '痴呆', none: '未评估', unknown: '未知', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }
 const genderTextMap = { '男': '男', '女': '女', unknown: '未知' }
 
 // 视图切换：subject 按受试者 / type 按数据类型
@@ -1255,8 +1259,8 @@ const onResetFilters = () => {
 }
 
 // 风险分级展示
-const riskText = (v) => ({ normal: '正常', mci: '轻度认知障碍', dementia: '痴呆' }[v] || '未评估')
-const riskTagType = (v) => ({ normal: 'success', mci: 'warning', dementia: 'danger' }[v] || 'info')
+const riskText = (v) => ({ normal: '正常', mci: '轻度认知障碍', dementia: '痴呆', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }[v] || '未评估')
+const riskTagType = (v) => ({ normal: 'success', mci: 'warning', dementia: 'danger', '无': 'info', '轻度': 'warning', '中度': 'danger', '重度': 'danger' }[v] || 'info')
 
 // 功能卡片：脱敏配置仅 admin 可见，其他功能卡片对所有有权限用户可见
 const allFeatures = [
@@ -1377,7 +1381,7 @@ const loadSubjectTemplate = async () => {
       { field_key: 'education_level', field_label: '教育程度', field_type: 'input', required: false, span: 24, placeholder: '如 高中/本科', options: [] },
       { field_key: 'phone', field_label: '联系电话', field_type: 'input', required: false, span: 12, placeholder: '如 13800138000', options: [] },
       { field_key: 'id_card', field_label: '身份证号', field_type: 'input', required: false, span: 12, placeholder: '如 110101199001011234', options: [] },
-      { field_key: 'cognitive_risk_level', field_label: '认知风险分级', field_type: 'select', required: false, span: 24, placeholder: '', options: [{ label: '正常', value: 'normal' }, { label: '轻度认知障碍', value: 'mci' }, { label: '痴呆', value: 'dementia' }] },
+      { field_key: 'cognitive_risk_level', field_label: '认知风险分级', field_type: 'select', required: false, span: 24, placeholder: '', options: [{ label: '无', value: '无' }, { label: '轻度', value: '轻度' }, { label: '中度', value: '中度' }, { label: '重度', value: '重度' }, { label: '正常', value: 'normal' }, { label: '轻度认知障碍', value: 'mci' }, { label: '痴呆', value: 'dementia' }] },
       { field_key: 'emotion_status', field_label: '情绪状态', field_type: 'input', required: false, span: 24, placeholder: '如 焦虑/抑郁', options: [] },
       { field_key: 'moca_score', field_label: 'MoCA 得分', field_type: 'number', required: false, span: 12, placeholder: '0-30', options: [], max: 30 },
       { field_key: 'mmse_score', field_label: 'MMSE 得分', field_type: 'number', required: false, span: 12, placeholder: '0-30', options: [], max: 30 },
@@ -1665,9 +1669,9 @@ const updateTypeChart = () => {
 
 // 风险分级 - 柱状图
 const updateRiskChart = () => {
-  const riskColorMap = { normal: '#67c23a', mci: '#e6a23c', dementia: '#f56c6c', none: '#909399', unknown: '#c0c4cc' }
+  const riskColorMap = { normal: '#67c23a', mci: '#e6a23c', dementia: '#f56c6c', none: '#909399', unknown: '#c0c4cc', '无': '#909399', '轻度': '#e6a23c', '中度': '#f56c6c', '重度': '#f56c6c' }
   // 固定顺序展示
-  const order = ['normal', 'mci', 'dementia', 'none']
+  const order = ['无', '轻度', '中度', '重度', 'normal', 'mci', 'dementia', 'none']
   const rows = (dataStats.value.risk_distribution || []).slice()
   order.forEach((k) => {
     if (!rows.find((r) => r.risk_level === k)) rows.push({ risk_level: k, count: 0 })

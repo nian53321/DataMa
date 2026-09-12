@@ -38,7 +38,7 @@ DEFAULT_SUBJECT_FIELDS = [
     {"field_key": "education_level", "field_label": "教育程度", "field_type": "input", "required": False, "enabled": True, "sort_order": 4, "placeholder": "如 高中/本科", "options": []},
     {"field_key": "phone", "field_label": "联系电话", "field_type": "input", "required": False, "enabled": True, "sort_order": 5, "placeholder": "如 13800138000", "options": []},
     {"field_key": "id_card", "field_label": "身份证号", "field_type": "input", "required": False, "enabled": True, "sort_order": 6, "placeholder": "如 110101199001011234", "options": []},
-    {"field_key": "cognitive_risk_level", "field_label": "认知风险分级", "field_type": "select", "required": False, "enabled": True, "sort_order": 7, "placeholder": "", "options": [{"label": "正常", "value": "normal"}, {"label": "轻度认知障碍", "value": "mci"}, {"label": "痴呆", "value": "dementia"}]},
+    {"field_key": "cognitive_risk_level", "field_label": "认知风险分级", "field_type": "select", "required": False, "enabled": True, "sort_order": 7, "placeholder": "", "options": [{"label": "无", "value": "无"}, {"label": "轻度", "value": "轻度"}, {"label": "中度", "value": "中度"}, {"label": "重度", "value": "重度"}, {"label": "正常", "value": "normal"}, {"label": "轻度认知障碍", "value": "mci"}, {"label": "痴呆", "value": "dementia"}]},
     {"field_key": "emotion_status", "field_label": "情绪状态", "field_type": "input", "required": False, "enabled": True, "sort_order": 8, "placeholder": "如 焦虑/抑郁", "options": []},
     # 量表得分（手动录入；与自动采集/外部推送的量表资产摘要并存，供列表与雷达图直接展示）
     {"field_key": "moca_score", "field_label": "MoCA 得分", "field_type": "number", "required": False, "enabled": True, "sort_order": 9, "placeholder": "0-30", "options": [], "max": 30},

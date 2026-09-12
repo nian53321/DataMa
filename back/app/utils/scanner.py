@@ -48,6 +48,10 @@ _PSEUDO_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{3,64}$")
 # sex 字段数值到中文映射（0/1 二值）
 _SEX_MAP = {0: "男", 1: "女", "0": "男", "1": "女"}
 
+# severity 字段数值到认知风险分级映射（0-3：无/轻度/中度/重度）
+_SEVERITY_MAP = {0: "无", 1: "轻度", 2: "中度", 3: "重度",
+                 "0": "无", "1": "轻度", "2": "中度", "3": "重度"}
+
 # 文件写入稳定窗口：mtime 距今不足该秒数的文件视为仍在写入
 _FILE_STABLE_SECONDS = 30
 
@@ -314,13 +318,14 @@ def _parse_user_info(user_info_path):
     if "phone" in data:
         fields["phone"] = str(data["phone"])
     # 临床信息
+    # severity 0-3 → 无/轻度/中度/重度，作为认知风险分级；无 severity 时回退用疾病名
     disease = str(data.get("disease", "")).strip()
     severity = data.get("severity", "")
-    if disease and disease != "未知病症":
-        risk = disease
-        if severity not in (0, "0", "", None):
-            risk = f"{disease}（严重度: {severity}）"
-        fields["cognitive_risk_level"] = risk
+    severity_text = _SEVERITY_MAP.get(severity) if severity not in ("", None) else None
+    if severity_text is not None:
+        fields["cognitive_risk_level"] = severity_text
+    elif disease and disease != "未知病症":
+        fields["cognitive_risk_level"] = disease
     if "comment" in data and data["comment"]:
         fields["remark"] = str(data["comment"])
     # 量表得分（兼容多字段命名：量表缩写 / 缩写_score / 中文拼音等）

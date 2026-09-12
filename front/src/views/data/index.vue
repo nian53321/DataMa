@@ -472,7 +472,9 @@ const selectAllAcrossPages = async () => {
       keyword: filter.keyword,
       ids_only: true,
     })
-    const allIds = (res.data?.items || []).map((x) => x.id)
+    const allIds = (res.data?.items || [])
+      .filter((x) => x.data_type !== 'json')
+      .map((x) => x.id)
     if (!allIds.length) {
       ElMessage.warning('当前筛选条件下无可选数据')
       return
@@ -517,7 +519,8 @@ const loadData = async () => {
       layer: filter.layer,
       keyword: filter.keyword,
     })
-    assetList.value = res.data.items || []
+    // 清洗流程忽略 json 模态（userInfo 备份等辅助文件）
+    assetList.value = (res.data.items || []).filter((a) => a.data_type !== 'json')
     pagination.total = res.data.total || 0
     updateStat()
     updateCharts()

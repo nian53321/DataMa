@@ -17,7 +17,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 
-from flask import request, current_app, send_file, after_this_request
+from flask import request, current_app, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from sqlalchemy import func
 
@@ -75,15 +75,26 @@ def _svc_snapshot():
     return SnapshotService(operator_id=int(get_jwt_identity()), operator_role=current_role())
 
 
-def _register_temp_cleanup(tmp_path):
-    """注册响应后清理临时文件的钩子（仅文件下载/播放路由使用）"""
-    @after_this_request
-    def _cleanup(response):
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        return response
+def _remove_temp_file(tmp_path):
+    """best-effort 删除临时文件，忽略已被清理/占用等异常"""
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+
+
+def _register_temp_cleanup(tmp_path, response):
+    """响应 body 完全发送后才清理临时文件（仅文件下载/播放路由使用）。
+
+    注意：Flask 的 after_request 钩子会在流式响应 body 真正流出前执行，若用
+    after_this_request 提前删除正在流式发送的临时文件，并发的字节范围(Range)
+    请求可能拿到 ENOENT 而瞬时失败，浏览器 <video> 会触发 error 事件——即使
+    视频随后仍能播放（前端表现为"媒体文件加载失败"的假报错）。因此与导出下载
+    路由一致改用 response.call_on_close，确保清理发生在完整发送之后。
+    """
+    if response is None:
+        return
+    response.call_on_close(lambda: _remove_temp_file(tmp_path))
 
 
 # ====================== 受试者管理 ======================
@@ -541,14 +552,14 @@ def serve_asset_file(asset_id):
     所有下载操作记录审计日志。加密文件会先解密到临时文件，响应结束后自动清理。
     """
     serve_path, is_temp, mimetype, download_name = _svc_asset().serve_asset_file(asset_id)
-    if is_temp:
-        _register_temp_cleanup(serve_path)
     # send_file 自动处理 Range 请求；显式指定 mimetype 与 download_name——
     # 加密文件解密临时文件若无扩展名，send_file 会把 MIME 推断为 octet-stream、
     # 下载名为 tmpXXXX，导致浏览器下载/播放均无法识别（用户误以为格式不支持）。
     resp = send_file(serve_path, conditional=True, mimetype=mimetype,
                      download_name=download_name, as_attachment=True)
     resp.headers["Accept-Ranges"] = "bytes"
+    if is_temp:
+        _register_temp_cleanup(serve_path, resp)
     return resp
 
 
@@ -562,11 +573,11 @@ def play_asset(asset_id):
     加密文件播放流程：源文件解密到临时文件 -> 转码/直接播放 -> 响应后清理临时文件。
     """
     serve_path, is_temp, mimetype = _svc_asset().play_asset(asset_id)
-    if is_temp:
-        _register_temp_cleanup(serve_path)
     # 显式声明 Accept-Ranges，避免 200 响应缺失该头导致浏览器中止媒体请求
     resp = send_file(serve_path, conditional=True, mimetype=mimetype)
     resp.headers["Accept-Ranges"] = "bytes"
+    if is_temp:
+        _register_temp_cleanup(serve_path, resp)
     return resp
 
 

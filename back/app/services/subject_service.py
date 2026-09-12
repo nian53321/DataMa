@@ -144,6 +144,15 @@ class SubjectService(BaseService):
             ad8_score=data.get("ad8_score"),
             remark=data.get("remark"),
         )
+        # 采集时间：创建时同样支持字符串转 datetime（与 update_subject 保持一致）
+        if data.get("collection_time"):
+            try:
+                from datetime import datetime
+                subject.collection_time = datetime.strptime(
+                    str(data["collection_time"])[:19], "%Y-%m-%d %H:%M:%S"
+                )
+            except (ValueError, TypeError):
+                pass
         self.session.add(subject)
         # 创建后留档（best-effort，便于历史追溯）— flush 拿 id，不 commit
         try:

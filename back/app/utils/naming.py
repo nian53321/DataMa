@@ -129,6 +129,11 @@ def apply_naming_standard(standard, subject, data_type, original_filename, video
     # 构建上下文
     seq = _next_seq(subject.id if subject else None, data_type) if subject else 1
     ctx = _build_context(subject, data_type, original_filename, seq, video_type, scale_type)
+    # userInfo 特殊处理：用户信息档案文件名必须保留 userinfo 标识，
+    # 避免默认模板渲染为 json_… 后丢 JSON 语义语义（userInfo.json => userinfo_….json）
+    is_userinfo = (ctx.get("original") or "").strip().lower() == "userinfo"
+    if is_userinfo:
+        ctx["data_type"] = "userinfo"
 
     # 量表类型统一小写（MOCA/MMSE/AD8 → moca/mmse/ad8），保证模板直引与自动追加风格一致
     if scale_type:
@@ -152,6 +157,9 @@ def apply_naming_standard(standard, subject, data_type, original_filename, video
         # 模板含未知变量，回退用原始文件名
         name = _safe_segment(ctx.get("original") or "unnamed")
     name = _safe_segment(name)
+    # userinfo 兜底：模板未引用 data_type/original 时仍保证文件名含 userinfo
+    if is_userinfo and "userinfo" not in name.lower():
+        name = f"userinfo_{name}"
 
     # 子类型兜底：模板未引用子类型变量但存在子类型时自动追加，避免同模态文件因同名
     # 导致路径冲突。适用：

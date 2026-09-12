@@ -588,6 +588,10 @@
                   </el-form-item>
                   <el-form-item label="风险分级">
                     <el-select v-model="exportFilter.riskLevel" placeholder="全部" clearable style="width: 130px">
+                      <el-option label="无" value="无" />
+                      <el-option label="轻度" value="轻度" />
+                      <el-option label="中度" value="中度" />
+                      <el-option label="重度" value="重度" />
                       <el-option label="正常" value="normal" />
                       <el-option label="轻度认知障碍" value="mci" />
                       <el-option label="痴呆" value="dementia" />
@@ -2289,11 +2293,11 @@ const exportToggleAllSubjects = () => {
 }
 
 const exportRiskText = (level) => {
-  const m = { normal: '正常', mci: '轻度障碍', dementia: '痴呆' }
+  const m = { normal: '正常', mci: '轻度障碍', dementia: '痴呆', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }
   return m[level] || '未评估'
 }
 const exportRiskTagType = (level) => {
-  const m = { normal: 'success', mci: 'warning', dementia: 'danger' }
+  const m = { normal: 'success', mci: 'warning', dementia: 'danger', '无': 'info', '轻度': 'warning', '中度': 'danger', '重度': 'danger' }
   return m[level] || 'info'
 }
 

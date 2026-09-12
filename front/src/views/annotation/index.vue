@@ -698,6 +698,8 @@ const dataTypeTagType = (t) => ({
 
 const filterAssets = () => {
   filteredAssets.value = assetOptions.value.filter((a) => {
+    // 标注流程忽略 json 模态（userInfo 备份等辅助文件）
+    if (a.data_type === 'json') return false
     if (assetFilter.data_type && a.data_type !== assetFilter.data_type) return false
     if (assetFilter.subject_id && a.subject_id !== assetFilter.subject_id) return false
     if (assetFilter.keyword) {
@@ -755,7 +757,20 @@ watch(assetInfo, (asset) => {
 
 const playUrl = (asset) => (asset?.id && assetInfo.value?.id === asset.id) ? playSignedUrl.value : ''
 
-const onMediaError = () => {
+// media 加载失败提示：仅对真正无法播放的格式/解码错误弹警告。
+// 时刻/瞬时错误不需提示：
+//   MEDIA_ERR_ABORTED(1) 　—— 用户或浏览器中断加载
+//   MEDIA_ERR_NETWORK(2)　—— 单个字节范围(Range)分段请求瞬时失败，
+//                             浏览器会重试或从已缓冲数据继续播放，视频仍可播放
+// 仅 MEDIA_ERR_DECODE(3) / MEDIA_ERR_SRC_NOT_SUPPORTED(4) 表示格式不支持/损坏
+let lastMediaErrAt = 0
+const onMediaError = (e) => {
+  const code = e?.target?.error?.code
+  if (code === 1 || code === 2) return
+  if (code !== undefined && code !== 3 && code !== 4) return
+  const now = Date.now()
+  if (now - lastMediaErrAt < 5000) return
+  lastMediaErrAt = now
   ElMessage.warning('媒体文件加载失败，可能格式不支持或文件损坏')
 }
 

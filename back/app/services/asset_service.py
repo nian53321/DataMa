@@ -77,8 +77,9 @@ class AssetService(BaseService):
             query = query.filter(DataAsset.file_name.like(build_like_contains(keyword), escape="|"))
         query = query.order_by(DataAsset.created_at.desc())
         if ids_only:
-            ids = [r[0] for r in query.with_entities(DataAsset.id).all()]
-            return {"items": [{"id": i} for i in ids], "total": len(ids)}
+            rows = query.with_entities(DataAsset.id, DataAsset.data_type).all()
+            return {"items": [{"id": i, "data_type": dt.value if dt else None} for i, dt in rows],
+                    "total": len(rows)}
         result = paginate(query, page, page_size)
         # 按角色脱敏（admin 不脱敏）
         desensitize_list(result["items"], self.operator_role)
@@ -217,6 +218,7 @@ class AssetService(BaseService):
             raise ValidationError("待导入数据列表不能为空")
 
         created = []
+        subject = self._get_or_404(Subject, subject_id, "受试者不存在")
         for item in items:
             data_type = item.get("data_type")
             if not data_type:
@@ -225,11 +227,15 @@ class AssetService(BaseService):
                 dt = DataType(data_type)
             except ValueError:
                 continue
+            file_name = item.get("file_name", "")
+            # 与单文件上传一致，批量/文件夹接入也按命名规范自动重命名
             asset = DataAsset(
                 subject_id=subject_id,
                 data_type=dt,
                 layer=DataLayer(item.get("layer", "raw")),
-                file_name=item.get("file_name", ""),
+                file_name=self._apply_naming(
+                    subject, dt.value, file_name, item.get("file_format")
+                ) or file_name,
                 file_path=item.get("file_path", ""),
                 file_format=item.get("file_format"),
                 file_size=item.get("file_size", 0),
@@ -245,6 +251,25 @@ class AssetService(BaseService):
         # 批量数据 + 日志一次性原子提交
         self._commit()
         return created
+
+    def _apply_naming(self, subject, data_type, original_filename, file_format=None):
+        """按启用的命名规范生成规范化文件名（与 upload_asset 逻辑一致）
+
+        userInfo.json 等原始文件名会保留 userinfo 语义（apply_naming_standard 已处理）。
+        """
+        if not original_filename:
+            return ""
+        import re as _re
+        naming_std = get_naming_standard(data_type)
+        scale_type = detect_scale_type(original_filename) if data_type == "scale" else None
+        norm_name, norm_ext = apply_naming_standard(
+            naming_std, subject, data_type, original_filename, scale_type=scale_type,
+        )
+        final_ext = norm_ext or (file_format or "")
+        fn = f"{norm_name}.{final_ext}" if final_ext else norm_name
+        fn = safe_filename_segment(fn) or "unnamed"
+        fn = _re.sub(r'_+', '_', fn).strip('_') or "unnamed"
+        return fn
 
     # ==================== 文件上传 ====================
 
