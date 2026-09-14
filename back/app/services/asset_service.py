@@ -47,6 +47,9 @@ from app.utils.naming import (
     apply_naming_standard, get_naming_standard, validate_extension,
 )
 from app.utils.scale_adapter import detect_scale_type
+from app.utils.source_identity import (
+    normalize_original_filename, stored_original_filename, source_group_key,
+)
 from app.utils.response import paginate
 from werkzeug.utils import secure_filename
 from app.utils.naming import _safe_segment as safe_filename_segment
@@ -234,8 +237,11 @@ class AssetService(BaseService):
                 .all()
             )
             for pseudo_id, meta in rows:
-                fn = (meta or {}).get("original_filename")
-                if fn is None:
+                # 归一化为纯文件名：存量数据可能带相对路径前缀（老版本浏览器
+                # 目录扫描入库），而前端本地记录用 File.name（纯名），不归一会
+                # 判为"库中不存在"而作废重传，反而制造重复。
+                fn = stored_original_filename((meta or {}).get("original_filename"))
+                if not fn:
                     continue
                 digest.setdefault(pseudo_id, []).append(
                     [fn, (meta or {}).get("original_size")]
@@ -260,6 +266,16 @@ class AssetService(BaseService):
             except ValueError:
                 continue
             file_name = item.get("file_name", "")
+            # 批量/文件夹导入（数据管理页）前端不发 metadata，此前这些记录的
+            # metadata_json 为 None，导致它们既不参与上传幂等、也不被启动自愈
+            # 纳入（自愈第一步就按 original_filename 为空跳过），成为重复数据的
+            # "死角"。这里与单文件上传对齐，统一补写同源身份字段。
+            raw_meta = item.get("metadata")
+            meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+            if file_name and not meta.get("original_filename"):
+                meta["original_filename"] = stored_original_filename(file_name)
+            if meta.get("original_size") is None and item.get("file_size") is not None:
+                meta["original_size"] = item.get("file_size")
             # 与单文件上传一致，批量/文件夹接入也按命名规范自动重命名
             asset = DataAsset(
                 subject_id=subject_id,
@@ -271,7 +287,7 @@ class AssetService(BaseService):
                 file_path=item.get("file_path", ""),
                 file_format=item.get("file_format"),
                 file_size=item.get("file_size", 0),
-                metadata_json=item.get("metadata"),
+                metadata_json=meta or None,
                 sample_rate=item.get("sample_rate"),
             )
             self.session.add(asset)
@@ -378,6 +394,8 @@ class AssetService(BaseService):
             # 视为重复上传（前端定时扫描场景）。命名规范会改写存储文件名，所以用原始文件名作为去重 key
             # 只取必要列（id/file_name/metadata_json），避免每次上传全量拉取该受试者同模态的所有资产
             stale_ids = []  # 同名不同大小的旧资产（半成品），新文件入库后替换
+            # 本次上传的归一化同源名（去目录前缀 / 去 .enc / 小写）
+            source_name = normalize_original_filename(original_name)
             existing = (
                 DataAsset.query
                 .filter_by(subject_id=subject_id, data_type=dt)
@@ -388,37 +406,39 @@ class AssetService(BaseService):
             )
             for ex in existing:
                 meta = ex.metadata_json or {}
-                if (meta.get("original_filename") == original_name
-                        and meta.get("original_size") == original_size
-                        and meta.get("video_type") == video_type):
+                # 同源判定用「归一化原始名」（去目录前缀 / 去 .enc / 小写）而非
+                # original_filename 字面值：同一份磁盘文件经不同入口入库时形态不同
+                # （浏览器目录扫描给 `伪ID/ecg_x.csv.enc`，后端 scanner 只给
+                # `ecg_x.csv.enc`），字面比较会让同一份数据被判成两份而重复入库。
+                if (normalize_original_filename(meta.get("original_filename")) != source_name
+                        or meta.get("video_type") != video_type):
+                    continue
+                if meta.get("original_size") == original_size:
                     original_ref = f"（原始: {original_name}）" if original_name != ex.file_name else ""
                     log_operation("upload", "asset", ex.id,
                                   f"重复上传跳过（命中既有资产 {ex.file_name}）{original_ref} 到 {subject.pseudo_id}/{data_type}",
                                   operator=self._operator_user())
                     self._commit()
-                    # 命中既有资产：顺带清理同组其他陈旧记录（同原始文件名+同
+                    # 命中既有资产：顺带清理同源其他陈旧记录（同归一化原始名 + 同
                     # video_type），让该源文件收敛为一条——覆盖存量"半成品+
-                    # 完整版共存"场景（重传完整版命中幂等，入库替换分支不触发，
+                    # 完整版共存"场景（重传完整版可能命中幂等，入库替换分支不触发，
                     # 半成品靠这里清掉）
                     for other in existing:
                         if other.id == ex.id:
                             continue
                         om = other.metadata_json or {}
-                        if (om.get("original_filename") == original_name
+                        if (normalize_original_filename(om.get("original_filename")) == source_name
                                 and om.get("video_type") == video_type):
                             stale_ids.append(other.id)
                     if stale_ids:
                         self._purge_stale_uploads(stale_ids)
                     # 命中既有资产：补查完整模型实例返回（调用方需 to_dict）
                     return DataAsset.query.get(ex.id), True  # (asset, is_duplicate)
-                if (meta.get("original_filename") == original_name
-                        and meta.get("video_type") == video_type
-                        and meta.get("original_size") != original_size):
-                    # 同名演进上传：采集端录制中的文件被扫描先上传了半成品（持续写入
-                    # 时大小是中途值），录制完成后完整文件再上传时同名但大小不同，
-                    # 幂等 key 不命中会双入库（半成品+成品两条）。视为同一文件的更新，
-                    # 新文件入库后替换旧资产（先写新后删旧，新文件失败旧资产保留）
-                    stale_ids.append(ex.id)
+                # 同名演进上传：采集端录制中的文件被扫描先上传了半成品（持续写入
+                # 时大小是中途值），录制完成后完整文件再上传时同名但大小不同，
+                # 幂等 key 不命中会双入库（半成品+成品两条）。视为同一文件的更新，
+                # 新文件入库后替换旧资产（先写新后删旧，新文件失败旧资产保留）
+                stale_ids.append(ex.id)
 
             # 视频重采不在此处删旧：必须等新文件成功落盘入库后再删（见下方 _commit 之后），
             # 保证"先写新、后删旧"，新文件失败时旧视频仍保留，避免重采造成数据丢失。
@@ -514,8 +534,11 @@ class AssetService(BaseService):
             # 相对存储路径入库（便于跨环境迁移）
             rel_path = f"{layer}/{subject.pseudo_id}/{data_type}/{filename}"
             # 元数据：记录原始文件名+大小，用于幂等去重；视频记录 video_type
+            # 写库统一为纯文件名（去相对路径前缀、保留 .enc）：与浏览器
+            # File.name 对齐，保证前端 ingest-digest 对账能直接匹配；
+            # 同源比对时再由 normalize_original_filename 进一步剥 .enc。
             metadata = {
-                "original_filename": original_name,
+                "original_filename": stored_original_filename(original_name),
                 "original_size": original_size,
             }
             if video_type:
@@ -746,12 +769,26 @@ class AssetService(BaseService):
                             operator=self._operator_user())
             _purge_asset_records(asset)
             pending_files = _collect_asset_file_paths(asset, storage_root)
+            shared_rel_path = asset.file_path
             self.session.delete(asset)
             log_operation("delete", "asset", asset.id,
                           f"同名演进替换删除旧版本 {asset.file_name}",
                           operator=self._operator_user())
             self._commit()
-            _remove_file_safely(pending_files[0])
+            # 共享文件保护：同一 file_path 若还有其他存活记录（同一秒内双入库
+            # 留下的两行指向同一文件、或手工登记复用同一路径），删磁盘会让
+            # 幸存记录变成指向不存在文件的孤儿。仅在无人引用时才删磁盘。
+            still_referenced = (
+                DataAsset.query.filter_by(file_path=shared_rel_path).count()
+                if shared_rel_path else 0
+            )
+            if still_referenced == 0:
+                _remove_file_safely(pending_files[0])
+            else:
+                current_app.logger.warning(
+                    "跳过删除磁盘文件（仍被 %s 条记录引用）：%s",
+                    still_referenced, shared_rel_path,
+                )
             _remove_file_safely(pending_files[1])
 
     def purge_duplicate_source_assets(self) -> int:
@@ -782,7 +819,9 @@ class AssetService(BaseService):
             orig = meta.get("original_filename")
             if not orig:
                 continue
-            key = (r.subject_id, r.data_type, orig, meta.get("video_type"))
+            # 分组键用归一化原始名（去目录前缀 / 去 .enc / 小写），与上传幂等
+            # 键口径一致：同一份源文件不同形态入库的残留才能被归到一组收敛
+            key = source_group_key(r.subject_id, r.data_type, orig, meta.get("video_type"))
             groups.setdefault(key, []).append(r.id)
         stale_ids = []
         for ids in groups.values():

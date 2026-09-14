@@ -800,7 +800,7 @@
             v-else
             type="info"
             :closable="false"
-            title="选择本地受试者根目录后，页面保持打开期间会按设定间隔自动扫描新增子文件夹与文件并上传到后端（前后端可跨设备部署）。子文件夹名作为伪ID，自动解析 userInfo.json。"
+            title="选择本地受试者根目录后，页面保持打开期间会按设定间隔自动扫描新增子文件夹与文件并上传到后端（前后端可跨设备部署）。子文件夹名作为伪ID，自动解析 userInfo.json。首次发现的文件只登记观察、不上传；下一轮扫描读到相同的大小与修改时间（即写入已结束）才上传，因此新文件最迟在一次扫描间隔后入库。"
             show-icon
             style="margin-bottom: 16px"
           />
@@ -821,6 +821,11 @@
             </el-descriptions-item>
             <el-descriptions-item label="累计上传文件">
               {{ browserScan.totalUploaded }}
+            </el-descriptions-item>
+            <el-descriptions-item label="待观察文件">
+              <el-tooltip content="首次发现的文件只登记不导入；下一轮扫描读到相同的大小与修改时间才上传，避免录制中/拷贝中的半成品入库" placement="top">
+                <span>{{ browserScan.observingCount || 0 }}</span>
+              </el-tooltip>
             </el-descriptions-item>
             <el-descriptions-item label="扫描间隔">
               <el-input-number v-model="browserScan.intervalSec" :min="1" :max="3600" :step="1" size="small" style="width: 120px" :disabled="browserScan.running" />
@@ -1037,7 +1042,7 @@ import * as echarts from 'echarts'
 import { Plus, Upload, Search, Refresh, UploadFilled, FolderOpened, RefreshLeft, RefreshRight, Document, Delete, InfoFilled, Check, CircleClose, VideoPlay, VideoPause } from '@element-plus/icons-vue'
 import { getSubjectsApi, getSubjectBatchesApi, getSubjectBatchesAndScenesApi, createSubjectApi, updateSubjectApi, deleteSubjectApi, getAssetsApi, createAssetApi, updateAssetApi, deleteAssetApi, batchCreateAssetsApi, uploadAssetApi, getOperationLogsApi, getDataStatsApi, parseUserInfoApi } from '@/api/data'
 import { supportsFsAccess, getUnsupportedReason } from '@/utils/dirWatcher'
-import { runScanFromFiles, loadSubjectCache } from '@/utils/browserScan'
+import { runScanFromFiles, loadSubjectCache, loadUploadedMap, saveUploadedMap } from '@/utils/browserScan'
 import { getSubjectTemplateApi, getScanConfigsApi, createScanConfigApi, updateScanConfigApi, deleteScanConfigApi, runScanNowApi } from '@/api/system'
 import { useUserStore } from '@/stores/user'
 import { useBrowserScanStore } from '@/stores/browserScan'
@@ -2573,9 +2578,12 @@ const scanBrowserOnce = async () => {
     await bsStore.scanOnce()
     const r = browserScan.lastResult
     const syncPart = r?.updatedSubjects ? `，更新 ${r.updatedSubjects} 个受试者信息` : ''
+    const obsPart = r?.observingCount ? `，${r.observingCount} 个文件处于写入观察期（下轮读数未变才上传）` : ''
     if (r && (r.newSubjects || r.uploadedPaths.length || r.updatedSubjects)) {
-      ElMessage.success(`本次扫描：新增 ${r.newSubjects} 个受试者，上传 ${r.uploadedPaths.length} 个文件${syncPart}`)
+      ElMessage.success(`本次扫描：新增 ${r.newSubjects} 个受试者，上传 ${r.uploadedPaths.length} 个文件${syncPart}${obsPart}`)
       _refreshAfterScan()
+    } else if (r && r.observingCount) {
+      ElMessage.info(`正在观察 ${r.observingCount} 个文件（首次发现只登记，下一轮扫描读数未变才上传）`)
     } else if (r && !r.failures.length) {
       ElMessage.info('本次扫描无新增文件')
     } else if (r && r.failures.length) {
@@ -2588,7 +2596,8 @@ const scanBrowserOnce = async () => {
 
 const startBrowserWatch = async () => {
   try {
-    await bsStore.startWatch()
+    // 用户主动开始监控：重置写入观察期基线，目录内尚未上传的文件重新观察一轮
+    await bsStore.startWatch({ resetObservation: true })
     ElMessage.success('已开始监控，路由切换不会中断，刷新页面后可一键恢复')
   } catch (e) {
     ElMessage.error(e.message || '启动监控失败')
@@ -2613,8 +2622,11 @@ const restoreBrowserWatch = async () => {
 const _onScanComplete = (result) => {
   if (result.newSubjects || result.uploadedPaths.length || result.updatedSubjects) {
     const syncPart = result.updatedSubjects ? `，更新 ${result.updatedSubjects} 个受试者信息` : ''
-    ElMessage.success(`自动扫描：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件${syncPart}`)
+    const obsPart = result.observingCount ? `，${result.observingCount} 个文件待观察` : ''
+    ElMessage.success(`自动扫描：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件${syncPart}${obsPart}`)
     _refreshAfterScan()
+  } else if (result.observingCount) {
+    ElMessage.info(`自动扫描：正在观察 ${result.observingCount} 个文件（下一轮读数未变才上传）`)
   }
 }
 
@@ -2656,14 +2668,20 @@ const runManualScanOnce = async () => {
   browserScan.progress = { phase: 'scan', current: 0, total: manualScanFiles.value.length, currentFile: '处理中…' }
   try { await loadSubjectCache() } catch { /* 忽略 */ }
   try {
+    // 复用持久化的已上传记录：原先传空对象，导致每次点击都全量重传
+    //（后端幂等虽挡住重复入库，但网络与解密开销照付）
     const result = await runScanFromFiles(manualScanFiles.value, {
-      uploadedMap: {},
+      uploadedMap: loadUploadedMap(),
       onProgress: (p) => { browserScan.progress = p },
     })
+    saveUploadedMap(result.uploadedMap || {})
     if (result.newSubjects || result.uploadedPaths.length || result.updatedSubjects) {
       const syncPart = result.updatedSubjects ? `，更新 ${result.updatedSubjects} 个受试者信息` : ''
-      ElMessage.success(`导入完成：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件${syncPart}`)
+      const obsPart = result.observingCount ? `，${result.observingCount} 个文件待观察` : ''
+      ElMessage.success(`导入完成：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件${syncPart}${obsPart}`)
       _refreshAfterScan()
+    } else if (result.observingCount) {
+      ElMessage.warning(`已登记 ${result.observingCount} 个文件，但读数尚未稳定（可能仍在写入）。请稍后再点击一次「开始导入」完成入库`)
     } else {
       ElMessage.info('无文件被导入')
     }

@@ -28,6 +28,9 @@ from app.utils.crypto import (
     decrypt_external_file_auto,
 )
 from app.utils.naming import apply_naming_standard, _safe_segment, BEIJING_TZ
+from app.utils.source_identity import (
+    normalize_original_filename, stored_original_filename, source_group_key,
+)
 from app.utils.eye_tracking_adapter import (
     load_sync_data, is_sync_data_file,
 )
@@ -62,11 +65,73 @@ def _is_file_writing(path):
     外部采集工具向监控目录渐进写入文件，扫描线程可能读到半截密文，
     此时解密必然失败（长度非 16 倍数 / PKCS7 去填充失败），
     会被误报为"密钥不匹配"。mtime 很新的文件应推迟到下一轮扫描。
+
+    注意：这是解密失败后的"归因判断"（用于区分"文件没写完"与"密钥不对"），
+    不承担"是否该导入"的职责 —— 导入时机由 _file_state_ready 的双轮读数
+    比对决定。
     """
     try:
         return (time.time() - os.path.getmtime(path)) < _FILE_STABLE_SECONDS
     except OSError:
         return True  # stat 失败（文件被独占锁定/已删除）按仍在写入处理
+
+
+# 快照条目过期时间（秒）：超过该时长未再出现在监控目录中的条目被清理，
+# 避免进程内快照无界增长
+_FILE_OBSERVE_STALE_SECONDS = 3600
+
+# 文件观察快照：{绝对路径: {"sig": (size, mtime_ns), "seen_at": ts}}
+# 存在进程内存即可：容器为 GUNICORN_WORKERS=1 + preload_app=True
+# （见 gunicorn_config.py），create_app 只在 gunicorn master 执行，扫描定时器
+# 线程不会被 fork 进 worker，因此扫描是单实例、快照不会跨进程分裂。容器重启
+# 后只是重新观察一轮，无正确性损失（源文件仍在监控目录里）。
+_file_observe_snapshot = {}
+
+
+def _observe_file_state(path, size):
+    """登记 / 刷新文件的写入观察基线，返回「读数已稳定」标记
+
+    观察期 = 一个自动扫描周期：本轮读到的（大小 + mtime_ns）与上一轮完全
+    一致才算稳定。
+
+    返回 False 的情况（本轮不入库，等下一轮再判）：
+      - 首次观察到的文件 —— 只登记基线，导入推迟到下一轮；
+      - 与上一轮读数不一致的文件（仍在写入 / 仍在拷贝）—— 刷新基线，继续
+        观察。这类文件的实际观察期会超过一个周期，直到出现连续两轮读数相同。
+
+    调用位置刻意放在"读取文件之前"：解密失败（外部密钥未上传）的轮次也要
+    登记基线，否则密钥补传后该文件仍处于"首见"状态，还要再多等一轮才入库。
+
+    为什么不用"mtime 距今 N 秒"这类绝对时间窗：外部拷贝工具可能保留源文件
+    mtime（robocopy /COPY:DAT、rsync -t、带时间戳的解压），新落盘文件的 mtime
+    是旧日期，"距今很久"会立即放行一个正在写入的半成品。本判据只看读数是否
+    变化，与 mtime 绝对值无关，对"保留 mtime 的拷贝"同样有效。
+    """
+    try:
+        mtime_ns = os.stat(path).st_mtime_ns
+    except OSError:
+        return False  # stat 失败（被独占锁定 / 已删除）按仍在写入处理
+    sig = (size, mtime_ns)
+    rec = _file_observe_snapshot.get(path)
+    if rec is None:
+        # 首见：登记基线，本轮不导入
+        _file_observe_snapshot[path] = {"sig": sig, "seen_at": time.time()}
+        return False
+    rec["seen_at"] = time.time()
+    if rec["sig"] != sig:
+        # 读数仍在变化：刷新基线，继续观察
+        rec["sig"] = sig
+        return False
+    # 与上一轮读数完全一致 → 写入已结束
+    return True
+
+
+def _expire_file_snapshots():
+    """清理长时间未再出现的文件观察快照，避免进程内快照无界增长"""
+    cutoff = time.time() - _FILE_OBSERVE_STALE_SECONDS
+    for p in [p for p, r in _file_observe_snapshot.items()
+              if r.get("seen_at", 0) < cutoff]:
+        _file_observe_snapshot.pop(p, None)
 
 
 def _get_db_external_keys():
@@ -413,6 +478,9 @@ def scan_watch_dir(config):
     try:
         new_count = 0
         skipped = 0
+        # 同名演进待删清单：录制半成品先入库、完整版后入库时，旧版本在本次
+        # 主事务提交后清理（先写新后删旧），不必等下次重启自愈才收敛
+        pending_stale_ids = []
         try:
             entries = sorted(os.listdir(watch_dir))
             for entry in entries:
@@ -434,17 +502,27 @@ def scan_watch_dir(config):
                         # 文件级增量去重：按（原始文件名+原始大小）跳过已导入文件，
                         # 与 upload_asset 幂等键一致。之前解密失败/被推迟的文件
                         # 不在集合中，下一轮自动重试（密钥补传后无需手动干预）
+                        # 文件级增量去重：按（归一化原始名 + 原始大小）跳过已导入
+                        # 文件。归一化是必需的——库里存的 original_filename 可能是
+                        # 老版本带相对路径前缀的形态，与本轮 fname（纯文件名）字面
+                        # 不等会漏判，导致同一文件重复导入。
                         existing_files = set()
                         for a in DataAsset.query.filter_by(subject_id=existing.id).all():
                             meta = a.metadata_json or {}
-                            existing_files.add(
-                                (meta.get("original_filename"), meta.get("original_size"))
-                            )
-                        _import_files_for_subject(
+                            existing_files.add((
+                                normalize_original_filename(meta.get("original_filename")),
+                                meta.get("original_size"),
+                            ))
+                        pending_stale_ids += _import_files_for_subject(
                             sub_dir, existing,
                             skip_files=existing_files,
                             failure_collector=result["failures"],
-                        )
+                        ) or []
+                    # 存量同源收敛：即使本轮没有新文件（源文件已稳定，全部命中
+                    # 增量去重被跳过），也把该受试者名下的同源重复组收敛为一条
+                    # ——覆盖"半成品+完整版共存"的历史存量，不必等下次重启的
+                    # 启动自愈才消失。
+                    pending_stale_ids += _collapse_subject_sources(existing)
                     # userInfo 字段自愈：首次扫描时 userInfo 尚在写入导致解析失败，
                     # 受试者创建时无元数据；此处检测到关键字段为空则重新解析补齐
                     _backfill_subject_fields(
@@ -479,16 +557,20 @@ def scan_watch_dir(config):
 
                 # 可选：自动上传文件
                 if config.auto_upload_files:
-                    _import_files_for_subject(
+                    pending_stale_ids += _import_files_for_subject(
                         sub_dir, subject,
                         failure_collector=result["failures"],
-                    )
+                    ) or []
 
                 new_count += 1
 
             config.last_scan_at = datetime.utcnow()
             config.last_scan_count = new_count
             db.session.commit()
+            # 新版本已落库提交后，再删除同名演进的旧版本记录与磁盘文件
+            # （先写新后删旧：新文件失败时旧记录保留，不丢数据）
+            if pending_stale_ids:
+                _purge_stale_assets(pending_stale_ids)
         except Exception as e:
             db.session.rollback()
             raise e
@@ -497,6 +579,8 @@ def scan_watch_dir(config):
         result["skipped"] = skipped
         return result
     finally:
+        # 清理长时间不再出现的文件观察快照，避免进程内快照无界增长
+        _expire_file_snapshots()
         _scan_run_lock.release()
 
 
@@ -533,6 +617,19 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
         "密钥.txt", "key.txt", "secret.txt",
     }
 
+    # 该受试者已有资产的同源索引：归一化原始名 -> [asset, ...]
+    # 用于识别「同名演进」——录制中的半成品先被扫描入库（大小是中途值），
+    # 录制完成后完整文件再次扫描入库时同名但大小不同；此时旧记录必须收敛，
+    # 否则资产列表里同一份心电会出现两条（且要等下次重启自愈才消失）。
+    existing_by_source = {}
+    for a in DataAsset.query.filter_by(subject_id=subject.id).all():
+        k = normalize_original_filename((a.metadata_json or {}).get("original_filename"))
+        if k:
+            existing_by_source.setdefault(k, []).append(a)
+
+    # 本次需清理的旧版本资产 id（由调用方在主事务提交后删除，先写新后删旧）
+    stale_ids = []
+
     for fname in os.listdir(sub_dir):
         # 跳过元数据文件
         if fname.lower() in skip_filenames_lower:
@@ -546,17 +643,20 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
         # 跳过临时文件（Office 锁文件 ~$ 开头、. 开头的隐藏文件）
         if fname.startswith("~$") or fname.startswith("."):
             continue
-        # 文件仍在写入（mtime 过新）：本轮跳过，避免读到半截内容，
-        # 下一轮扫描文件稳定后再导入
-        if _is_file_writing(src_path):
-            continue
         try:
             src_size = os.path.getsize(src_path)
         except OSError:
             continue
-        # 增量导入去重：跳过已导入的文件（原始文件名+原始大小）
-        if skip_files and (fname, src_size) in skip_files:
+        # 增量导入去重：跳过已导入的文件（归一化原始名 + 原始大小）；
+        # 已入库文件不再需要观察，顺手清掉快照
+        if skip_files and (normalize_original_filename(fname), src_size) in skip_files:
+            _file_observe_snapshot.pop(src_path, None)
             continue
+        # 写入观察（观察期 = 一个自动扫描周期）：读取之前先登记 / 刷新基线。
+        # 基线不因本轮读取失败而丢失，密钥补传后无需多等一轮。稳定标记在下文
+        # 读取成功之后才用于决定是否入库 —— 这样"密钥缺失"的失败告警仍在
+        # 本轮记录，不因观察期而推迟。
+        file_stable = _observe_file_state(src_path, src_size)
         # 剥离 .enc 后缀得到原始文件名（用于识别类型与应用命名规范）
         original_name = _strip_enc_suffix(fname)
         ext = original_name.rsplit(".", 1)[-1] if "." in original_name else ""
@@ -640,6 +740,10 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
         if plaintext is None:
             continue  # 解密失败已记录，跳过此文件
 
+        # 首次观察 / 读数仍在变化：本轮不入库，等下一轮读数一致再导入 ——
+        # 录制中、拷贝中的半成品不会入库（观察期 = 一个自动扫描周期）
+        if not file_stable:
+            continue
 
         # 用项目 DMEC 格式加密写入数据湖
         encrypted = encrypt_bytes(plaintext)
@@ -654,7 +758,8 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
         # 元数据：记录原始文件名+大小（与 upload_asset 一致，支持幂等去重）
         # 眼动/量表数据额外解析 JSON 字段存入 metadata_json
         asset_metadata = {
-            "original_filename": fname,
+            # 写库统一为纯文件名（保留 .enc），与 upload_asset / 前端 File.name 对齐
+            "original_filename": stored_original_filename(fname),
             "original_size": src_size,
         }
         if is_sync:
@@ -671,6 +776,14 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
                 )
                 if scale_summary:
                     asset_metadata["summary"] = scale_summary
+        # 同名演进：存在同源记录但原始大小不同 → 本次是更新版本（完整版），
+        # 旧记录（半成品）待本次扫描提交后删除。仅收敛 video_type 为空的通用
+        # 记录；带 video_type 的视频（face/body/gait）各自独立，互不干扰。
+        for old in existing_by_source.get(normalize_original_filename(fname), []):
+            om = old.metadata_json or {}
+            if om.get("video_type") is None and om.get("original_size") != src_size:
+                stale_ids.append(old.id)
+
         asset = DataAsset(
             subject_id=subject.id,
             file_name=new_name,
@@ -682,7 +795,53 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
             metadata_json=asset_metadata,
         )
         db.session.add(asset)
+        # 已登记入库：清掉观察快照（后续轮次交给 skip_files 增量去重跳过）
+        _file_observe_snapshot.pop(src_path, None)
 
+    # 去重：同一批内同名文件只登记一次删除
+    return list(dict.fromkeys(stale_ids))
+
+
+def _collapse_subject_sources(subject):
+    """对单个受试者做同源收敛，返回待删资产 id 列表
+
+    分组键与 AssetService.purge_duplicate_source_assets 一致（归一化原始名 +
+    video_type），组内保留 id 最大的一条（最新入库，即完整版/最新演进版本）。
+    无 original_filename 的老数据跳过（保守，不误删）。
+
+    与启动自愈的区别：本函数在每轮扫描时调用，使存量重复在运行期即被收敛，
+    不必等下次重启。
+    """
+    groups = {}
+    for a in DataAsset.query.filter_by(subject_id=subject.id).all():
+        meta = a.metadata_json or {}
+        key = source_group_key(subject.id, a.data_type,
+                               meta.get("original_filename"), meta.get("video_type"))
+        if key[2] is None:
+            continue  # 无原始文件名（手工登记等）不参与收敛
+        groups.setdefault(key, []).append(a.id)
+    stale = []
+    for ids in groups.values():
+        if len(ids) > 1:
+            stale.extend(sorted(ids)[:-1])
+    return stale
+
+
+def _purge_stale_assets(stale_ids):
+    """删除同名演进 / 存量重复留下的旧版本资产（新版本已入库后调用）
+
+    复用 AssetService 的清理链（留档 + 级联关联记录 + 删磁盘，并带共享
+    文件保护），避免 utils 层重复实现一套删除逻辑。延迟导入以避免
+    utils -> services 的模块级循环依赖。
+    """
+    ids = list(dict.fromkeys(stale_ids))  # 去重：同名演进与存量收敛可能重叠
+    if not ids:
+        return
+    try:
+        from app.services.asset_service import AssetService
+        AssetService(operator_id=None)._purge_stale_uploads(ids)
+    except Exception:
+        logger.exception("同源重复清理失败（不影响本次扫描结果）：%s", ids)
 
 
 def run_scan_once():

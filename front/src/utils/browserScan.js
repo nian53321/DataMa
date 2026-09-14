@@ -13,6 +13,7 @@
  * - 后端 upload_asset 本身有幂等去重（同受试者+同模态+同原始文件名+同原始大小），双保险
  */
 import { scanDirectory, verifyPermission, diffFiles } from '@/utils/dirWatcher'
+import { splitByObservation } from '@/utils/writeObserve'
 import {
   parseUserInfoApi, createSubjectApi, updateSubjectApi, uploadAssetApi,
   getSubjectsApi, getIngestDigestApi,
@@ -24,16 +25,51 @@ const PSEUDO_ID_RE = /^[A-Za-z0-9_\-]{3,64}$/
 // 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 2GB 一致）
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
-// 写入静默窗口：最近 30 秒内修改过的文件视为可能仍在写入（采集端录制中
-// 大小持续增长），本轮跳过、待静止超窗后下一轮扫描再上传——避免先把半成品
-// 传上去、录制完成后完整文件再传一遍（同名不同大小会入库两条重复记录）。
-// lastModified 晚于当前时间（跨机拷贝保留源机时钟）不视为写入中，正常放行。
-const WRITE_QUIET_MS = 30 * 1000
+// 写入观察期基线：{ [path]: { size, lastModified } }
+// 判据实现见 utils/writeObserve.js（与后端 scanner._observe_file_state 同口径）——
+// 首见文件只登记基线、不上传；下一轮扫描读到**完全相同**的（大小 + 修改时间）
+// 才认为写入已结束并上传。观察期天然等于一个自动扫描周期，不需要额外的绝对秒数下限。
+const PENDING_KEY = 'browser_scan_pending_map'
 
 // 跳过的密钥文件（小写比对）；userInfo 需作为 json 资产入库，不在跳过清单
 const META_FILES = new Set([
   '密钥.txt', 'key.txt', 'secret.txt',
 ])
+
+/**
+ * 原始文件名归一化：去相对路径前缀 + 去 .enc 后缀 + 小写
+ * 与后端 app/utils/source_identity.normalize_original_filename 口径一致，
+ * 用于「本地已上传记录 ↔ 后端资产摘要」对账时消除同一文件的形态差异。
+ */
+function normName(name) {
+  if (!name) return ''
+  let n = String(name).trim().replace(/\\/g, '/').split('/').pop() || ''
+  if (n.toLowerCase().endsWith('.enc')) n = n.slice(0, -4)
+  return n.toLowerCase()
+}
+
+/** 读取写入观察期基线 */
+export function loadPendingMap() {
+  try {
+    return JSON.parse(localStorage.getItem(PENDING_KEY) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+
+/** 保存写入观察期基线（容量超限时静默丢弃） */
+export function savePendingMap(map) {
+  try {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(map))
+  } catch { /* localStorage 不可用时静默 */ }
+}
+
+/** 清空写入观察期基线（移除监控目录时调用） */
+export function clearPendingMap() {
+  try {
+    localStorage.removeItem(PENDING_KEY)
+  } catch { /* 忽略 */ }
+}
 
 // localStorage 持久化 key
 const UPLOADED_KEY = 'browser_scan_uploaded_map'
@@ -280,8 +316,11 @@ async function syncSubjectInfoFromUserinfo(allGroups) {
  * 对账失败（网络错误/旧版后端无此接口）时静默降级为纯本地增量，不阻断扫描。
  */
 async function reconcileUploadedMap(effectiveMap) {
+  // 被作废的路径：调用方据此同步清理写入观察期基线，让这些文件重新以
+  // 「首见」身份进入观察期，而不是拿着旧读数直接放行。
+  const invalidated = []
   const paths = Object.keys(effectiveMap)
-  if (!paths.length) return
+  if (!paths.length) return invalidated
   const pseudoIds = [...new Set(
     paths.map((p) => p.split('/')[0]).filter(Boolean)
   )]
@@ -290,7 +329,7 @@ async function reconcileUploadedMap(effectiveMap) {
     const res = await getIngestDigestApi(pseudoIds)
     digest = res.data || {}
   } catch {
-    return
+    return invalidated
   }
   for (const p of paths) {
     const segs = p.split('/')
@@ -300,10 +339,14 @@ async function reconcileUploadedMap(effectiveMap) {
     // 摘要条目缺 original_size（老数据）时仅按文件名匹配，保守视为仍在库，
     // 避免作废重传与库内既有资产形成重复记录
     const hit = Array.isArray(entries) && entries.some(
-      ([fn, sz]) => fn === fname && (sz == null || sz === size)
+      ([fn, sz]) => normName(fn) === normName(fname) && (sz == null || sz === size)
     )
-    if (!hit) delete effectiveMap[p]
+    if (!hit) {
+      delete effectiveMap[p]
+      invalidated.push(p)
+    }
   }
+  return invalidated
 }
 
 // ==================== 单次扫描编排 ====================
@@ -334,7 +377,9 @@ export async function runBrowserScan(handle, options = {}) {
 /**
  * 直接基于文件列表执行扫描编排（供不支持 FS Access API 的手动一次性扫描复用）
  * @param {Array<{file: File, path: string, name: string, size: number, lastModified: number}>} allFiles 全量文件
- * @returns {Promise<{newSubjects, uploadedPaths, failures, uploadedMap}>}
+ * @param {Object} [options]
+ * @param {boolean} [options.observe=true] 是否启用写入观察期（首见只登记、下轮未变才上传）
+ * @returns {Promise<{newSubjects, uploadedPaths, failures, uploadedMap, updatedSubjects, observingCount}>}
  */
 export async function runScanFromFiles(allFiles, options = {}) {
   const {
@@ -342,6 +387,9 @@ export async function runScanFromFiles(allFiles, options = {}) {
     collectionBatch,
     collectionScene,
     onProgress,
+    // 写入观察期开关：默认开启（首见文件只登记、下一轮读数未变才上传）。
+    // 仅用于单测/调试关闭。
+    observe = true,
   } = options
 
   // 3. diff 出新增/变更文件（增量扫描，避免全量重传）
@@ -355,14 +403,28 @@ export async function runScanFromFiles(allFiles, options = {}) {
   }
   // 与后端资产对账：平台侧删除过的资产/受试者，本地记录未感知会永久跳过
   // 这些文件，作废失效记录后由 diff 重新发现（重新上传入库/重建受试者）
-  await reconcileUploadedMap(effectiveMap)
-  const newFiles = diffFiles(allFiles, effectiveMap)
-    // 写入静默窗口过滤：疑似录制中的文件本轮不传也不记入已上传记录，
-    // 稳定后下一轮扫描仍会被 diff 发现并上传完整版
-    .filter((f) => {
-      const age = Date.now() - (f.lastModified || 0)
-      return !(age >= 0 && age < WRITE_QUIET_MS)
-    })
+  const invalidatedPaths = await reconcileUploadedMap(effectiveMap)
+
+  // 4. 写入观察期（双轮读数比对，观察期 = 一个自动扫描周期）
+  //
+  // 首见文件只登记基线不上传；下一轮读到完全相同的（大小+修改时间）才上传。
+  // 这样目录被整体拷入 / 采集端仍在录制时，半成品不会先入库、完整版再入库一条。
+  // 基线持久化在 localStorage：页面刷新、路由切换都不丢，只有「移除目录」才清空。
+  const pending = observe ? loadPendingMap() : {}
+  // 基线里已不在当前扫描树的路径直接丢弃，避免无界增长
+  for (const p of Object.keys(pending)) {
+    if (!currentPaths.has(p)) delete pending[p]
+  }
+  // 资产在平台侧被删过的文件：基线读数是上一轮（甚至上一次会话）留下的，
+  // 若沿用会让这些文件在第一轮就直接判稳、立即上传。清掉基线使其重新观察一轮
+  //（受试者被删后重扫的场景，否则"删受试者 → 重新扫描"会立刻全量重传）。
+  for (const p of invalidatedPaths) delete pending[p]
+
+  // 判据：首见登记基线，下一轮读数完全一致（且不在 30s 静默窗口内）才放行
+  const { ready: newFiles, observing, pending: nextPending } = splitByObservation(
+    diffFiles(allFiles, effectiveMap), pending, { observe }
+  )
+  if (observe) savePendingMap(nextPending)
 
   // 全量文件按受试者分组（供受试者信息同步、补回 userInfo 和新建受试者的数据文件）
   const allGroups = groupBySubject(allFiles)
@@ -378,21 +440,35 @@ export async function runScanFromFiles(allFiles, options = {}) {
   const failures = [...infoSync.failures]
   let updatedSubjects = infoSync.updated
 
-  if (!newFiles.length) {
+  if (!newFiles.length && !observing.length) {
     onProgress?.({ phase: 'done', current: 0, total: 0, currentFile: '' })
     return {
       newSubjects: 0, uploadedPaths: [], failures,
-      uploadedMap: effectiveMap, updatedSubjects,
+      uploadedMap: effectiveMap, updatedSubjects, observingCount: 0,
     }
   }
 
-  // 4. 按受试者分组（基于新增文件）
-  const groups = groupBySubject(newFiles)
+  // 5. 按受试者分组
+  // 首见受试者目录时本轮无文件可传，但仍需创建受试者（目录名 = 伪ID），
+  // 所以分组取「有待上传文件的」∪「仅在观察期的」，后者 files 为空。
+  const readyGroups = groupBySubject(newFiles)
+  const readyMap = new Map(readyGroups.map((g) => [g.pseudoId, g]))
+  const groups = []
+  const groupedIds = new Set()
+  for (const g of [...groupBySubject(observing), ...readyGroups]) {
+    if (groupedIds.has(g.pseudoId)) continue
+    groupedIds.add(g.pseudoId)
+    groups.push({
+      pseudoId: g.pseudoId,
+      userInfo: g.userInfo,
+      files: readyMap.get(g.pseudoId)?.files || [],
+    })
+  }
   if (!groups.length) {
     onProgress?.({ phase: 'done', current: 0, total: 0, currentFile: '' })
     return {
       newSubjects: 0, uploadedPaths: [], failures,
-      uploadedMap: effectiveMap, updatedSubjects,
+      uploadedMap: effectiveMap, updatedSubjects, observingCount: 0,
     }
   }
 
@@ -450,16 +526,17 @@ export async function runScanFromFiles(allFiles, options = {}) {
         continue // 受试者未建成功，跳过其文件
       }
 
-      // 新建受试者：uploadedMap 中该受试者的缓存必然过期（受试者刚创建，不可能上传过）
-      // 从全量文件补回该受试者的所有数据文件
+      // 新建受试者：本地 uploadedMap 中该受试者的记录必然过期（受试者刚创建，
+      // 旧资产已随受试者删除），清掉陈旧记录让这些文件下一轮重新被 diff 发现。
+      //
+      // 这里**只清记录、不补文件**。曾经的做法是把 allG.files 整体补进 g.files
+      // 直接上传，效果是：首见受试者时该组文件全在写入观察期（g.files 为空），
+      // 于是命中本分支被强行全量上传 —— 双轮判据被完全绕过，表现为
+      //「点击开始监控后日志里 create subject 与全部 upload 同秒完成」。
+      // 正确行为是：本轮只建受试者（files 为空，不上传），下一轮读数稳定才上传。
       const allG = allGroupMap.get(g.pseudoId)
       if (allG && allG.files.length > 0 && g.files.length === 0) {
-        // 清除该受试者的旧缓存记录
-        for (const f of allG.files) {
-          delete updatedMap[f.path]
-        }
-        // 补回数据文件
-        g.files = [...allG.files]
+        for (const f of allG.files) delete updatedMap[f.path]
       }
     }
 
@@ -500,5 +577,15 @@ export async function runScanFromFiles(allFiles, options = {}) {
   }
 
   onProgress?.({ phase: 'done', current: done, total: totalFiles, currentFile: '' })
-  return { newSubjects, uploadedPaths, failures, uploadedMap: updatedMap, updatedSubjects }
+  return {
+    newSubjects,
+    uploadedPaths,
+    failures,
+    uploadedMap: updatedMap,
+    updatedSubjects,
+    // 本轮仍处于写入观察期、未上传的文件数（供 UI 提示"正在观察 N 个文件"）。
+    // 早期只在两个提前返回分支里给了该字段，正常完成路径漏了 —— 表现为
+    // "首见受试者只建受试者不上传"这种最典型的场景反而看不到观察期提示。
+    observingCount: observing.length,
+  }
 }

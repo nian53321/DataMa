@@ -12,7 +12,7 @@ import {
   queryPermission,
 } from '@/utils/dirWatcher'
 import {
-  runBrowserScan, loadSubjectCache, loadUploadedMap, saveUploadedMap,
+  runBrowserScan, loadSubjectCache, loadUploadedMap, saveUploadedMap, clearPendingMap,
 } from '@/utils/browserScan'
 
 // 用户主动停止标志：持久化到 localStorage。
@@ -33,6 +33,8 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
     lastScanAt: '',
     totalNewSubjects: 0,
     totalUploaded: 0,
+    // 本轮处于写入观察期、尚未上传的文件数（首见只登记，下一轮读数未变才上传）
+    observingCount: 0,
     failures: [],
     progress: { phase: '', current: 0, total: 0, currentFile: '' },
     // 刷新页面后检测到持久化句柄但定时器已丢失，需用户点击恢复
@@ -114,6 +116,9 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
     state.dirName = ''
     _uploadedMap = {}
     saveUploadedMap(_uploadedMap)
+    // 观察期基线一并清空：换目录后不应沿用旧路径的读数
+    clearPendingMap()
+    state.observingCount = 0
     state.totalNewSubjects = 0
     state.totalUploaded = 0
     state.failures = []
@@ -141,6 +146,7 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
       state.totalUpdatedSubjects = (state.totalUpdatedSubjects || 0) + (result.updatedSubjects || 0)
       _uploadedMap = result.uploadedMap
       saveUploadedMap(_uploadedMap)
+      state.observingCount = result.observingCount || 0
       state.failures = result.failures
       state.lastScanAt = new Date().toLocaleTimeString('zh-CN', { hour12: false })
       state.lastResult = { ...result, ts: Date.now() }
@@ -157,6 +163,15 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
 
   const scanOnce = async () => { await _doScan() }
 
+  /**
+   * 开始监控
+   * @param {Object} [opts]
+   * @param {boolean} [opts.skipVerify] 自动恢复（刷新页面后权限仍 granted）时不弹授权框
+   * @param {boolean} [opts.resetObservation] 用户主动点击「开始监控」：清空写入观察期
+   *   基线，让目录内所有尚未上传的文件重新走一轮观察。若沿用上一会话残留的基线，
+   *   这些文件在第一轮就会被判为"读数稳定"直接上传 —— 表现为点击开始监控即全量上传。
+   *   自动恢复监控（刷新页面）时不重置，避免刷新一次就白等一轮。
+   */
   const startWatch = async (opts = {}) => {
     // 已有定时器在运行则直接返回，避免重复创建定时器导致扫描并发堆积
     if (_watchTimer) return
@@ -166,6 +181,10 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
       if ((await queryPermission(state.handle)) !== 'granted') throw new Error('未获得目录读取权限')
     } else if (!(await verifyPermission(state.handle))) {
       throw new Error('未获得目录读取权限')
+    }
+    if (opts.resetObservation) {
+      clearPendingMap()
+      state.observingCount = 0
     }
     try { await loadSubjectCache() } catch { /* 缓存加载失败不阻断 */ }
     state.running = true
