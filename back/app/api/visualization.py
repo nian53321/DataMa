@@ -102,10 +102,10 @@ def _read_asset_text(asset):
     return text, tmp_path
 
 
-def _parse_eeg_edf(asset):
-    """解析 EDF/EDF+ 格式脑电文件（纯 Python 实现，无需第三方库）
+def _parse_eeg_edf(asset, fmt=""):
+    """解析 EDF/EDF+/BDF 格式脑电文件（纯 Python 实现，无需第三方库）
     EDF 格式：256字节固定头 + 每信号256字节 + 数据记录
-    支持 EDF+（含时间戳通道）和普通 EDF。
+    支持 EDF+（含时间戳通道）、BDF（24bit 样本）和普通 EDF。
     """
     file_path, tmp_path = _get_asset_file_path(asset)
     if file_path is None:
@@ -126,6 +126,10 @@ def _parse_eeg_edf(asset):
     if len(raw) < 256:
         return fail("EDF 文件头不完整（<256字节）", 422)
 
+    # BDF（BioSemi）与 EDF 头部布局相同，但样本为 24bit（3字节小端补码）
+    is_bdf = raw[0:1] == b"\xff" or fmt in ("bdf",)
+    sample_size = 3 if is_bdf else 2
+
     try:
         # 解析固定头部（256字节）
         version = raw[0:8].decode("ascii", errors="replace").strip()
@@ -140,28 +144,23 @@ def _parse_eeg_edf(asset):
 
         if num_signals <= 0 or num_signals > 256:
             return fail(f"EDF 信号数异常: {num_signals}", 422)
-        if num_records <= 0:
-            return fail("EDF 数据记录数为 0", 422)
 
         # 解析每个信号的头部（每信号256字节）
-        offset = 256
-        labels = []
-        phys_dims = []
-        phys_mins = []
-        phys_maxs = []
-        dig_mins = []
-        dig_maxs = []
-        samples_per_record = []
+        # EDF/BDF 规范：同一字段的所有信号连续存储（并排布局），
+        # 即 labels 全部在前、transducers 全部在后，依此类推
+        sig_hdr = 256
 
-        for i in range(num_signals):
-            base = offset + i * 256
-            labels.append(raw[base:base + 16].decode("ascii", errors="replace").strip())
-            phys_dims.append(raw[base + 16:base + 24].decode("ascii", errors="replace").strip())
-            phys_mins.append(float(raw[base + 56:base + 64].decode("ascii", errors="replace").strip()))
-            phys_maxs.append(float(raw[base + 64:base + 72].decode("ascii", errors="replace").strip()))
-            dig_mins.append(int(raw[base + 72:base + 80].decode("ascii", errors="replace").strip()))
-            dig_maxs.append(int(raw[base + 80:base + 88].decode("ascii", errors="replace").strip()))
-            samples_per_record.append(int(raw[base + 104:base + 112].decode("ascii", errors="replace").strip()))
+        def sig_field(field_offset, width, i):
+            base = sig_hdr + field_offset * num_signals + i * width
+            return raw[base:base + width].decode("ascii", errors="replace").strip()
+
+        labels = [sig_field(0, 16, i) for i in range(num_signals)]
+        phys_dims = [sig_field(96, 8, i) for i in range(num_signals)]
+        phys_mins = [float(sig_field(104, 8, i)) for i in range(num_signals)]
+        phys_maxs = [float(sig_field(112, 8, i)) for i in range(num_signals)]
+        dig_mins = [int(sig_field(120, 8, i)) for i in range(num_signals)]
+        dig_maxs = [int(sig_field(128, 8, i)) for i in range(num_signals)]
+        samples_per_record = [int(sig_field(216, 8, i)) for i in range(num_signals)]
 
         # 过滤掉 EDF+ 的时间戳通道（标签以 "EDF Annotations" 开头）
         data_channels = []
@@ -175,12 +174,19 @@ def _parse_eeg_edf(asset):
         # 采样率 = samples_per_record / record_duration
         ch0 = data_channels[0]
         sample_rate = round(samples_per_record[ch0] / record_duration) if record_duration > 0 else 500
-        duration_sec = round(num_records * record_duration, 2)
 
         # 解析数据记录
         # 每个记录包含所有信号，按信号顺序排列
         data_offset = header_bytes
         total_samples_per_record = sum(samples_per_record)
+
+        # EDF+/BDF+ 允许记录数为 -1（写入时未知），按文件大小推算
+        if num_records < 0:
+            record_bytes = total_samples_per_record * sample_size
+            num_records = (len(raw) - data_offset) // record_bytes
+        if num_records <= 0:
+            return fail("EDF 数据记录数为 0", 422)
+        duration_sec = round(num_records * record_duration, 2)
 
         # 降采样目标
         max_points = 1500
@@ -193,7 +199,7 @@ def _parse_eeg_edf(asset):
             spr = samples_per_record[ci]
             # 该通道在每条记录中的起始偏移
             ch_offset_in_record = sum(samples_per_record[j] for j in range(ci))
-            # 物理值转换
+            # 物理值转换：phys = (dig - d_min) * scale + p_min
             p_min = phys_mins[ci]
             p_max = phys_maxs[ci]
             d_min = dig_mins[ci]
@@ -202,29 +208,34 @@ def _parse_eeg_edf(asset):
 
             downsampled = []
             for rec_idx in range(num_records):
-                rec_start = data_offset + rec_idx * total_samples_per_record * 2 + ch_offset_in_record * 2
+                rec_start = data_offset + rec_idx * total_samples_per_record * sample_size + ch_offset_in_record * sample_size
                 # 该通道在此记录中的数据
                 for s in range(spr):
                     global_sample = rec_idx * spr + s
                     if global_sample % step != 0:
                         continue
-                    byte_pos = rec_start + s * 2
-                    if byte_pos + 2 > len(raw):
+                    byte_pos = rec_start + s * sample_size
+                    if byte_pos + sample_size > len(raw):
                         break
-                    dig_val = struct.unpack("<h", raw[byte_pos:byte_pos + 2])[0]
-                    phys_val = dig_val * scale + p_min
+                    chunk = raw[byte_pos:byte_pos + sample_size]
+                    if is_bdf:
+                        dig_val = int.from_bytes(chunk, "little", signed=True)
+                    else:
+                        dig_val = struct.unpack("<h", chunk)[0]
+                    phys_val = (dig_val - d_min) * scale + p_min
                     downsampled.append(round(phys_val, 2))
 
             label = labels[ci] or f"Channel {ci}"
             channels.append({"name": label, "data": downsampled})
 
+        device = ("BDF" if is_bdf else "EDF") + f" ({len(channels)}ch)"
         return success({
             "meta": {
                 "sampleRate": sample_rate,
                 "duration": duration_sec,
                 "channels": len(channels),
                 "totalSamples": total_samples,
-                "device": f"EDF ({len(channels)}ch)",
+                "device": device,
             },
             "channels": channels,
         })
@@ -236,8 +247,8 @@ def _parse_eeg_edf(asset):
 def _parse_eeg_csv(text):
     """解析 OpenBCI 风格 CSV 脑电数据
     格式：Sample Index,EXG Channel 0..15,Timestamp
-    相同时间戳的连续行属于同一秒数据，自适应计算采样率。
-    返回 16 通道波形数据（降采样到便于绘制的规模）。
+    按时间戳实际跨度自适应计算采样率，容忍个别脏行（整行跳过）。
+    返回多通道波形数据（降采样到便于绘制的规模）。
     """
     reader = csv.reader(io.StringIO(text))
     rows = list(reader)
@@ -259,23 +270,25 @@ def _parse_eeg_csv(text):
 
     num_channels = len(channel_indices)
 
-    # 解析数据行：收集每行各通道值和时间戳
-    # 按时间戳分组：相同时间戳的连续行 = 1 秒数据
-    channel_data = [[] for _ in range(num_channels)]  # 每个通道的完整数据
+    # 解析数据行：整行先解析成功再统一落表（原子处理）。
+    # 若部分列 append 后因脏数据（如混入的二进制字节）中途失败，会造成
+    # 通道间行错位、时间戳与数据长度不一致，且残缺行被填 0.0 引入假数据点。
+    channel_data = [[] for _ in range(num_channels)]
     timestamps = []
+    max_col = max(col_idx for col_idx, _ in channel_indices)
     for row in rows[1:]:
-        if not row:
+        if not row or len(row) <= max_col:
             continue
         try:
-            for ci, (col_idx, _) in enumerate(channel_indices):
-                if col_idx < len(row):
-                    channel_data[ci].append(float(row[col_idx]))
-                else:
-                    channel_data[ci].append(0.0)
-            if ts_idx is not None and ts_idx < len(row):
-                timestamps.append(float(row[ts_idx]))
-        except (ValueError, IndexError):
+            vals = [float(row[col_idx]) for col_idx, _ in channel_indices]
+            ts = (float(row[ts_idx])
+                  if ts_idx is not None and ts_idx < len(row) else None)
+        except ValueError:
             continue
+        for ci in range(num_channels):
+            channel_data[ci].append(vals[ci])
+        if ts is not None:
+            timestamps.append(ts)
 
     total = len(channel_data[0]) if channel_data else 0
     if total == 0:
@@ -322,17 +335,25 @@ def _parse_eeg_json(text):
     samples = data.get("samples", [])
     # BrainLink 只有 1 通道原始波，转换为单通道
     raw_all = []
-    for s in samples[:10]:
+    for s in samples:
         for v in s.get("raw", []):
             raw_all.append(v)
-    raw_down = raw_all[::2]
+    if not raw_all:
+        return fail("JSON 无有效采样数据", 422)
+    # 降采样到与其他格式一致的绘制规模
+    max_points = 1500
+    step = max(1, len(raw_all) // max_points)
+    raw_down = raw_all[::step]
     raw_uv = [round(v * (1.8 / 4096) / 2000 * 1e6, 2) for v in raw_down]
+    sample_rate = data.get("rawSampleRateHz", 512)
+    duration = (data.get("durationSeconds")
+                or round(len(raw_all) / sample_rate, 2))
     return success({
         "meta": {
-            "sampleRate": data.get("rawSampleRateHz", 512),
-            "duration": data.get("durationSeconds", 0),
+            "sampleRate": sample_rate,
+            "duration": duration,
             "channels": 1,
-            "totalSamples": len(raw_uv),
+            "totalSamples": len(raw_all),
             "device": "BrainLink Pro",
         },
         "channels": [{"name": "FP1", "data": raw_uv}],
@@ -346,7 +367,7 @@ def eeg_asset_parse(asset_id):
     支持：
     - CSV 格式（OpenBCI 风格：Sample Index,EXG Channel 0..15,Timestamp）
     - JSON 格式（BrainLink 风格）
-    - EDF/EDF+ 格式（标准脑电二进制格式，纯Python解析）
+    - EDF/EDF+/BDF 格式（标准脑电二进制格式，纯Python解析）
     自动处理加密文件解密，自适应计算采样率。
     """
     asset = DataAsset.query.get(asset_id)
@@ -359,9 +380,9 @@ def eeg_asset_parse(asset_id):
 
     fmt = (asset.file_format or "").lower()
 
-    # EDF 是二进制格式，需要单独处理
+    # EDF/BDF 是二进制格式，需要单独处理
     if fmt in ("edf", "edf+", "bdf"):
-        return _parse_eeg_edf(asset)
+        return _parse_eeg_edf(asset, fmt)
 
     text, tmp_path = _read_asset_text(asset)
     if text is None:
