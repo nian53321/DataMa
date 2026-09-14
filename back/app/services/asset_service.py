@@ -43,6 +43,8 @@ from app.utils.crypto import (
 from app.utils.desensitize import desensitize_list
 from app.utils.file_signature import check_signature
 from app.utils.like_query import build_like_contains
+from datetime import datetime
+from app.utils.collection_time import resolve_collection_time
 from app.utils.naming import (
     apply_naming_standard, get_naming_standard, validate_extension,
 )
@@ -141,6 +143,12 @@ class AssetService(BaseService):
             file_size=data.get("file_size", 0),
             metadata_json=data.get("metadata"),
             sample_rate=data.get("sample_rate"),
+            # 采集时间：元数据显式采集字段 > 文件名时间戳 > 入库时刻
+            timestamp_utc=resolve_collection_time(
+                data.get("metadata"),
+                extra_names=[data.get("file_name", "")],
+                fallback_utc=datetime.utcnow(),
+            ),
         )
         self.session.add(asset)
         self.session.flush()  # 让 asset.id 可用
@@ -289,6 +297,12 @@ class AssetService(BaseService):
                 file_size=item.get("file_size", 0),
                 metadata_json=meta or None,
                 sample_rate=item.get("sample_rate"),
+                # 采集时间：元数据显式采集字段 > 文件名时间戳 > 入库时刻
+                timestamp_utc=resolve_collection_time(
+                    meta,
+                    extra_names=[file_name],
+                    fallback_utc=datetime.utcnow(),
+                ),
             )
             self.session.add(asset)
             created.append(asset)
@@ -582,6 +596,13 @@ class AssetService(BaseService):
                 file_size=os.path.getsize(save_path),
                 sample_rate=sample_rate,
                 metadata_json=metadata,
+                # 采集时间：元数据显式采集字段 > 采集端原始名 > 规范化名 > 入库时刻
+                timestamp_utc=resolve_collection_time(
+                    metadata,
+                    original_filename=original_name,
+                    extra_names=[filename],
+                    fallback_utc=datetime.utcnow(),
+                ),
             )
             self.session.add(asset)
             self.session.flush()  # 让 asset.id 可用

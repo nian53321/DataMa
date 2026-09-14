@@ -38,6 +38,7 @@ from app.utils.scale_adapter import (
     load_scale_data, is_scale_data_file, parse_scale_summary,
     detect_scale_type,
 )
+from app.utils.collection_time import resolve_collection_time
 
 # 全局定时器引用
 _scan_timer = None
@@ -793,6 +794,13 @@ def _import_files_for_subject(sub_dir, subject, skip_files=None, failure_collect
             data_type=DataType(data_type) if data_type in valid_types else DataType.TASK,
             layer=asset_layer,
             metadata_json=asset_metadata,
+            # 采集时间：元数据显式采集字段 > 采集端原始名 > 规范化名 > 入库时刻
+            timestamp_utc=resolve_collection_time(
+                asset_metadata,
+                original_filename=original_name,
+                extra_names=[new_name],
+                fallback_utc=datetime.utcnow(),
+            ),
         )
         db.session.add(asset)
         # 已登记入库：清掉观察快照（后续轮次交给 skip_files 增量去重跳过）
