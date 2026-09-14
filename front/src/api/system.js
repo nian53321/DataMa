@@ -68,6 +68,11 @@ export const importExternalKeyApi = (formData) =>
   })
 export const verifyExternalKeyApi = (id, data) =>
   request.post(`/system/external-keys/${id}/verify`, data)
+export const downloadExternalKeyApi = (id) =>
+  request.get(`/system/external-keys/${id}/download`, {
+    responseType: 'blob',
+    skipErrorHandler: true,
+  })
 export const getEncFilesApi = (params) =>
   request.get('/system/external-keys/enc-files', { params })
 

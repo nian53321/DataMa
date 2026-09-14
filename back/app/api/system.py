@@ -344,6 +344,22 @@ def delete_external_key(key_id):
     return success(message=f"外部密钥「{name}」已删除")
 
 
+@system_bp.route("/external-keys/<int:key_id>/download", methods=["GET"])
+@role_required(Role.ADMIN)
+def download_external_key(key_id):
+    """下载外部密钥的 密钥.txt 文件（与导入格式互逆，可直接再导入）
+
+    仅管理员；导出记审计日志
+    """
+    content, filename = _svc_external_key().export_keyfile(key_id)
+    return send_file(
+        io.BytesIO(content),
+        as_attachment=True,
+        download_name=filename,
+        mimetype="text/plain",
+    )
+
+
 @system_bp.route("/external-keys/import", methods=["POST"])
 @role_required(Role.ADMIN)
 def import_external_key():

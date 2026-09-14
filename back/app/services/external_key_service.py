@@ -20,6 +20,7 @@
 import base64
 import logging
 import os
+import re
 from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -263,6 +264,30 @@ class ExternalKeyService(BaseService):
             "iv_b64": iv_b64,
             "is_active": True,
         })
+
+    def export_keyfile(self, key_id: int) -> Tuple[bytes, str]:
+        """导出外部密钥为 密钥.txt 格式文件（下载备份/跨环境迁移）
+
+        内容与导入格式互逆（CRYPTO_AES_KEY=/CRYPTO_AES_IV=），下载后可直接
+        再导入其他环境。仅管理员可触发（路由层拦截），导出记审计日志。
+
+        :returns: (文件内容字节, 下载文件名)
+        """
+        key = self._get_or_404(ExternalKey, key_id, "外部密钥不存在")
+        content = (
+            f"CRYPTO_AES_KEY={key.key_b64}\n"
+            f"CRYPTO_AES_IV={key.iv_b64}\n"
+        ).encode("utf-8")
+        # 密钥名清洗为安全文件名（保留中文，剔除 Windows 非法字符与空白）
+        safe_name = re.sub(r'[\\/:*?"<>|\s]+', "_", key.name).strip("_") or str(key.id)
+        filename = f"密钥_{safe_name}.txt"
+        log_operation(
+            "download", "external_key", key.id,
+            f"下载外部密钥「{key.name}」密钥文件（{filename}）",
+            operator=self._operator_user(),
+        )
+        self._commit()
+        return content, filename
 
     # ==================== 验证 ====================
 

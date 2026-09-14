@@ -448,10 +448,11 @@
                   </template>
                 </el-table-column>
                 <el-table-column prop="created_at" label="创建时间" width="170" />
-                <el-table-column label="操作" width="200" fixed="right" align="center">
+                <el-table-column label="操作" width="240" fixed="right" align="center">
                   <template #default="{ row }">
                     <el-button link type="primary" @click="openEditExtKeyDialog(row)">编辑</el-button>
                     <el-button link type="warning" @click="openVerifyExtKeyDialog(row)">验证</el-button>
+                    <el-button link type="success" @click="handleDownloadExtKey(row)">下载</el-button>
                     <el-button link type="danger" @click="handleDeleteExtKey(row)">删除</el-button>
                   </template>
                 </el-table-column>
@@ -610,11 +611,49 @@
                 <el-table
                   ref="exportSubjectTableRef"
                   :data="exportFilteredSubjects"
+                  row-key="id"
                   border
                   stripe
                   height="380"
                   @selection-change="onExportSelectionChange"
+                  @expand-change="onExportRowExpand"
                 >
+                  <el-table-column type="expand" width="30">
+                    <template #default="{ row }">
+                      <div style="padding: 8px 12px">
+                        <div v-if="subjectAssetCache[row.id]?.loading" v-loading="true" style="min-height: 60px" />
+                        <el-empty
+                          v-else-if="!subjectAssetCache[row.id]?.items?.length"
+                          description="该受试者暂无数据资产"
+                          :image-size="50"
+                        />
+                        <template v-else>
+                          <div style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px">
+                            <el-tag v-for="(cnt, type) in groupAssetsByType(subjectAssetCache[row.id].items)" :key="type" size="small" type="info">
+                              {{ exportTypeText(type) }} × {{ cnt }}
+                            </el-tag>
+                          </div>
+                          <el-table :data="subjectAssetCache[row.id].items" size="small" border>
+                            <el-table-column label="文件名" min-width="220" show-overflow-tooltip>
+                              <template #default="{ row: a }">{{ a.file_name || `资产 #${a.id}` }}</template>
+                            </el-table-column>
+                            <el-table-column label="类型" width="70" align="center">
+                              <template #default="{ row: a }">{{ exportTypeText(a.data_type) }}</template>
+                            </el-table-column>
+                            <el-table-column label="数据层" width="80" align="center">
+                              <template #default="{ row: a }">{{ exportLayerText(a.layer) }}</template>
+                            </el-table-column>
+                            <el-table-column label="大小" width="80" align="right">
+                              <template #default="{ row: a }">{{ formatFileSize(a.file_size) }}</template>
+                            </el-table-column>
+                            <el-table-column label="采集时间" width="150" align="center" show-overflow-tooltip>
+                              <template #default="{ row: a }">{{ a.timestamp_utc || '-' }}</template>
+                            </el-table-column>
+                          </el-table>
+                        </template>
+                      </div>
+                    </template>
+                  </el-table-column>
                   <el-table-column type="selection" width="45" />
                   <el-table-column prop="pseudo_id" label="伪ID" min-width="110" show-overflow-tooltip />
                   <el-table-column prop="age" label="年龄" width="60" align="center" />
@@ -1499,11 +1538,12 @@ import {
   deleteExternalKeyApi,
   importExternalKeyApi,
   verifyExternalKeyApi,
+  downloadExternalKeyApi,
   getEncFilesApi,
   getSubjectTemplateApi,
   saveSubjectTemplateApi,
 } from '@/api/system'
-import { getSubjectsApi, exportStartApi, exportProgressApi, exportDownloadApi, exportPreviewApi } from '@/api/data'
+import { getSubjectsApi, getAssetsApi, exportStartApi, exportProgressApi, exportDownloadApi, exportPreviewApi } from '@/api/data'
 import { fetchAllPages } from '@/utils/fetchAll'
 import { fetchSignedUrlApi } from '@/api/media'
 import VersionHistoryDialog from '@/components/VersionHistoryDialog.vue'
@@ -2207,9 +2247,9 @@ const exportDataTypeOptions = [
   { label: '视频 video', value: 'video' },
   { label: '音频 audio', value: 'audio' },
   { label: '眼动 eye', value: 'eye' },
-  { label: '步态 gait', value: 'gait' },
   { label: '量表 scale', value: 'scale' },
   { label: '任务 task', value: 'task' },
+  { label: '辅助数据 json', value: 'json' },
 ]
 const exportLayerOptions = [
   { label: '原始层 raw', value: 'raw' },
@@ -2278,6 +2318,31 @@ const exportFilteredSubjects = computed(() => {
 
 const onExportSelectionChange = (rows) => {
   exportSelectedSubjects.value = rows
+}
+
+// 受试者行展开：懒加载该受试者的数据资产（按受试者 ID 缓存）
+const subjectAssetCache = reactive({})
+
+const onExportRowExpand = async (row, expandedRows) => {
+  const opened = expandedRows.some(r => r.id === row.id)
+  if (!opened) return
+  if (subjectAssetCache[row.id]?.loaded) return
+  subjectAssetCache[row.id] = { loading: true, loaded: false, items: [] }
+  try {
+    const items = await fetchAllPages(getAssetsApi, { subject_id: row.id }, 100)
+    subjectAssetCache[row.id] = { loading: false, loaded: true, items }
+  } catch {
+    subjectAssetCache[row.id] = { loading: false, loaded: false, items: [] }
+    ElMessage.error('加载受试者数据资产失败')
+  }
+}
+
+const groupAssetsByType = (items) => {
+  const byType = {}
+  for (const a of items || []) {
+    byType[a.data_type] = (byType[a.data_type] || 0) + 1
+  }
+  return byType
 }
 
 // 全选/反选当前筛选后的列表
@@ -2360,7 +2425,9 @@ watch(
 
 const exportTypeText = (t) => {
   const opt = exportDataTypeOptions.find(o => o.value === t)
-  return opt ? opt.label.split(' ')[0] : t
+  if (opt) return opt.label.split(' ')[0]
+  // 步态视频按 video 入库（video_type=gait 子类型）；历史独立 gait 资产兜底显示
+  return { gait: '步态' }[t] || t
 }
 const exportLayerText = (ly) => {
   const m = { raw: '原始层', cleaned: '清洗层', feature: '特征层', annotation: '标注层' }
@@ -3019,6 +3086,36 @@ const handleDeleteExtKey = async (row) => {
   } catch (e) {
     if (e !== 'cancel') {
       ElMessage.error('删除失败')
+    }
+  }
+}
+
+const handleDownloadExtKey = async (row) => {
+  try {
+    const blob = await downloadExternalKeyApi(row.id)
+    // 后端成功返回密钥文件 blob；失败返回 JSON，由 catch 解析
+    const url = window.URL.createObjectURL(new Blob([blob]))
+    const safeName = (row.name || '').replace(/[\\/:*?"<>|\s]+/g, '_').replace(/^_+|_+$/g, '')
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `密钥_${safeName || row.id}.txt`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success('密钥文件已下载，请妥善保管')
+  } catch (e) {
+    const errData = e?.response?.data
+    if (errData instanceof Blob) {
+      try {
+        const text = await errData.text()
+        const err = JSON.parse(text)
+        ElMessage.error(err.message || '密钥下载失败')
+      } catch {
+        ElMessage.error('密钥下载失败')
+      }
+    } else {
+      ElMessage.error(e?.message || '密钥下载失败')
     }
   }
 }
