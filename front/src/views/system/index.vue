@@ -576,7 +576,7 @@
                   <el-form-item label="关键词">
                     <el-input
                       v-model="exportFilter.keyword"
-                      placeholder="伪ID/备注"
+                      placeholder="伪ID/姓名/备注"
                       clearable
                       style="width: 160px"
                     />
@@ -656,6 +656,9 @@
                   </el-table-column>
                   <el-table-column type="selection" width="45" />
                   <el-table-column prop="pseudo_id" label="伪ID" min-width="110" show-overflow-tooltip />
+                  <el-table-column prop="real_name" label="姓名" width="90" show-overflow-tooltip>
+                    <template #default="{ row }">{{ row.real_name || '—' }}</template>
+                  </el-table-column>
                   <el-table-column prop="age" label="年龄" width="60" align="center" />
                   <el-table-column prop="gender" label="性别" width="60" align="center" />
                   <el-table-column label="风险分级" width="100" align="center">
@@ -835,6 +838,9 @@
             >
               <el-table-column label="所属受试者" min-width="130" show-overflow-tooltip>
                 <template #default="{ row }">{{ row.pseudo_id }}</template>
+              </el-table-column>
+              <el-table-column label="姓名" width="90" show-overflow-tooltip>
+                <template #default="{ row }">{{ row.real_name || '—' }}</template>
               </el-table-column>
               <el-table-column label="文件名" min-width="240" show-overflow-tooltip>
                 <template #default="{ row }">{{ row.file_name || `资产 #${row.asset_id}` }}</template>
@@ -2296,6 +2302,7 @@ const exportFilteredSubjects = computed(() => {
   if (kw) {
     list = list.filter(s =>
       (s.pseudo_id || '').toLowerCase().includes(kw) ||
+      (s.real_name || '').toLowerCase().includes(kw) ||
       (s.remark || '').toLowerCase().includes(kw)
     )
   }

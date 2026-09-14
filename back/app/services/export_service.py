@@ -107,6 +107,7 @@ class ExportService(BaseService):
                     "layer": ly,
                     "file_size": int(a.file_size or 0),
                     "pseudo_id": subject.pseudo_id if subject else f"subject_{a.subject_id}",
+                    "real_name": subject.real_name if subject else None,
                 })
 
         return {
