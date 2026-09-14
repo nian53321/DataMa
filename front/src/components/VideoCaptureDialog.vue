@@ -447,7 +447,7 @@
       <el-tag v-else-if="passthroughRunning" type="warning">
         脚本执行中——USB 总线复位期间可能断网 10-30 秒，请耐心等待
       </el-tag>
-      <el-tag v-else-if="passthroughExit === 0" type="success">透传完成，可在上方重新检测设备</el-tag>
+      <el-tag v-else-if="passthroughExit === 0" type="success">透传完成，已自动重新检测设备</el-tag>
       <el-tag v-else-if="passthroughExit !== null" type="danger">透传失败（退出码 {{ passthroughExit }}），详见下方日志</el-tag>
       <el-tag v-else type="info">任务状态未知（宿主机代理可能已重启）</el-tag>
     </div>

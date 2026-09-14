@@ -69,12 +69,45 @@ def _run_child(args, timeout=30, **kw):
 
 
 # ==================== 设备检测 ====================
+def _sysfs_camera_present():
+    """sysfs 是否存在 RealSense 设备（VID 0x8086），只读不打开设备"""
+    import glob
+    try:
+        for dev in glob.glob("/sys/bus/usb/devices/*/"):
+            try:
+                vid = open(os.path.join(dev, "idVendor")).read().strip()
+            except OSError:
+                continue
+            if vid.lower() == "8086":
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_usb_nodes():
+    """按当前 sysfs 重建 /dev/bus/usb 设备节点（与 orbbec.py 一致的自愈）
+
+    透传脚本无人值守模式跳过容器重启：usbip 重新 attach 后 devnum 变化，
+    容器内旧设备节点失效（无 udev 守护进程不会自动重建），librealsense 枚举
+    不到设备——这里在检测/开会话前修复节点，透传完成后无需重启容器。
+    """
+    try:
+        from ensure_usb_nodes import ensure_usb_nodes
+        ensure_usb_nodes()
+    except Exception:
+        pass
+
+
 def _probe():
     """检测 RealSense 设备，返回 (count, serial, detail)；失败返回 (0, None, {})
 
     detail 为子进程 DETAIL 行携带的设备信息（name / firmware_version / product_line），
     用于确认设备型号（如 D455F）与固件版本。
     """
+    if not _sysfs_camera_present():
+        return 0, None, {}
+    _ensure_usb_nodes()
     count, serial, detail = 0, None, {}
     try:
         code, out = _run_child(["probe"], timeout=15)
@@ -246,6 +279,9 @@ def _ensure_session(timeout=25):
         sess = _sess
         if sess is not None and sess["proc"].poll() is None:
             return sess, ""
+    # 透传自愈后节点可能尚未修复（用户未触发状态检测直接开预览）：会话子进程
+    # 启动即打开设备，节点失效会启动失败，先按 sysfs 重建
+    _ensure_usb_nodes()
     # 协议通道走独立 fd 管道：stdout 承载 MJPEG 帧流，不能混入协议行
     # （fd 编号不固定，pass_fds 只保证继承，编号经环境变量告知子进程）
     r_fd, w_fd = os.pipe()
