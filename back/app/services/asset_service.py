@@ -20,6 +20,8 @@
 """
 import os
 import mimetypes
+import threading
+from contextlib import contextmanager
 from typing import Tuple, Optional
 
 from flask import current_app
@@ -48,6 +50,36 @@ from app.utils.scale_adapter import detect_scale_type
 from app.utils.response import paginate
 from werkzeug.utils import secure_filename
 from app.utils.naming import _safe_segment as safe_filename_segment
+
+
+# ==================== 上传幂等互斥锁 ====================
+# upload_asset 的幂等去重是 check-then-act（先查重后入库），并发上传同一文件时
+# 两个请求会同时查不到既有记录而双双入库（重复录入），甚至规范化文件名不同
+# 形成两条独立资产。并发来源：多标签页/多设备同时扫描同一目录（uploadedMap
+# 整轮扫描结束才写回）、网络错误重试与仍在处理中的首次请求重叠、自动扫描与
+# 手动上传并发。单 gunicorn worker 部署（GUNICORN_WORKERS=1）下进程内按幂等
+# key 加锁即可完全串行化同一文件的上传，不同文件互不影响。
+_idem_guard = threading.Lock()
+_idem_locks = {}  # 幂等 key -> [Lock, refcount]
+
+
+@contextmanager
+def _idem_lock_for(key):
+    """按上传幂等 key 获取互斥锁（引用计数管理，用完即回收，防内存增长）"""
+    with _idem_guard:
+        entry = _idem_locks.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _idem_locks[key] = entry
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _idem_guard:
+            entry[1] -= 1
+            if entry[1] <= 0 and _idem_locks.get(key) is entry:
+                del _idem_locks[key]
 
 
 class AssetService(BaseService):
@@ -336,184 +368,212 @@ class AssetService(BaseService):
         original_size = file_storage.stream.tell()
         file_storage.stream.seek(0)  # 重置到开头
 
-        # 幂等检查：同受试者+同模态+同原始文件名+同原始大小（视频还需 video_type 一致）
-        # 视为重复上传（前端定时扫描场景）。命名规范会改写存储文件名，所以用原始文件名作为去重 key
-        # 只取必要列（id/file_name/metadata_json），避免每次上传全量拉取该受试者同模态的所有资产
-        existing = (
-            DataAsset.query
-            .filter_by(subject_id=subject_id, data_type=dt)
-            .with_entities(
-                DataAsset.id, DataAsset.file_name, DataAsset.metadata_json,
+        # 幂等 key 级互斥：查重是 check-then-act，并发上传同一文件（多标签页扫描/
+        # 重试/多设备）会双双未命中而重复入库。持锁覆盖"查重→落盘→入库 commit"
+        # 全程：同一文件的上传串行化，后进者在锁内查到先进者已提交的记录直接返回；
+        # 不同文件 key 不同，互不影响。锁必须覆盖落盘——否则并发方会在先进者
+        # commit 前写同一存储路径覆盖文件。
+        with _idem_lock_for((subject_id, dt.value, original_name, original_size, video_type)):
+            # 幂等检查：同受试者+同模态+同原始文件名+同原始大小（视频还需 video_type 一致）
+            # 视为重复上传（前端定时扫描场景）。命名规范会改写存储文件名，所以用原始文件名作为去重 key
+            # 只取必要列（id/file_name/metadata_json），避免每次上传全量拉取该受试者同模态的所有资产
+            stale_ids = []  # 同名不同大小的旧资产（半成品），新文件入库后替换
+            existing = (
+                DataAsset.query
+                .filter_by(subject_id=subject_id, data_type=dt)
+                .with_entities(
+                    DataAsset.id, DataAsset.file_name, DataAsset.metadata_json,
+                )
+                .all()
             )
-            .all()
-        )
-        for ex in existing:
-            meta = ex.metadata_json or {}
-            if (meta.get("original_filename") == original_name
-                    and meta.get("original_size") == original_size
-                    and meta.get("video_type") == video_type):
-                original_ref = f"（原始: {original_name}）" if original_name != ex.file_name else ""
-                log_operation("upload", "asset", ex.id,
-                              f"重复上传跳过（命中既有资产 {ex.file_name}）{original_ref} 到 {subject.pseudo_id}/{data_type}",
-                              operator=self._operator_user())
-                self._commit()
-                # 命中既有资产：补查完整模型实例返回（调用方需 to_dict）
-                return DataAsset.query.get(ex.id), True  # (asset, is_duplicate)
+            for ex in existing:
+                meta = ex.metadata_json or {}
+                if (meta.get("original_filename") == original_name
+                        and meta.get("original_size") == original_size
+                        and meta.get("video_type") == video_type):
+                    original_ref = f"（原始: {original_name}）" if original_name != ex.file_name else ""
+                    log_operation("upload", "asset", ex.id,
+                                  f"重复上传跳过（命中既有资产 {ex.file_name}）{original_ref} 到 {subject.pseudo_id}/{data_type}",
+                                  operator=self._operator_user())
+                    self._commit()
+                    # 命中既有资产：顺带清理同组其他陈旧记录（同原始文件名+同
+                    # video_type），让该源文件收敛为一条——覆盖存量"半成品+
+                    # 完整版共存"场景（重传完整版命中幂等，入库替换分支不触发，
+                    # 半成品靠这里清掉）
+                    for other in existing:
+                        if other.id == ex.id:
+                            continue
+                        om = other.metadata_json or {}
+                        if (om.get("original_filename") == original_name
+                                and om.get("video_type") == video_type):
+                            stale_ids.append(other.id)
+                    if stale_ids:
+                        self._purge_stale_uploads(stale_ids)
+                    # 命中既有资产：补查完整模型实例返回（调用方需 to_dict）
+                    return DataAsset.query.get(ex.id), True  # (asset, is_duplicate)
+                if (meta.get("original_filename") == original_name
+                        and meta.get("video_type") == video_type
+                        and meta.get("original_size") != original_size):
+                    # 同名演进上传：采集端录制中的文件被扫描先上传了半成品（持续写入
+                    # 时大小是中途值），录制完成后完整文件再上传时同名但大小不同，
+                    # 幂等 key 不命中会双入库（半成品+成品两条）。视为同一文件的更新，
+                    # 新文件入库后替换旧资产（先写新后删旧，新文件失败旧资产保留）
+                    stale_ids.append(ex.id)
 
-        # 视频重采不在此处删旧：必须等新文件成功落盘入库后再删（见下方 _commit 之后），
-        # 保证"先写新、后删旧"，新文件失败时旧视频仍保留，避免重采造成数据丢失。
-        # 应用命名规范：查询启用的命名规范并生成规范化文件名
-        # 外部加密文件传剥离 .enc 后的文件名，确保扩展名是真实类型（wav 而非 enc）
-        # 视频传 video_type 用于命名区分（face/body/gait）；
-        # naming_video_type 仅影响命名后缀（如深度资产），不写 metadata/不参与重采
-        naming_input = base_name if is_external_enc else original_name
-        naming_std = get_naming_standard(data_type)
-        norm_name, norm_ext = apply_naming_standard(
-            naming_std, subject, data_type, naming_input,
-            video_type=naming_video_type or video_type,
-            # 量表传入量表类型（MoCA/MMSE/AD8），使重命名后仍可区分不同量表
-            scale_type=detect_scale_type(naming_input) if dt == DataType.SCALE else None,
-        )
-        # 拼接扩展名（保留原后缀；无后缀时不追加）
-        final_ext = norm_ext or ext
-        filename = f"{norm_name}.{final_ext}" if final_ext else norm_name
-        # 安全化文件名：保留中文等 Unicode 字母（_safe_segment），
-        # 不使用 werkzeug.secure_filename（会把中文全部删除）
-        filename = safe_filename_segment(filename) or "unnamed"
-        # 压缩连续下划线为单个（scene/batch 为空时会产生 __）
-        import re as _re
-        filename = _re.sub(r'_+', '_', filename).strip('_') or "unnamed"
+            # 视频重采不在此处删旧：必须等新文件成功落盘入库后再删（见下方 _commit 之后），
+            # 保证"先写新、后删旧"，新文件失败时旧视频仍保留，避免重采造成数据丢失。
+            # 应用命名规范：查询启用的命名规范并生成规范化文件名
+            # 外部加密文件传剥离 .enc 后的文件名，确保扩展名是真实类型（wav 而非 enc）
+            # 视频传 video_type 用于命名区分（face/body/gait）；
+            # naming_video_type 仅影响命名后缀（如深度资产），不写 metadata/不参与重采
+            naming_input = base_name if is_external_enc else original_name
+            naming_std = get_naming_standard(data_type)
+            norm_name, norm_ext = apply_naming_standard(
+                naming_std, subject, data_type, naming_input,
+                video_type=naming_video_type or video_type,
+                # 量表传入量表类型（MoCA/MMSE/AD8），使重命名后仍可区分不同量表
+                scale_type=detect_scale_type(naming_input) if dt == DataType.SCALE else None,
+            )
+            # 拼接扩展名（保留原后缀；无后缀时不追加）
+            final_ext = norm_ext or ext
+            filename = f"{norm_name}.{final_ext}" if final_ext else norm_name
+            # 安全化文件名：保留中文等 Unicode 字母（_safe_segment），
+            # 不使用 werkzeug.secure_filename（会把中文全部删除）
+            filename = safe_filename_segment(filename) or "unnamed"
+            # 压缩连续下划线为单个（scene/batch 为空时会产生 __）
+            import re as _re
+            filename = _re.sub(r'_+', '_', filename).strip('_') or "unnamed"
 
-        storage_root = current_app.config["DATA_LAKE_DIR"]
-        # 目录结构：根目录/分层/受试者伪ID/模态类型/文件名
-        save_dir = os.path.join(storage_root, layer, subject.pseudo_id, data_type)
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, filename)
-        # 路径穿越防护：确保最终路径仍在 DATA_LAKE_DIR 内（兜底防御）
-        storage_root_abs = os.path.realpath(storage_root)
-        save_path_abs = os.path.realpath(save_path)
-        if not (save_path_abs == storage_root_abs
-                or save_path_abs.startswith(storage_root_abs + os.sep)):
-            raise ValidationError("非法的存储路径")
+            storage_root = current_app.config["DATA_LAKE_DIR"]
+            # 目录结构：根目录/分层/受试者伪ID/模态类型/文件名
+            save_dir = os.path.join(storage_root, layer, subject.pseudo_id, data_type)
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, filename)
+            # 路径穿越防护：确保最终路径仍在 DATA_LAKE_DIR 内（兜底防御）
+            storage_root_abs = os.path.realpath(storage_root)
+            save_path_abs = os.path.realpath(save_path)
+            if not (save_path_abs == storage_root_abs
+                    or save_path_abs.startswith(storage_root_abs + os.sep)):
+                raise ValidationError("非法的存储路径")
 
-        # 量表文件明文缓存：供落盘后解析摘要（外部加密文件在解密分支捕获）
-        _scale_plain_bytes = None
+            # 量表文件明文缓存：供落盘后解析摘要（外部加密文件在解密分支捕获）
+            _scale_plain_bytes = None
 
-        # 落盘：启用加密时直接将上传流加密写入磁盘（不留明文临时文件）
-        # 外部加密文件（.enc）：先用数据库外部密钥解密明文，再用内部密钥加密入库
-        if _encryption_enabled():
-            if is_external_enc:
-                # 读取外部加密密文 → 用数据库外部密钥解密 → 用内部密钥加密 → 落盘
-                from app.services.external_key_service import ExternalKeyService
-                enc_data = file_storage.read()
-                candidate_keys = ExternalKeyService().get_active_keys_for_decrypt()
-                if not candidate_keys:
-                    raise ValidationError(
-                        "外部加密文件无法解密：数据库无可用外部密钥，"
-                        "请先到「系统设置 → 外部密钥管理」上传对应的外部密钥（key+iv）"
-                    )
-                try:
-                    plaintext, _matched_key_id = decrypt_external_bytes_auto(
-                        enc_data, candidate_keys
-                    )
-                except ValueError as e:
-                    raise ValidationError(
-                        f"外部加密文件解密失败：{e}，请检查外部密钥是否正确"
-                    )
-                _scale_plain_bytes = plaintext
-                encrypted = encrypt_bytes(plaintext)
-                with open(save_path, "wb") as f:
-                    f.write(encrypted)
-            else:
-                encrypt_stream_to_file(file_storage, save_path)
-        else:
-            if is_external_enc:
-                # 未启用内部加密：外部加密文件需先解密再以明文存储
-                from app.services.external_key_service import ExternalKeyService
-                enc_data = file_storage.read()
-                candidate_keys = ExternalKeyService().get_active_keys_for_decrypt()
-                if not candidate_keys:
-                    raise ValidationError(
-                        "外部加密文件无法解密：数据库无可用外部密钥，"
-                        "请先到「系统设置 → 外部密钥管理」上传对应的外部密钥（key+iv）"
-                    )
-                try:
-                    plaintext, _matched_key_id = decrypt_external_bytes_auto(
-                        enc_data, candidate_keys
-                    )
-                except ValueError as e:
-                    raise ValidationError(
-                        f"外部加密文件解密失败：{e}，请检查外部密钥是否正确"
-                    )
-                _scale_plain_bytes = plaintext
-                with open(save_path, "wb") as f:
-                    f.write(plaintext)
-            else:
-                file_storage.save(save_path)
-
-        # 相对存储路径入库（便于跨环境迁移）
-        rel_path = f"{layer}/{subject.pseudo_id}/{data_type}/{filename}"
-        # 元数据：记录原始文件名+大小，用于幂等去重；视频记录 video_type
-        metadata = {
-            "original_filename": original_name,
-            "original_size": original_size,
-        }
-        if video_type:
-            metadata["video_type"] = video_type
-        # 量表文件：解析摘要与原始字段存入 metadata（与目录扫描导入行为一致，
-        # 供可视化 /visualization/scale-asset 直接读取，避免每次解密重解析）
-        if dt == DataType.SCALE:
-            try:
-                import json as _json
-                from app.utils.scale_adapter import parse_scale_summary
+            # 落盘：启用加密时直接将上传流加密写入磁盘（不留明文临时文件）
+            # 外部加密文件（.enc）：先用数据库外部密钥解密明文，再用内部密钥加密入库
+            if _encryption_enabled():
                 if is_external_enc:
-                    content = _scale_plain_bytes
-                else:
-                    # 明文上传：落盘后流指针已到末尾，seek 回 0 重读明文（JSON 文件体积小）
-                    file_storage.stream.seek(0)
-                    content = file_storage.stream.read()
-                    file_storage.stream.seek(0)
-                if content:
-                    try:
-                        # utf-8-sig 剥离 UTF-8 BOM，兼容外部系统导出的带 BOM 文件
-                        raw = _json.loads(content.decode("utf-8-sig"))
-                    except Exception:
-                        raw = None
-                    if isinstance(raw, dict):
-                        scale_summary = parse_scale_summary(
-                            raw, scale_type=detect_scale_type(original_name)
+                    # 读取外部加密密文 → 用数据库外部密钥解密 → 用内部密钥加密 → 落盘
+                    from app.services.external_key_service import ExternalKeyService
+                    enc_data = file_storage.read()
+                    candidate_keys = ExternalKeyService().get_active_keys_for_decrypt()
+                    if not candidate_keys:
+                        raise ValidationError(
+                            "外部加密文件无法解密：数据库无可用外部密钥，"
+                            "请先到「系统设置 → 外部密钥管理」上传对应的外部密钥（key+iv）"
                         )
-                        if scale_summary:
-                            metadata["raw"] = raw
-                            metadata["summary"] = scale_summary
+                    try:
+                        plaintext, _matched_key_id = decrypt_external_bytes_auto(
+                            enc_data, candidate_keys
+                        )
+                    except ValueError as e:
+                        raise ValidationError(
+                            f"外部加密文件解密失败：{e}，请检查外部密钥是否正确"
+                        )
+                    _scale_plain_bytes = plaintext
+                    encrypted = encrypt_bytes(plaintext)
+                    with open(save_path, "wb") as f:
+                        f.write(encrypted)
+                else:
+                    encrypt_stream_to_file(file_storage, save_path)
+            else:
+                if is_external_enc:
+                    # 未启用内部加密：外部加密文件需先解密再以明文存储
+                    from app.services.external_key_service import ExternalKeyService
+                    enc_data = file_storage.read()
+                    candidate_keys = ExternalKeyService().get_active_keys_for_decrypt()
+                    if not candidate_keys:
+                        raise ValidationError(
+                            "外部加密文件无法解密：数据库无可用外部密钥，"
+                            "请先到「系统设置 → 外部密钥管理」上传对应的外部密钥（key+iv）"
+                        )
+                    try:
+                        plaintext, _matched_key_id = decrypt_external_bytes_auto(
+                            enc_data, candidate_keys
+                        )
+                    except ValueError as e:
+                        raise ValidationError(
+                            f"外部加密文件解密失败：{e}，请检查外部密钥是否正确"
+                        )
+                    _scale_plain_bytes = plaintext
+                    with open(save_path, "wb") as f:
+                        f.write(plaintext)
+                else:
+                    file_storage.save(save_path)
+
+            # 相对存储路径入库（便于跨环境迁移）
+            rel_path = f"{layer}/{subject.pseudo_id}/{data_type}/{filename}"
+            # 元数据：记录原始文件名+大小，用于幂等去重；视频记录 video_type
+            metadata = {
+                "original_filename": original_name,
+                "original_size": original_size,
+            }
+            if video_type:
+                metadata["video_type"] = video_type
+            # 量表文件：解析摘要与原始字段存入 metadata（与目录扫描导入行为一致，
+            # 供可视化 /visualization/scale-asset 直接读取，避免每次解密重解析）
+            if dt == DataType.SCALE:
+                try:
+                    import json as _json
+                    from app.utils.scale_adapter import parse_scale_summary
+                    if is_external_enc:
+                        content = _scale_plain_bytes
+                    else:
+                        # 明文上传：落盘后流指针已到末尾，seek 回 0 重读明文（JSON 文件体积小）
+                        file_storage.stream.seek(0)
+                        content = file_storage.stream.read()
+                        file_storage.stream.seek(0)
+                    if content:
+                        try:
+                            # utf-8-sig 剥离 UTF-8 BOM，兼容外部系统导出的带 BOM 文件
+                            raw = _json.loads(content.decode("utf-8-sig"))
+                        except Exception:
+                            raw = None
+                        if isinstance(raw, dict):
+                            scale_summary = parse_scale_summary(
+                                raw, scale_type=detect_scale_type(original_name)
+                            )
+                            if scale_summary:
+                                metadata["raw"] = raw
+                                metadata["summary"] = scale_summary
+                except Exception:
+                    # 解析失败不影响上传主流程（可视化可回退解密后解析）
+                    pass
+            asset = DataAsset(
+                subject_id=subject_id,
+                data_type=dt,
+                layer=DataLayer(layer),
+                file_name=filename,
+                file_path=rel_path,
+                file_format=final_ext or None,
+                file_size=os.path.getsize(save_path),
+                sample_rate=sample_rate,
+                metadata_json=metadata,
+            )
+            self.session.add(asset)
+            self.session.flush()  # 让 asset.id 可用
+            # 创建后留档（best-effort，便于历史追溯）
+            try:
+                save_snapshot("data_asset", asset.id, asset.to_dict(), "create",
+                              self._operator_user(), "上传数据资产")
             except Exception:
-                # 解析失败不影响上传主流程（可视化可回退解密后解析）
                 pass
-        asset = DataAsset(
-            subject_id=subject_id,
-            data_type=dt,
-            layer=DataLayer(layer),
-            file_name=filename,
-            file_path=rel_path,
-            file_format=final_ext or None,
-            file_size=os.path.getsize(save_path),
-            sample_rate=sample_rate,
-            metadata_json=metadata,
-        )
-        self.session.add(asset)
-        self.session.flush()  # 让 asset.id 可用
-        # 创建后留档（best-effort，便于历史追溯）
-        try:
-            save_snapshot("data_asset", asset.id, asset.to_dict(), "create",
-                          self._operator_user(), "上传数据资产")
-        except Exception:
-            pass
-        original_ref = f"（原始: {original_name}）" if original_name != filename else ""
-        log_operation("upload", "asset", asset.id,
-                      f"上传文件 {filename}{original_ref} 到 {subject.pseudo_id}/{data_type}",
-                      operator=self._operator_user())
-        # 业务数据 + 快照 + 日志一次性原子提交（避免双 commit 中途失败导致审计日志丢失）
-        self._commit()
+            original_ref = f"（原始: {original_name}）" if original_name != filename else ""
+            log_operation("upload", "asset", asset.id,
+                          f"上传文件 {filename}{original_ref} 到 {subject.pseudo_id}/{data_type}",
+                          operator=self._operator_user())
+            # 业务数据 + 快照 + 日志一次性原子提交（避免双 commit 中途失败导致审计日志丢失）
+            self._commit()
         # 视频重采：新文件已成功入库后再删除同 video_type 的旧视频资产。
         # 顺序必须"先写新后删旧"：若新文件落盘/入库失败，旧视频仍保留，避免重采造成数据丢失。
         # exclude_asset_id=asset.id 排除刚上传的新视频，只删同类型的其他旧视频。
@@ -521,6 +581,9 @@ class AssetService(BaseService):
             self._purge_subject_video_by_type(
                 subject_id, video_type, storage_root=None, exclude_asset_id=asset.id,
             )
+        # 同名演进替换：删除录制半成品等旧版本资产（先写新后删旧，同视频重采顺序）
+        if stale_ids:
+            self._purge_stale_uploads(stale_ids)
         return asset, False  # (asset, is_duplicate) 新建资产
 
     # ==================== 文件服务（下载/播放） ====================
@@ -666,6 +729,68 @@ class AssetService(BaseService):
             self._commit()
             _remove_file_safely(pending_files[0])
             _remove_file_safely(pending_files[1])
+
+    def _purge_stale_uploads(self, asset_ids: list):
+        """删除同名演进上传留下的旧版本资产（录制半成品→完整文件替换场景）
+
+        新文件已入库后调用（先写新后删旧）：每条独立清理——留档 + 级联关联记录
+        → DB commit → 删磁盘文件（best-effort），与视频重采清理同一模式。
+        """
+        storage_root = current_app.config["DATA_LAKE_DIR"]
+        for asset_id in asset_ids:
+            asset = DataAsset.query.get(asset_id)
+            if asset is None:
+                continue
+            snapshot_delete("data_asset", asset,
+                            f"同名演进替换（删除旧版本 {asset.file_name}）",
+                            operator=self._operator_user())
+            _purge_asset_records(asset)
+            pending_files = _collect_asset_file_paths(asset, storage_root)
+            self.session.delete(asset)
+            log_operation("delete", "asset", asset.id,
+                          f"同名演进替换删除旧版本 {asset.file_name}",
+                          operator=self._operator_user())
+            self._commit()
+            _remove_file_safely(pending_files[0])
+            _remove_file_safely(pending_files[1])
+
+    def purge_duplicate_source_assets(self) -> int:
+        """系统自愈：清理同源重复资产，每组保留最新一条
+
+        同源分组键 = 受试者 + 模态 + 原始文件名 + video_type（与上传幂等键同源，
+        忽略大小差异）。组内多条的来源：
+        - 历史并发上传竞态（同 key 双入库，锁修复前产生）
+        - 录制半成品先入库：完整版再传时同 size 命中幂等直接返回，
+          入库替换分支不触发，半成品残留
+
+        保留 id 最大的一条（最新上传，即完整版/最新演进版本），其余删除
+        （留档 + 级联清理 + 删磁盘）。无原始文件名元数据的老数据保守跳过。
+        返回清理的记录数；重复调用幂等（组内只剩一条时无操作）。
+        """
+        rows = (
+            DataAsset.query
+            .with_entities(
+                DataAsset.id, DataAsset.subject_id, DataAsset.data_type,
+                DataAsset.metadata_json,
+            )
+            .filter(DataAsset.metadata_json.isnot(None))
+            .all()
+        )
+        groups = {}
+        for r in rows:
+            meta = r.metadata_json or {}
+            orig = meta.get("original_filename")
+            if not orig:
+                continue
+            key = (r.subject_id, r.data_type, orig, meta.get("video_type"))
+            groups.setdefault(key, []).append(r.id)
+        stale_ids = []
+        for ids in groups.values():
+            if len(ids) > 1:
+                stale_ids.extend(sorted(ids)[:-1])  # 保留 id 最大（最新上传）
+        if stale_ids:
+            self._purge_stale_uploads(stale_ids)
+        return len(stale_ids)
 
 
 # ==================== 模块级辅助函数（文件服务相关） ====================

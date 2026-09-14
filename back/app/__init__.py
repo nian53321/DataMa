@@ -337,6 +337,16 @@ def create_app(env=None):
                 app.logger.info("已初始化默认管理员账号（admin/admin123，请尽快修改密码）")
         except Exception as e:
             app.logger.warning("默认管理员初始化失败: %s", e)
+        # 同源重复资产自愈：清理历史录入产生的重复记录（并发竞态双入库、
+        # 录制半成品+完整版共存），每组同源保留最新一条。幂等可重复执行；
+        # 失败不阻断启动，下次启动重试
+        try:
+            from app.services.asset_service import AssetService
+            removed = AssetService().purge_duplicate_source_assets()
+            if removed:
+                app.logger.info("启动自愈：已清理 %d 条同源重复数据资产", removed)
+        except Exception as e:
+            app.logger.warning("同源重复资产自愈清理失败: %s", e)
 
     # 注册蓝图
     from app.api import ALL_BLUEPRINTS
