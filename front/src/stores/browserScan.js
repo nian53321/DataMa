@@ -138,6 +138,7 @@ export const useBrowserScanStore = defineStore('browserScan', () => {
       })
       state.totalNewSubjects += result.newSubjects
       state.totalUploaded += result.uploadedPaths.length
+      state.totalUpdatedSubjects = (state.totalUpdatedSubjects || 0) + (result.updatedSubjects || 0)
       _uploadedMap = result.uploadedMap
       saveUploadedMap(_uploadedMap)
       state.failures = result.failures

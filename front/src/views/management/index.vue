@@ -275,6 +275,7 @@
             <el-option label="步态" value="gait" />
             <el-option label="量表" value="scale" />
             <el-option label="认知任务" value="task" />
+            <el-option label="辅助数据" value="json" />
           </el-select>
         </el-form-item>
         <el-form-item label="分层">
@@ -668,6 +669,7 @@
             <el-option label="步态" value="gait" />
             <el-option label="量表" value="scale" />
             <el-option label="认知任务" value="task" />
+            <el-option label="辅助数据" value="json" />
           </el-select>
         </el-form-item>
         <el-form-item label="数据分层">
@@ -1220,7 +1222,8 @@ const dataStatCards = computed(() => [
 // 模态/风险/性别 文本映射
 const dataTypeTextMap = {
   video: '视频', audio: '音频', eeg: '脑电', ecg: '心电',
-  eye: '眼动', gait: '步态', scale: '量表', task: '任务', unknown: '未知',
+  eye: '眼动', gait: '步态', scale: '量表', task: '任务',
+  json: '辅助数据', unknown: '未知',
 }
 const riskTextMap = { normal: '正常', mci: '轻度认知障碍', dementia: '痴呆', none: '未评估', unknown: '未知', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }
 const genderTextMap = { '男': '男', '女': '女', unknown: '未知' }
@@ -1500,7 +1503,7 @@ const detectDataType = (ext, fileName = '') => {
   if (name.includes('gait') || name.includes('walk')) return 'gait'
   return null
 }
-const typeText = (t) => ({ video: '视频', audio: '音频', eeg: '脑电', ecg: '心电', eye: '眼动', gait: '步态', scale: '量表', task: '任务' }[t] || '未知')
+const typeText = (t) => ({ video: '视频', audio: '音频', eeg: '脑电', ecg: '心电', eye: '眼动', gait: '步态', scale: '量表', task: '任务', json: '辅助数据' }[t] || '未知')
 const targetTypeText = (t) => ({
   subject: '受试者', asset: '数据资产', annotation_task: '标注任务',
   label: '标签', user: '用户', role_menu: '角色菜单',
@@ -1645,7 +1648,8 @@ const updateTrendChart = () => {
 const updateTypeChart = () => {
   const typeColorMap = {
     video: '#409eff', audio: '#67c23a', eeg: '#e6a23c', ecg: '#f56c6c',
-    eye: '#9254de', gait: '#13c2c2', scale: '#fa8c16', task: '#722ed1', unknown: '#c0c4cc',
+    eye: '#9254de', gait: '#13c2c2', scale: '#fa8c16', task: '#722ed1',
+    json: '#909399', unknown: '#c0c4cc',
   }
   const data = (dataStats.value.type_distribution || []).map((d) => ({
     name: dataTypeTextMap[d.data_type] || d.data_type,
@@ -2291,7 +2295,7 @@ const statusTagType = (s) => ({
 }[s] || 'info')
 const dataTypeTagType = (t) => ({
   video: 'danger', audio: 'primary', eeg: 'success', ecg: 'warning',
-  eye: 'info', gait: 'info', scale: 'success', task: 'warning',
+  eye: 'info', gait: 'info', scale: 'success', task: 'warning', json: 'info',
 }[t] || 'info')
 
 // 文件大小格式化：字节 → B/KB/MB/GB/TB
@@ -2568,8 +2572,9 @@ const scanBrowserOnce = async () => {
     const prev = { subjects: browserScan.totalNewSubjects, files: browserScan.totalUploaded }
     await bsStore.scanOnce()
     const r = browserScan.lastResult
-    if (r && (r.newSubjects || r.uploadedPaths.length)) {
-      ElMessage.success(`本次扫描：新增 ${r.newSubjects} 个受试者，上传 ${r.uploadedPaths.length} 个文件`)
+    const syncPart = r?.updatedSubjects ? `，更新 ${r.updatedSubjects} 个受试者信息` : ''
+    if (r && (r.newSubjects || r.uploadedPaths.length || r.updatedSubjects)) {
+      ElMessage.success(`本次扫描：新增 ${r.newSubjects} 个受试者，上传 ${r.uploadedPaths.length} 个文件${syncPart}`)
       _refreshAfterScan()
     } else if (r && !r.failures.length) {
       ElMessage.info('本次扫描无新增文件')
@@ -2606,8 +2611,9 @@ const restoreBrowserWatch = async () => {
 
 // 组件挂载时注册扫描完成回调（store 在后台扫描时会调此回调刷新列表）
 const _onScanComplete = (result) => {
-  if (result.newSubjects || result.uploadedPaths.length) {
-    ElMessage.success(`自动扫描：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件`)
+  if (result.newSubjects || result.uploadedPaths.length || result.updatedSubjects) {
+    const syncPart = result.updatedSubjects ? `，更新 ${result.updatedSubjects} 个受试者信息` : ''
+    ElMessage.success(`自动扫描：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件${syncPart}`)
     _refreshAfterScan()
   }
 }
@@ -2654,8 +2660,9 @@ const runManualScanOnce = async () => {
       uploadedMap: {},
       onProgress: (p) => { browserScan.progress = p },
     })
-    if (result.newSubjects || result.uploadedPaths.length) {
-      ElMessage.success(`导入完成：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件`)
+    if (result.newSubjects || result.uploadedPaths.length || result.updatedSubjects) {
+      const syncPart = result.updatedSubjects ? `，更新 ${result.updatedSubjects} 个受试者信息` : ''
+      ElMessage.success(`导入完成：新增 ${result.newSubjects} 个受试者，上传 ${result.uploadedPaths.length} 个文件${syncPart}`)
       _refreshAfterScan()
     } else {
       ElMessage.info('无文件被导入')

@@ -14,8 +14,8 @@
  */
 import { scanDirectory, verifyPermission, diffFiles } from '@/utils/dirWatcher'
 import {
-  parseUserInfoApi, createSubjectApi, uploadAssetApi, getSubjectsApi,
-  getIngestDigestApi,
+  parseUserInfoApi, createSubjectApi, updateSubjectApi, uploadAssetApi,
+  getSubjectsApi, getIngestDigestApi,
 } from '@/api/data'
 
 // 伪ID合法格式：3-64位字母/数字/下划线/短横线（与后端 scanner 一致）
@@ -23,6 +23,12 @@ const PSEUDO_ID_RE = /^[A-Za-z0-9_\-]{3,64}$/
 
 // 单文件上传大小上限（与后端 MAX_CONTENT_LENGTH 2GB 一致）
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+// 写入静默窗口：最近 30 秒内修改过的文件视为可能仍在写入（采集端录制中
+// 大小持续增长），本轮跳过、待静止超窗后下一轮扫描再上传——避免先把半成品
+// 传上去、录制完成后完整文件再传一遍（同名不同大小会入库两条重复记录）。
+// lastModified 晚于当前时间（跨机拷贝保留源机时钟）不视为写入中，正常放行。
+const WRITE_QUIET_MS = 30 * 1000
 
 // 跳过的密钥文件（小写比对）；userInfo 需作为 json 资产入库，不在跳过清单
 const META_FILES = new Set([
@@ -32,6 +38,9 @@ const META_FILES = new Set([
 // localStorage 持久化 key
 const UPLOADED_KEY = 'browser_scan_uploaded_map'
 const SUBJECT_CACHE_KEY = 'browser_scan_subject_cache'
+// 受试者信息同步指纹 { [pseudoId]: 'size-lastModified' }：记录上次从
+// userInfo.json 同步进受试者表的文件指纹，指纹没变则跳过同步
+const USERINFO_SYNC_KEY = 'browser_scan_userinfo_sync'
 
 // 模块级受试者缓存：{ [pseudoId]: subjectId }
 let _subjectCache = null
@@ -180,6 +189,82 @@ export function saveUploadedMap(map) {
   }
 }
 
+// ==================== 受试者信息同步 ====================
+
+/** 读取受试者信息同步指纹 */
+function loadUserinfoSyncMap() {
+  try {
+    return JSON.parse(localStorage.getItem(USERINFO_SYNC_KEY) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+
+/** 保存受试者信息同步指纹（容量超限时静默丢弃） */
+function saveUserinfoSyncMap(map) {
+  try {
+    localStorage.setItem(USERINFO_SYNC_KEY, JSON.stringify(map))
+  } catch { /* localStorage 不可用时静默 */ }
+}
+
+/**
+ * 从 userInfo.json 同步已存在受试者的信息（列表信息随录入的 userinfo 更新）
+ *
+ * 背景：受试者创建时解析过一次 userinfo，之后采集端修改 userinfo 并重新扫描，
+ * 受试者表的信息不会更新，列表一直是旧值。
+ *
+ * 策略：
+ * - 以文件指纹（size+lastModified）缓存上次同步内容，指纹没变跳过，
+ *   每轮扫描的指纹比对是纯内存操作，不产生网络请求
+ * - 首次运行（本地无缓存）会对每个有 userInfo 的受试者做一次全量同步，
+ *   顺带修复历史存量数据（userinfo 已入库但受试者信息陈旧）
+ * - 只更新基本信息字段；伪ID以目录名为准、批次/场景保留平台侧配置不覆盖
+ * - 受试者尚不存在时记指纹即跳过（后续新建流程解析的就是同一文件）
+ */
+async function syncSubjectInfoFromUserinfo(allGroups) {
+  const result = { updated: 0, failures: [] }
+  const withInfo = allGroups.filter((g) => g.userInfo)
+  if (!withInfo.length) return result
+
+  const syncMap = loadUserinfoSyncMap()
+  let dirty = false
+  for (const g of withInfo) {
+    const fp = `${g.userInfo.size || 0}-${g.userInfo.lastModified || 0}`
+    if (syncMap[g.pseudoId] === fp) continue
+    // 受试者不存在：记指纹跳过（新建流程会解析当前文件填充信息）
+    let subjectId = await resolveSubjectId(g.pseudoId)
+    if (!subjectId) {
+      syncMap[g.pseudoId] = fp
+      dirty = true
+      continue
+    }
+    try {
+      const fd = new FormData()
+      fd.append('file', g.userInfo.file, g.userInfo.name)
+      const res = await parseUserInfoApi(fd)
+      const fields = { ...(res.data?.fields || {}) }
+      // 伪ID以目录名为准；批次/场景是平台侧配置，不随 userinfo 覆盖
+      delete fields.pseudo_id
+      delete fields.collection_batch
+      delete fields.collection_scene
+      if (Object.keys(fields).length) {
+        await updateSubjectApi(subjectId, fields)
+        result.updated++
+      }
+      syncMap[g.pseudoId] = fp
+      dirty = true
+    } catch (e) {
+      // 失败不记指纹，下一轮扫描重试
+      result.failures.push({
+        name: `${g.pseudoId}/userInfo.json`,
+        reason: '受试者信息同步失败：' + (e.response?.data?.message || e.message),
+      })
+    }
+  }
+  if (dirty) saveUserinfoSyncMap(syncMap)
+  return result
+}
+
 // ==================== 与后端资产对账 ====================
 
 /**
@@ -272,34 +357,52 @@ export async function runScanFromFiles(allFiles, options = {}) {
   // 这些文件，作废失效记录后由 diff 重新发现（重新上传入库/重建受试者）
   await reconcileUploadedMap(effectiveMap)
   const newFiles = diffFiles(allFiles, effectiveMap)
+    // 写入静默窗口过滤：疑似录制中的文件本轮不传也不记入已上传记录，
+    // 稳定后下一轮扫描仍会被 diff 发现并上传完整版
+    .filter((f) => {
+      const age = Date.now() - (f.lastModified || 0)
+      return !(age >= 0 && age < WRITE_QUIET_MS)
+    })
+
+  // 全量文件按受试者分组（供受试者信息同步、补回 userInfo 和新建受试者的数据文件）
+  const allGroups = groupBySubject(allFiles)
+  const allGroupMap = new Map(allGroups.map((g) => [g.pseudoId, g]))
+
+  // 恢复受试者缓存（信息同步与建受试者都需要）
+  restoreSubjectCache()
+
+  // 受试者信息同步：从 userInfo.json 刷新已存在受试者的信息（放在新增文件
+  // 判断之前——即使本轮没有新文件，userinfo 变化/存量陈旧也能同步）。
+  // 指纹增量：每轮纯内存比对，只有指纹变化/首次才发起解析与更新请求
+  const infoSync = await syncSubjectInfoFromUserinfo(allGroups)
+  const failures = [...infoSync.failures]
+  let updatedSubjects = infoSync.updated
 
   if (!newFiles.length) {
     onProgress?.({ phase: 'done', current: 0, total: 0, currentFile: '' })
-    return { newSubjects: 0, uploadedPaths: [], failures: [], uploadedMap: effectiveMap }
+    return {
+      newSubjects: 0, uploadedPaths: [], failures,
+      uploadedMap: effectiveMap, updatedSubjects,
+    }
   }
 
   // 4. 按受试者分组（基于新增文件）
   const groups = groupBySubject(newFiles)
   if (!groups.length) {
     onProgress?.({ phase: 'done', current: 0, total: 0, currentFile: '' })
-    return { newSubjects: 0, uploadedPaths: [], failures: [], uploadedMap: effectiveMap }
+    return {
+      newSubjects: 0, uploadedPaths: [], failures,
+      uploadedMap: effectiveMap, updatedSubjects,
+    }
   }
-
-  // 全量文件按受试者分组（用于补回 userInfo 和新建受试者的数据文件）
-  const allGroups = groupBySubject(allFiles)
-  const allGroupMap = new Map(allGroups.map((g) => [g.pseudoId, g]))
 
   // diff 可能过滤掉未变更的 userInfo，从全量文件补回（新建受试者需要）
   for (const g of groups) {
     if (!g.userInfo) g.userInfo = allGroupMap.get(g.pseudoId)?.userInfo || null
   }
 
-  // 5. 恢复受试者缓存
-  restoreSubjectCache()
-
   let newSubjects = 0
   const uploadedPaths = []
-  const failures = []
   const updatedMap = { ...effectiveMap }
 
   // 计算总文件数用于进度
@@ -397,5 +500,5 @@ export async function runScanFromFiles(allFiles, options = {}) {
   }
 
   onProgress?.({ phase: 'done', current: done, total: totalFiles, currentFile: '' })
-  return { newSubjects, uploadedPaths, failures, uploadedMap: updatedMap }
+  return { newSubjects, uploadedPaths, failures, uploadedMap: updatedMap, updatedSubjects }
 }
