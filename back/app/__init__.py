@@ -347,6 +347,17 @@ def create_app(env=None):
                 app.logger.info("启动自愈：已清理 %d 条同源重复数据资产", removed)
         except Exception as e:
             app.logger.warning("同源重复资产自愈清理失败: %s", e)
+        # 命名冲突幽灵记录自愈：同秒上传的多个不同源文件会渲染出同名 →
+        # 落盘互相覆盖，库内却留多条记录指向同一路径（磁盘 1 文件 : N 记录，
+        # 表现为「同一份数据出现多条」）。按磁盘大小判定真身，清理其余记录。
+        # 幂等可重复执行；失败不阻断启动
+        try:
+            from app.services.asset_service import AssetService
+            collided = AssetService().purge_path_collision_assets()
+            if collided:
+                app.logger.info("启动自愈：已清理 %d 条命名冲突幽灵记录", collided)
+        except Exception as e:
+            app.logger.warning("命名冲突幽灵记录自愈清理失败: %s", e)
 
     # 注册蓝图
     from app.api import ALL_BLUEPRINTS

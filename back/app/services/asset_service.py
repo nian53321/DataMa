@@ -333,6 +333,44 @@ class AssetService(BaseService):
         fn = _re.sub(r'_+', '_', fn).strip('_') or "unnamed"
         return fn
 
+    def _dedupe_storage_filename(self, subject, dt, layer, save_dir, filename):
+        """保证存储目录内文件名唯一，防同秒命名冲突导致文件被覆盖
+
+        根因：命名规范默认模板 `{data_type}_{pseudo_id}_{timestamp}_{scene}_{batch}`
+        中的 `{timestamp}` 取的是**入库时刻**（`datetime.now`，秒级精度）。同一受试者、
+        同一模态的多个**不同源文件**若在同一秒内上传，会渲染出完全相同的文件名 →
+        落盘路径相同 → 后写覆盖先写；而库内两条记录都会保留（原始名不同、大小不同，
+        幂等命中分支与「同名演进替换」分支都不会触发）→ 磁盘 1 个文件对应 N 条记录，
+        表现为「同一份数据出现多条」，且被覆盖文件的字节永久丢失。
+
+        冲突判据（满足其一即视为已占用）：
+        - 库内已有同受试者/同模态/同分层/同 file_name 的记录（历史幽灵记录同样占名）
+        - 磁盘上目标路径已存在
+        冲突时在扩展名前追加 `_2`、`_3` …，语义为「同一秒内的第 N 个文件」。
+        """
+        stem, dot, ext = filename.rpartition(".")
+        if not dot:
+            stem, ext = filename, ""
+        try:
+            layer_enum = DataLayer(layer)
+        except ValueError:
+            layer_enum = None
+        candidate = filename
+        seq = 1
+        while True:
+            taken = os.path.exists(os.path.join(save_dir, candidate))
+            if not taken:
+                query = DataAsset.query.filter_by(
+                    subject_id=subject.id, data_type=dt, file_name=candidate,
+                )
+                if layer_enum is not None:
+                    query = query.filter(DataAsset.layer == layer_enum)
+                taken = query.first() is not None
+            if not taken:
+                return candidate
+            seq += 1
+            candidate = f"{stem}_{seq}.{ext}" if ext else f"{stem}_{seq}"
+
     # ==================== 文件上传 ====================
 
     def upload_asset(self, subject_id: int, data_type: str,
@@ -482,6 +520,11 @@ class AssetService(BaseService):
             # 目录结构：根目录/分层/受试者伪ID/模态类型/文件名
             save_dir = os.path.join(storage_root, layer, subject.pseudo_id, data_type)
             os.makedirs(save_dir, exist_ok=True)
+            # 命名冲突兜底：{timestamp} 是秒级入库时刻，同秒上传的多个不同源文件会
+            # 生成同名 → 落盘互相覆盖（库内却留多条记录）。这里在落盘前保证唯一。
+            filename = self._dedupe_storage_filename(
+                subject, dt, layer, save_dir, filename
+            )
             save_path = os.path.join(save_dir, filename)
             # 路径穿越防护：确保最终路径仍在 DATA_LAKE_DIR 内（兜底防御）
             storage_root_abs = os.path.realpath(storage_root)
@@ -848,6 +891,59 @@ class AssetService(BaseService):
         for ids in groups.values():
             if len(ids) > 1:
                 stale_ids.extend(sorted(ids)[:-1])  # 保留 id 最大（最新上传）
+        if stale_ids:
+            self._purge_stale_uploads(stale_ids)
+        return len(stale_ids)
+
+    def purge_path_collision_assets(self) -> int:
+        """系统自愈：清理「同一存储路径被多条记录引用」的幽灵记录，每组保留一条
+
+        成因：命名规范默认模板 `{data_type}_{pseudo_id}_{timestamp}_{scene}_{batch}`
+        的 `{timestamp}` 取秒级入库时刻。同一受试者、同一模态的多个**不同源文件**
+        在同一秒内上传会渲染出同名 → 落盘路径相同 → 后写覆盖先写；而库内两条记录
+        都保留（原始名不同、大小不同，幂等命中与同源收敛都归不到一组）→
+        磁盘 1 个文件对应 N 条记录，表现为「同一份数据出现多条」。
+
+        实测现场（受试者 1111222）：磁盘 6 个文件、库内 9 条记录；
+        `video/..._173253_...mp4`、`video/..._173254_...mp4`、`audio/..._173255_...wav`
+        三条路径各被 2 条记录引用（457 与 458 / 459 与 460 / 464 与 465 成对）。
+
+        保留规则（按可靠性排序）：
+        1. `file_size` 与磁盘实际大小一致的记录（被覆盖的幽灵记录大小必然对不上）
+        2. 无法判定（文件已不在磁盘）时保留 id 最大的一条
+        删记录不删磁盘文件——路径被幸存记录共享，`_purge_stale_uploads` 的
+        共享文件保护会兜住。幂等可重复执行。
+        """
+        storage_root = current_app.config["DATA_LAKE_DIR"]
+        rows = (
+            DataAsset.query
+            .with_entities(DataAsset.id, DataAsset.file_path, DataAsset.file_size)
+            .filter(DataAsset.file_path.isnot(None))
+            .all()
+        )
+        groups = {}
+        for r in rows:
+            if not r.file_path:
+                continue
+            groups.setdefault(r.file_path, []).append(r)
+        stale_ids = []
+        for rel_path, items in groups.items():
+            if len(items) < 2:
+                continue
+            try:
+                abs_path = os.path.join(storage_root, rel_path)
+                disk_size = os.path.getsize(abs_path) if os.path.exists(abs_path) else None
+            except OSError:
+                disk_size = None
+            matched = [r.id for r in items if disk_size is not None
+                       and r.file_size == disk_size]
+            keeper = max(matched) if matched else max(r.id for r in items)
+            stale_ids.extend(r.id for r in items if r.id != keeper)
+            current_app.logger.warning(
+                "命名冲突自愈：路径 %s 被 %d 条记录引用，保留 id=%s，清理 %s",
+                rel_path, len(items), keeper,
+                [r.id for r in items if r.id != keeper],
+            )
         if stale_ids:
             self._purge_stale_uploads(stale_ids)
         return len(stale_ids)
