@@ -83,6 +83,11 @@ generate_word_manual.py
 *.tmp.py
 .usb_check_tmp.py
 
+# ===================== 脱敏基准实验产物（开发期测算数据，不入库）=====================
+# bench_video_desens / bench_audio_desens 内含 mp4/jpg/大量实验 json，运行时不需要。
+back/tools/bench_video_desens/
+back/tools/bench_audio_desens/
+
 # ===================== 后端脚本（仅保留部署必需的子进程）=====================
 # back/scripts/ 是部署必要目录（Dockerfile COPY . . 会拷入镜像）：
 # 容器内摄像头子进程 orbbec_camera_proc.py / realsense_child.py 必须纳入版本管理；

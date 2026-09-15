@@ -112,6 +112,23 @@
       </template>
     </div>
 
+    <!-- 普通摄像头（非深度）：提示无法采集深度，引导透传/切换深度相机 -->
+    <el-alert
+      v-if="deviceSource === 'webcam'"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-top: 10px"
+    >
+      <template #title>
+        当前为普通摄像头（非深度摄像头），无法采集深度数据。{{
+          depthAvailable
+            ? '如需采集深度，请在「设备源」中切换至已检测到的深度相机。'
+            : '如需采集深度，请点击「透传深度相机」透传深度摄像头后选择深度相机。'
+        }}
+      </template>
+    </el-alert>
+
     <!-- 视频区 -->
     <div
       class="video-stage"
@@ -731,6 +748,9 @@ const showPassthroughBtn = computed(() =>
   (realSenseChecked.value && !realSenseAvailable.value) ||
   (orbbecChecked.value && !orbbecAvailable.value)
 )
+
+// 是否已检测到任一深度相机（决定普通摄像头提示是引导切换还是引导透传）
+const depthAvailable = computed(() => orbbecAvailable.value || realSenseAvailable.value)
 
 const startPassthrough = async () => {
   try {
@@ -1632,11 +1652,21 @@ const playPreview = async (s) => {
 }
 
 // ==================== 录制控制 ====================
-const startRecording = () => {
+const startRecording = async () => {
   if (!stream.value) {
     ElMessage.warning('摄像头未就绪')
     return
   }
+  // 普通摄像头无法采集深度：开始前确认用户知悉（如需深度请先透传深度摄像头）
+  try {
+    await ElMessageBox.confirm(
+      depthAvailable.value
+        ? '当前「普通摄像头」无法采集深度数据。如需采集深度，请在设备源中切换至已检测到的深度相机。是否仍以普通摄像头开始采集？'
+        : '当前「普通摄像头」无法采集深度数据。如需采集深度，请点击「透传深度相机」透传深度摄像头后选择深度相机。是否仍以普通摄像头开始采集？',
+      '开始采集',
+      { type: 'warning', confirmButtonText: '仍要开始', cancelButtonText: '取消' }
+    )
+  } catch { return }
   chunks = []
   const options = { mimeType: getSupportedMime() }
   try {

@@ -238,6 +238,53 @@ def _rewrap_file_dek(data: bytes, old_mk: bytes, new_mk: bytes) -> bytes:
     return _rewrap_dek(data, new_mk, new_mk)
 
 
+def encrypt_bytes_with_key(plaintext: bytes, mk: bytes) -> bytes:
+    """用**指定**主密钥加密（不读进程缓存）
+
+    用于「本包专用主密钥」导出：包内密文只能用随包那把主密钥解开，
+    平台主密钥不出包（见 :mod:`app.utils.restore_kit`）。
+    """
+    return _encrypt_bytes_with_key(plaintext, mk)
+
+
+def rewrap_dek_prefix(prefix: bytes, new_mk: bytes, old_mk: bytes = None) -> bytes:
+    """只重包裹文件头里的 DEK（前 ``5 + NONCE + ENC_DEK`` 字节），内容密文不变
+
+    大文件因此可以流式处理（见 :func:`rewrap_dmec_file`），无需整体读入内存。
+    """
+    if len(prefix) < 5 + NONCE_SIZE + ENC_DEK_SIZE:
+        raise ValueError("文件过短，不是有效的加密文件")
+    if prefix[:4] != MAGIC:
+        raise ValueError("文件不是加密格式（魔数不匹配）")
+    old = old_mk if old_mk is not None else get_master_key()
+    dek_nonce = prefix[5:5 + NONCE_SIZE]
+    enc_dek = prefix[5 + NONCE_SIZE:5 + NONCE_SIZE + ENC_DEK_SIZE]
+    try:
+        dek = AESGCM(old).decrypt(dek_nonce, enc_dek, associated_data=MAGIC)
+    except InvalidTag:
+        raise ValueError("DEK 解密失败：主密钥不匹配或文件头已损坏")
+    new_nonce = os.urandom(NONCE_SIZE)
+    new_enc_dek = AESGCM(new_mk).encrypt(new_nonce, dek, associated_data=MAGIC)
+    return MAGIC + bytes([prefix[4]]) + new_nonce + new_enc_dek
+
+
+def rewrap_dmec_file(src_path, dst_path, new_mk: bytes, old_mk: bytes = None):
+    """把已加密文件的 DEK 重包裹到 ``new_mk``（流式，内容密文逐字节原样拷贝）
+
+    :return: 写入的目标路径
+    """
+    import shutil
+    head_len = 5 + NONCE_SIZE + ENC_DEK_SIZE
+    with open(src_path, "rb") as f:
+        prefix = f.read(head_len)
+    new_prefix = rewrap_dek_prefix(prefix, new_mk, old_mk)
+    with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
+        fin.seek(head_len)
+        fout.write(new_prefix)
+        shutil.copyfileobj(fin, fout, length=1 << 20)
+    return dst_path
+
+
 def _decrypt_bytes_with_key(data: bytes, mk: bytes) -> bytes:
     """用指定主密钥解密字节流：输入 [header][encrypted_content]，返回明文"""
     dek_nonce, enc_dek, content_nonce, enc_content = _parse_header(data)

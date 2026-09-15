@@ -39,14 +39,26 @@ DEFAULT_RULES = [
         "mask_char": "*", "is_active": True, "sort_order": 6,
     },
     {
+        # 性别与年龄属准标识符（quasi-identifier）：与姓名/电话组合可反推个体，
+        # 因此默认启用、整体替换（保留位数只会泄露取值长度，无保留价值）
+        "field_key": "gender", "field_label": "性别",
+        "algorithm": "mask_all", "keep_head": 0, "keep_tail": 0,
+        "mask_char": "*", "is_active": True, "sort_order": 7,
+    },
+    {
+        "field_key": "age", "field_label": "年龄",
+        "algorithm": "mask_all", "keep_head": 0, "keep_tail": 0,
+        "mask_char": "*", "is_active": True, "sort_order": 8,
+    },
+    {
         "field_key": "remark", "field_label": "备注",
         "algorithm": "mask_tail", "keep_head": 0, "keep_tail": 0,
-        "mask_char": "*", "is_active": False, "sort_order": 7,
+        "mask_char": "*", "is_active": False, "sort_order": 9,
     },
     {
         "field_key": "pseudo_id", "field_label": "伪ID",
         "algorithm": "mask_middle", "keep_head": 2, "keep_tail": 2,
-        "mask_char": "*", "is_active": False, "sort_order": 8,
+        "mask_char": "*", "is_active": False, "sort_order": 10,
     },
 ]
 
@@ -101,10 +113,32 @@ class DesensitizeRule(db.Model):
 
 
 def init_default_desensitize():
-    """首次启动时写入默认脱敏配置（已存在则跳过）"""
+    """初始化默认脱敏配置
+
+    - 总开关行不存在则创建（id=1）
+    - 默认规则采用「仅补插缺失」策略：按 field_key 判断，已存在的规则一律不动
+      （既保证老库升级后能拿到新增的默认规则，又不会覆盖管理员的改动）
+    - 补插时 sort_order 一律追加到当前最大值之后：老库中默认位置常已被占用，
+      沿用默认值会与前序规则并列，导致 ORDER BY sort_order 结果不确定
+    - 管理员通过界面删除过的默认规则，会在下次启动时被重新补插——这是有意为之：
+      DEFAULT_RULES 代表"系统默认规则"集合；只想停用某条规则请置 is_active=False
+
+    :return: 本次新增的规则条数
+    """
     if DesensitizeSetting.query.count() == 0:
         db.session.add(DesensitizeSetting(id=1, enabled=True))
-    if DesensitizeRule.query.count() == 0:
-        for item in DEFAULT_RULES:
-            db.session.add(DesensitizeRule(**item))
+    existing_keys = {key for (key,) in db.session.query(DesensitizeRule.field_key).all()}
+    # 空库时 max_order=0 → 各规则落回默认 sort_order（1..N，与 DEFAULT_RULES 顺序一致）
+    max_order = db.session.query(
+        db.func.max(DesensitizeRule.sort_order)).scalar() or 0
+    added = 0
+    for item in DEFAULT_RULES:
+        if item["field_key"] in existing_keys:
+            continue
+        rule = dict(item)
+        max_order += 1
+        rule["sort_order"] = max_order
+        db.session.add(DesensitizeRule(**rule))
+        added += 1
     db.session.commit()
+    return added

@@ -11,8 +11,10 @@
 """
 import hashlib
 import hmac
+import json
 import logging
 import os
+import re
 import threading
 
 # os.O_BINARY 仅存在于 Windows，Unix 缺失时置 0 兼容
@@ -288,3 +290,127 @@ def desensitize_list(items, role):
     for item in items:
         desensitize_dict(item, role)
     return items
+
+
+# ==================== userInfo.json 内容脱敏（导出场景） ====================
+
+# 采集端 userInfo.json 的字段名 → 平台脱敏规则的 field_key
+# 采集端键名与平台模型字段名不一致（userName vs real_name），必须显式映射
+USERINFO_KEY_ALIASES = {
+    "username": "real_name",
+    "name": "real_name",
+    "realname": "real_name",
+    "real_name": "real_name",
+    "patientname": "real_name",
+    "phone": "phone",
+    "telephone": "phone",
+    "tel": "phone",
+    "mobile": "phone",
+    "phonenumber": "phone",
+    "email": "email",
+    "mail": "email",
+    "idcard": "id_card",
+    "id_card": "id_card",
+    "cardno": "id_card",
+    "address": "address",
+    "homeaddress": "address",
+    "comment": "remark",
+    "remark": "remark",
+    # 准标识符：性别/年龄（采集端 sex 为 0/1/2 编码，平台侧为 gender 中文）
+    "sex": "gender",
+    "gender": "gender",
+    "usersex": "gender",
+    "usergender": "gender",
+    "age": "age",
+    "userage": "age",
+}
+
+# 匹配 JSON 文本中的 "key": "value" 字符串字段（值为字符串）
+# 用正则而非 json.loads：采集端 userInfo.json 常见缺逗号/尾逗号等非法 JSON，
+# 解析会直接失败；文本替换同时保证原缩进、注释、字段顺序一律不变
+_USERINFO_STR_FIELD_RE = re.compile(
+    r'("([A-Za-z_][A-Za-z0-9_]*)"[ \t]*:[ \t]*")((?:[^"\\]|\\.)*)(")'
+)
+
+# 匹配 "key": <数字> 数值型字段
+# 必要性：采集端把性别/年龄写成数值（"sex": 0、"age": 30），只处理字符串值
+# 会让这两条规则在导出路径上完全失效
+# 不含 true/false/null：null 表示"无此信息"，脱敏会无中生有造出值（"phone": null
+#   → "phone": "****"），布尔同理，二者都不承载身份信息
+# 尾部 (?![0-9A-Za-z_.]) 防止从更长 token 中间截断匹配
+_USERINFO_SCALAR_FIELD_RE = re.compile(
+    r'("([A-Za-z_][A-Za-z0-9_]*)"[ \t]*:[ \t]*)'
+    r'(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+    r'(?![0-9A-Za-z_.])'
+)
+
+
+def _mask_userinfo_field(key: str, raw_value: str, is_quoted: bool):
+    """按脱敏规则处理 userInfo 文本中的单个字段值
+
+    :param key: JSON 键名（采集端命名，需经 USERINFO_KEY_ALIASES 映射）
+    :param raw_value: 值的文本形态（不含外层引号）
+    :param is_quoted: 该值在原文本中是否带引号（字符串值）
+    :return: (写回的文本, 是否命中脱敏)；未命中时原样返回 raw_value
+    """
+    field_key = USERINFO_KEY_ALIASES.get(key.lower())
+    if not field_key:
+        return raw_value, False
+    try:
+        masked = desensitize_field(field_key, raw_value)
+    except Exception:
+        return raw_value, False
+    if masked is None or masked == raw_value:
+        return raw_value, False
+    masked = str(masked)
+    if is_quoted:
+        # 字符串值：直接嵌回原引号内，保持既有转义结构不变
+        return masked, True
+    # 非字符串标量：脱敏结果按 JSON 字符串写回（"age": 30 → "age": "**"）
+    # 不能裸写 mask_char —— 会产出 `"age": **` 这种非法 JSON
+    # 类型由 number 变为 string 是有意的：值已不可用，类型随之失去语义；
+    # scanner._parse_user_info 对 int()/映射失败均有容错，二次导入不会崩
+    return json.dumps(masked, ensure_ascii=False), True
+
+
+def desensitize_userinfo_text(text: str):
+    """对 userInfo.json 文本按脱敏规则处理受试者身份字段
+
+    - 仅替换能映射到脱敏规则且规则启用（is_active=True）的字段
+    - 规则取值用 desensitize_field()，因此天然独立于脱敏总开关 enabled：
+      导出脱敏由用户在导出界面显式勾选，不应被平台全局开关静默吞掉
+    - 覆盖字符串值与数值两类值；容忍非法 JSON（采集端数据常见）
+    - null/布尔值不做脱敏（非身份信息，替换会无中生有）
+    - 未命中任何规则的键（如 moca/mmse/disease）与原有缩进、空白一律不动
+
+    :param text: userInfo.json 原始文本
+    :return: (脱敏后文本, 命中字段数)
+    """
+    if not text:
+        return text, 0
+
+    hits = 0
+
+    def _replace_str(match):
+        nonlocal hits
+        prefix, key, value, quote = match.group(1), match.group(2), match.group(3), match.group(4)
+        if not value:
+            return match.group(0)
+        new_value, hit = _mask_userinfo_field(key, value, True)
+        if not hit:
+            return match.group(0)
+        hits += 1
+        return f"{prefix}{new_value}{quote}"
+
+    def _replace_scalar(match):
+        nonlocal hits
+        prefix, key, value = match.group(1), match.group(2), match.group(3)
+        new_value, hit = _mask_userinfo_field(key, value, False)
+        if not hit:
+            return match.group(0)
+        hits += 1
+        return f"{prefix}{new_value}"
+
+    text = _USERINFO_STR_FIELD_RE.sub(_replace_str, text)
+    text = _USERINFO_SCALAR_FIELD_RE.sub(_replace_scalar, text)
+    return text, hits

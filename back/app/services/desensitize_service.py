@@ -40,6 +40,8 @@ DEFAULT_PREVIEW_SAMPLE = [
     {"field_key": "email", "value": "zhangsanfeng@example.com"},
     {"field_key": "license_no", "value": "110123456789012"},
     {"field_key": "id_card", "value": "110101199001011234"},
+    {"field_key": "gender", "value": "男"},
+    {"field_key": "age", "value": "62"},
     {"field_key": "address", "value": "北京市海淀区中关村大街1号"},
     {"field_key": "remark", "value": "受试者主诉偶有头晕，家属反馈近期记忆力下降"},
     {"field_key": "pseudo_id", "value": "SUB-2026-001"},

@@ -235,7 +235,7 @@
             </el-table-column>
           </el-table>
           <div style="margin-top: 8px; color: #909399; font-size: 12px">
-            字段标识需与后端模型 to_dict() 输出的 key 一致，如 real_name/phone/email/license_no/pseudo_id/remark 等。
+            字段标识需与后端模型 to_dict() 输出的 key 一致，如 real_name/phone/email/license_no/gender/age/pseudo_id/remark 等。
           </div>
         </el-tab-pane>
 
@@ -733,6 +733,84 @@
                     <span style="margin-left: 8px; color: #909399; font-size: 12px">
                       {{ exportForm.encrypted ? '主密钥加密' : '明文导出' }}
                     </span>
+                  </div>
+                </div>
+
+                <el-divider style="margin: 8px 0" />
+
+                <div style="margin-bottom: 16px">
+                  <div style="display: flex; align-items: center; margin-bottom: 4px">
+                    <span style="font-weight: 600; margin-right: 12px">脱敏导出</span>
+                    <el-switch v-model="exportForm.desensitize.enabled" />
+                    <span style="margin-left: 8px; color: #909399; font-size: 12px">
+                      {{ exportForm.desensitize.enabled ? '已启用（按模态选择）' : '不脱敏（导出原始数据）' }}
+                    </span>
+                  </div>
+                  <div v-if="exportForm.desensitize.enabled" style="margin-top: 8px">
+                    <el-checkbox v-model="exportForm.desensitize.userinfo">受试者信息（userInfo）</el-checkbox>
+                    <el-checkbox v-model="exportForm.desensitize.audio">音频（声纹）</el-checkbox>
+                    <el-checkbox v-model="exportForm.desensitize.video">视频（人脸马赛克）</el-checkbox>
+                    <el-checkbox v-model="exportForm.desensitize.eeg">脑电（EEG）</el-checkbox>
+                    <el-checkbox v-model="exportForm.desensitize.ecg">心电（ECG）</el-checkbox>
+                  </div>
+                  <div
+                    v-if="exportForm.desensitize.enabled && (exportForm.desensitize.eeg || exportForm.desensitize.ecg || exportForm.desensitize.audio || exportForm.encrypted)"
+                    style="margin-top: 8px; padding: 8px 10px; border: 1px solid #e4e7ed; border-radius: 6px"
+                  >
+                    <el-checkbox v-model="exportForm.desensitize.restore_kit">
+                      随包附带还原包（离线还原脚本 + 本包专用密钥）
+                      <span style="color: #909399; font-size: 12px">— 默认勾选</span>
+                    </el-checkbox>
+                    <div style="color: #e6a23c; font-size: 12px; line-height: 1.6; margin-top: 4px">
+                      勾选后包内多出 <b>_restore_kit/</b>：还原脚本（纯标准库，接收方解压即可运行）、
+                      <b>本包专用密钥</b> 与使用说明。<b>任何拿到该包的人都能还原出原始脑电/心电/音频</b>，
+                      等于把「脱敏」降级为「加扰」—— 这是<b>默认勾选</b>带来的代价，若接收方无需还原请取消勾选。
+                      密钥是本次导出<b>现生成的一次性密钥</b>（非平台主密钥）：单包泄露不波及历史/其他脱敏包，
+                      也无法反查 userInfo 的哈希脱敏。导出审计会记录此次「含还原密钥」。
+                      <br /><b>脚本会解密包内全部 .dmec</b>（不只脑电/心电/音频）：脑电/心电/音频解密后再去脱敏，
+                      得到<b>原始文件</b>；其余文件（视频/受试者信息/眼动等）只解密，得到<b>脱敏后的明文</b>
+                      —— 它们的脱敏不可逆，解出来人脸仍是马赛克块、身份字段仍是掩码。
+                      <template v-if="exportForm.encrypted">
+                        <br />当前是<b>加密导出</b>：还会额外随包给出一把<b>本包专用主密钥</b>（master.key），
+                        接收方运行脚本可<b>先解密 .dmec、再还原</b>，一步拿到原始文件；
+                        平台主密钥始终不出包。解密为脚本内置实现（纯标准库，约 0.8 MB/s），
+                        无需接收方安装任何密码学包。
+                      </template>
+                    </div>
+                  </div>
+                  <div v-if="exportForm.desensitize.enabled" style="color: #e6a23c; font-size: 12px; line-height: 1.6; margin-top: 6px">
+                    <div v-if="exportForm.desensitize.userinfo">
+                      · <b>受试者信息</b>：按「系统管理 → 脱敏配置」已启用规则替换 userInfo 内姓名/电话/性别/年龄等字段（性别/年龄在文件内为数值，脱敏后按字符串写回）
+                    </div>
+                    <div v-if="exportForm.desensitize.audio">
+                      · <b>音频</b>：在定点 PCM 域加<b>确定性噪声</b>（按受试者 + 逻辑路径 + 声道派生，幅度 R 随录音响度自适应，SNR 约 -9.5 dB）破坏声纹（语音内容基本不可懂），<b>只改样本区</b>——RIFF 头块等其余字节一字不动，<b>采样率/声道/帧数逐样本不变</b>。非整数 PCM 的源（mp3/m4a/浮点 wav）会先转成 <b>16-bit PCM WAV</b>（文件名后缀同步改为 .wav）。仅作用于「音频」类型；<b>视频内音轨由「视频」开关处理（直接移除）</b>。凭导出时的同一密钥可<b>逐字节无损还原</b>（不再有变调带来的毫秒级时间漂移）
+                    </div>
+                    <div v-if="exportForm.desensitize.video">
+                      · <b>视频</b>：逐帧检测人脸，<b>只对人脸区域做不可逆马赛克（像素化）</b>——把脸区降采样成粗块再放大回来，块边长 = <b>人脸短边 ÷ 8</b>（按当帧人脸大小自适应分级，脸越近块越粗），背景/身体/衣着逐像素保留。实测 4 档人脸尺度（脸短边 37 / 77 / 116 / 151 px）SFace 余弦 = <b>0.114 / 0.043 / 0.063 / 0.062</b>，全部远低于同一人判定阈值 0.363（旧版模糊档最差 0.260，已贴近阈值）；YuNet 在脱敏画面上<b>四档全部检不出人脸</b>。块内像素被整块替换，属于<b>结构性破坏</b>而非「只是更糊」：<b>脱敏后人脸区域不能再做任何下游人脸分析</b>（检测 / 关键点 / 表情 / 视线均不可用），旧版「弱模糊仍可定位大致位置」的说法已不再成立；人脸以外的发型轮廓、体型、衣着等软生物特征不在覆盖范围内。<b>音轨一律移除</b>（视频音轨含声纹，音频开关只作用于「音频」类型资产）；输出统一重编码为 <b>H.264 MP4</b>（文件名后缀同步改为 .mp4），<b>无法还原</b>——不写还原清单（包内不存在可回推参数）。加密导出时该文件仍会被随包脚本<b>解密</b>，但解出来的仍是人脸马赛克（像素化）的视频。仅支持单视频轨，含深度/红外多轨的录制会被跳过并提示
+                    </div>
+                    <div v-if="exportForm.desensitize.eeg">
+                      · <b>脑电</b>：逐通道按信号幅度自适应加噪，破坏脑纹可识别性；<b>全列保留</b>——列名、通道数、采样点数均不变，绝对时间列（Timestamp / Board Timestamp）做<b>整列常量平移</b>（保持采样间隔与单调递增，无法定位真实采集时刻）。实测：波形相关约 0.99（时间结构仍可用），频带功率占比改变 20%~43%、通道间相干性下降 6%~52%（随原始通道间相关性而变）；凭导出时的同一密钥可<b>逐字节无损还原</b>
+                    </div>
+                    <div v-if="exportForm.desensitize.ecg">
+                      · <b>心电</b>：value 列按 SNR 约 10 dB 加噪，<b>heart_rate 等派生生理列同样逐点加噪</b>（保留列但破坏 HRV，避免下游从脱敏波形反推真实心率）；<b>全列保留</b>——行数、列名、相对时间轴均不变，绝对时间列做<b>整列常量平移</b>；凭导出时的同一密钥可<b>逐字节无损还原</b>
+                    </div>
+                    <div style="margin-top: 4px; color: #909399">
+                      加密导出时统一走「解密 → 脱敏 → 重新加密」；任一文件脱敏失败会被<b>跳过</b>，不会回退为原始明文。
+                      <template v-if="exportForm.desensitize.eeg || exportForm.desensitize.ecg || exportForm.desensitize.audio">
+                        导出包内附 <b>_desens_manifest.json</b> 还原清单（只含列参数/每声道噪声幅度，不含密钥）：
+                        <template v-if="exportForm.desensitize.restore_kit">
+                          已勾选还原包，接收方直接运行包内 <b>_restore_kit/restore_signal_desens.py</b> 即可逐字节还原
+                          <template v-if="exportForm.encrypted">（脚本会用包内 master.key 先解密再还原）</template>
+                          （脚本自动读取包内密钥）
+                        </template>
+                        <template v-else>
+                          凭导出时相同的 DESENS_HMAC_KEY 运行 <b>back/tools/restore_signal_desens.py</b> 即可逐字节还原
+                        </template>
+                      </template>
+                      <template v-if="exportForm.desensitize.video">
+                        <br /><b>视频不产生还原清单</b>：人脸马赛克是有损变换（块内像素被整块替换，原始细节已不存在），包内不存在任何可回推原始人脸的密钥或参数，接收方无法还原内容 —— 加密导出时视频仍会被随包脚本<b>解密</b>（否则包里会残留一半密文），但解出来的仍是人脸马赛克（像素化）的视频。
+                      </template>
+                    </div>
                   </div>
                 </div>
 
@@ -2268,6 +2346,29 @@ const exportForm = reactive({
   data_types: [],
   layers: [],
   encrypted: true,
+  // 统一脱敏配置：一个总开关 + 各模态子项，一次性覆盖全部脱敏途径。
+  // 默认全开（隐私优先）；需要原始数据时按模态单独关闭，或关掉总开关一次全关。
+  //   userinfo → userInfo 文件字段级脱敏
+  //   audio    → 音频声纹脱敏（定点 PCM 域确定性加噪，可逆；只改样本区，帧数/采样率不变）
+  //   video    → 视频人脸区域脱敏（逐帧检测 + 人脸区不可逆马赛克 + 移除音轨）
+  //                马赛克块边长按人脸短边自适应（= 人脸短边 / 8）；v3 起不再用模糊，
+  //                因为模糊加大到一定程度后 SFace 余弦会回升（越糊越像同一人）
+  //   eeg      → 脑电值级脱敏（全列保留：信号列加噪 + 绝对时间列整列平移）
+  //   ecg      → 心电值级脱敏（全列保留：value 列加噪，heart_rate 列同样加噪）
+  //   restore_kit → 随包附带「还原包」：离线还原脚本 + 本包专用密钥 + 说明
+  //                 **默认开启**（2026-09-15 起）—— 接收方拿到包即可自行还原
+  //                 ⚠️ 附带密钥等于把"脱敏"降级为"加扰"：若不希望接收方能还原，需手动取消勾选
+  //                 注：视频脱敏不可逆（马赛克），不在还原包覆盖范围内；且脱敏后
+  //                     人脸区域无法再被检测/识别，下游人脸分析不可用
+  desensitize: {
+    enabled: true,
+    userinfo: true,
+    audio: true,
+    video: true,
+    eeg: true,
+    ecg: true,
+    restore_kit: true,
+  },
 })
 const exportSubjectList = ref([])
 const exportSelectedSubjects = ref([])  // 表格当前选中行
@@ -2483,6 +2584,7 @@ const handleExport = async () => {
       data_types: exportForm.data_types,
       layers: exportForm.layers,
       encrypted: exportForm.encrypted,
+      desensitize: { ...exportForm.desensitize },
     })
     const taskId = startRes.data.task_id
     exportProgress.status = '任务已启动，正在解析导出范围...'
@@ -2565,7 +2667,18 @@ const handleExport = async () => {
     exportProgress.status = '导出完成'
     const skipped = finishedTask?.skipped_files || 0
     if (skipped > 0) {
-      ElMessage.warning(`导出完成，但 ${skipped} 个文件因磁盘丢失或读取失败被跳过，详见操作日志`)
+      // 如实展示跳过原因（磁盘丢失 / 脱敏失败 / 打包异常都不同），
+      // 不再一律说"磁盘丢失或读取失败"
+      const detail = finishedTask?.skipped_detail || []
+      const lines = detail
+        .slice(0, 3)
+        .map((d) => `${d.file_name || d.asset_id}：${d.reason}`)
+        .join('<br/>')
+      ElMessageBox.alert(
+        lines || '原因详见操作日志与服务端日志',
+        `导出完成，但 ${skipped} 个文件被跳过`,
+        { dangerouslyUseHTMLString: true, confirmButtonText: '我知道了' }
+      )
     } else {
       ElMessage.success('导出成功')
     }
