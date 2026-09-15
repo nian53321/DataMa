@@ -91,6 +91,13 @@ back/models/
 back/tools/bench_video_desens/
 back/tools/bench_audio_desens/
 
+# ===================== back/tools 下的开发文档与一次性诊断脚本（不入库）=====================
+# back/tools/ 唯一需要版本管理的是交付物本身（restore_signal_desens.py）；
+# README-*.md 是开发期分析结论（同类内容已落在 .workbuddy/memory/ 的分册里），
+# _diag_*.py 是一次性诊断脚本（如深度码流体积扫描、DMEC 单文件解密）。
+back/tools/README-*.md
+back/tools/_diag_*.py
+
 # ===================== 后端脚本（仅保留部署必需的子进程）=====================
 # back/scripts/ 是部署必要目录（Dockerfile COPY . . 会拷入镜像）：
 # 容器内摄像头子进程 orbbec_camera_proc.py / realsense_child.py 必须纳入版本管理；
