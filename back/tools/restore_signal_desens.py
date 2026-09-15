@@ -48,8 +48,8 @@ for _p in (_APP_ROOT, os.path.dirname(_APP_ROOT)):
         sys.path.insert(0, _p)
 
 from app.utils.signal_desensitize import (  # noqa: E402
-    MANIFEST_NAME, VERSION_TAG, load_manifest, manifest_bytes, restore_signal_file,
-    set_hmac_key, verify_manifest,
+    MANIFEST_NAME, VERSION_TAG, _pseudo_from_path, load_manifest, manifest_bytes,
+    restore_signal_file, set_hmac_key, verify_manifest,
 )
 
 _DEFAULT_KEY_PATHS = (
@@ -105,11 +105,21 @@ def _find_entry_file(root, entry):
 
 
 def _pseudo_of(entry, override):
+    """确定派生噪声用的 subject_key —— 口径必须与 ``restore_zip`` 一致
+
+    优先级：**显式 --pseudo-id > manifest 条目的 ``subject_key`` > 逻辑路径首段**。
+
+    早期版本只取路径首段、忽略 ``entry["subject_key"]``，与 ``restore_zip``
+    （``subject_key or entry["subject_key"] or _pseudo_from_path(path)``）口径不一致。
+    当前 ``logical_path`` 恰好是 ``<pseudo_id>/<layer>/...`` 所以不触发，但只要路径
+    格式一变就会静默用错 subject_key 派生噪声，产出"看着像信号的错数据"。
+    """
     if override:
         return override
-    path = entry.get("path") or entry.get("arcname") or ""
-    parts = str(path).replace("\\", "/").split("/")
-    return parts[0] if parts else ""
+    sk = entry.get("subject_key")
+    if sk:
+        return str(sk)
+    return _pseudo_from_path(entry.get("path") or entry.get("arcname") or "") or ""
 
 
 def _human(v, decimals):
