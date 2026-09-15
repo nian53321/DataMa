@@ -53,8 +53,10 @@ from app.utils.source_identity import (
     normalize_original_filename, stored_original_filename, source_group_key,
 )
 from app.utils.singleton_assets import (
-    is_singleton_asset, is_singleton_data_type, collapse_singleton_duplicates,
+    is_singleton_asset, is_singleton_data_type,
     _dt_value, USERINFO_SOURCE_NAME,
+    absorb_sources, source_entry_of, absorbed_entries, collection_time_of,
+    find_singleton_violations, pick_singleton_keeper,
 )
 from app.utils.response import paginate
 from werkzeug.utils import secure_filename
@@ -253,11 +255,18 @@ class AssetService(BaseService):
                 # 目录扫描入库），而前端本地记录用 File.name（纯名），不归一会
                 # 判为"库中不存在"而作废重传，反而制造重复。
                 fn = stored_original_filename((meta or {}).get("original_filename"))
-                if not fn:
-                    continue
-                digest.setdefault(pseudo_id, []).append(
-                    [fn, (meta or {}).get("original_size")]
-                )
+                if fn:
+                    digest.setdefault(pseudo_id, []).append(
+                        [fn, (meta or {}).get("original_size")]
+                    )
+                # 已被单实例规则吸收的源文件同样算"已处理"：它们在后端没有独立
+                # 资产记录，若不出现在摘要里，前端每轮对账都会判定"后端没有该
+                # 文件" → 作废重传 → 又被淘汰 → 再重传，形成死循环。现场表现
+                # 是受试者目录下同模态文件每个扫描周期全量重传一次。
+                for name, size in absorbed_entries(meta):
+                    fn2 = stored_original_filename(name)
+                    if fn2:
+                        digest.setdefault(pseudo_id, []).append([fn2, size])
         return digest
 
     def batch_create_assets(self, subject_id: int, items: list):
@@ -501,6 +510,12 @@ class AssetService(BaseService):
                         _singleton_stale_ids(existing, new_is_singleton, exclude_id=ex.id)
                     )
                     if stale_ids:
+                        # 删除前先把被淘汰记录的源文件登记到保留者：否则这些文件
+                        # 在 ingest-digest 里消失 → 前端每轮对账判定"后端没有"
+                        # → 作废重传 → 又被淘汰 → 死循环（每轮 N 条跳过日志）
+                        self._absorb_stale_sources(
+                            ex.id, [r for r in existing if r.id in set(stale_ids)]
+                        )
                         self._purge_stale_uploads(stale_ids)
                     # 命中既有资产：补查完整模型实例返回（调用方需 to_dict）
                     return DataAsset.query.get(ex.id), True  # (asset, is_duplicate)
@@ -516,19 +531,29 @@ class AssetService(BaseService):
             # 判定只比较两侧文件名解析出的时间戳 —— 用 timestamp_utc 会被
             # 「入库时刻兜底值」污染（无时间戳的老记录 ts = 入库时刻，恒最新）。
             if new_is_singleton:
-                newer = _newer_singleton_rows(existing, original_name)
+                newer = _newer_singleton_rows(existing, original_name, subject.pseudo_id)
                 if newer:
-                    keeper = max(newer, key=lambda r: (r.timestamp_utc or datetime.min, r.id))
+                    keeper = max(newer, key=lambda r: (collection_time_of(r) or datetime.min, r.id))
                     log_operation(
                         "upload", "asset", keeper.id,
                         f"单实例模态跳过旧采集文件：已有更新资产 {keeper.file_name}"
                         f"（本次 {original_name}）",
                         operator=self._operator_user(),
                     )
+                    # 本次被拒的源文件必须登记到保留者：否则它不在 digest 里 →
+                    # 前端每轮对账都判定"后端没有这个文件" → 作废重传 → 再被拒，
+                    # 形成无限循环（现场表现：每个扫描周期刷 N 条本日志）
+                    self._absorb_stale_sources(
+                        keeper.id, [r for r in newer if r.id != keeper.id],
+                        extra=[(original_name, original_size)],
+                    )
                     self._commit()
                     # 顺带收敛：该受试者同类若仍有多条，只留采集时间最新的这条
                     stale = _singleton_stale_ids(existing, True, exclude_id=keeper.id)
                     if stale:
+                        self._absorb_stale_sources(
+                            keeper.id, [r for r in existing if r.id in set(stale)]
+                        )
                         self._purge_stale_uploads(stale)
                     return DataAsset.query.get(keeper.id), True
 
@@ -716,8 +741,45 @@ class AssetService(BaseService):
             )
         # 同名演进替换：删除录制半成品等旧版本资产（先写新后删旧，同视频重采顺序）
         if stale_ids:
+            # 删除前登记被淘汰记录的源文件（见 _absorb_stale_sources 说明）
+            self._absorb_stale_sources(
+                asset.id, [r for r in existing if r.id in set(stale_ids)]
+            )
             self._purge_stale_uploads(stale_ids)
         return asset, False  # (asset, is_duplicate) 新建资产
+
+    def _absorb_stale_sources(self, keeper_id, rows, extra=None):
+        """把被单实例规则淘汰的源文件登记到保留资产的 metadata
+
+        为什么必须做：被淘汰的记录删掉后，其源文件在 `ingest_digest` 里就没有
+        任何记录。前端浏览器扫描每轮拿 digest 对账，判定"后端没有这个文件"
+        → 作废本地记录 → 重新上传 → 又被唯一性规则淘汰 → 下一轮再重传。
+        2026-09-16 线上表现：受试者 17862665472640001 的 12 个脑电文件每个扫描
+        周期全量重传一次，每轮写 12 条"跳过旧采集文件"审计日志，且新旧判定的
+        基准被入库时刻污染后，连本该入库的更新采集也被一并拒绝。
+
+        登记到保留者后，digest 会把它们一并报为"已处理"，对账命中即终止循环。
+
+        :param keeper_id: 保留下来的资产 id
+        :param rows: 被淘汰的资产行（需含 metadata_json）
+        :param extra: 额外要登记的 (name, size)，如本次因更旧而被拒的源文件
+        """
+        if not keeper_id:
+            return
+        entries = list(extra or [])
+        for row in rows or []:
+            entry = source_entry_of(row)
+            if entry:
+                entries.append(entry)
+            # 继承被删记录此前吸收的名单，避免"换了 keeper 后旧文件又开始重传"
+            entries.extend(absorbed_entries(row))
+        if not entries:
+            return
+        keeper = DataAsset.query.get(keeper_id)
+        if keeper is None:
+            return
+        if absorb_sources(keeper, entries):
+            self._commit()
 
     # ==================== 文件服务（下载/播放） ====================
 
@@ -1048,7 +1110,17 @@ class AssetService(BaseService):
         幂等可重复执行。
         """
         storage_root = current_app.config["DATA_LAKE_DIR"]
-        stale_ids = collapse_singleton_duplicates(storage_root=storage_root)
+        # 逐组收敛（而不是只取待删 id 列表）：需要知道每组保留者是谁，才能把被
+        # 淘汰记录的源文件登记到它身上 —— 否则自愈删掉的记录会让前端下一轮
+        # 又把这些文件重传回来（见 _absorb_stale_sources）
+        stale_ids = []
+        for _key, assets in find_singleton_violations(storage_root=storage_root).items():
+            keep_id = pick_singleton_keeper(assets, storage_root)
+            stale_rows = [a for a in assets if a.id != keep_id]
+            stale_ids.extend(a.id for a in stale_rows)
+            if keep_id and stale_rows:
+                self._absorb_stale_sources(keep_id, stale_rows)
+        stale_ids = sorted(set(stale_ids))
         if stale_ids:
             current_app.logger.warning(
                 "单实例约束自愈：清理 %d 条重复资产 %s", len(stale_ids), stale_ids,
@@ -1082,7 +1154,7 @@ def _singleton_stale_ids(existing_rows, new_is_singleton, exclude_id=None):
     return out
 
 
-def _newer_singleton_rows(existing_rows, original_name):
+def _newer_singleton_rows(existing_rows, original_name, pseudo_id=None):
     """单实例模态下，采集时间比本次上传文件**更新**的既有资产行
 
     场景：受试者目录里存在两次采集的两份心电（`ecg_20260717.csv` 与
@@ -1092,6 +1164,11 @@ def _newer_singleton_rows(existing_rows, original_name):
 
     只在两侧文件名都能解析出时间戳时判定：解析不出时信息不足，退化为既有的
     「后上传替换先上传」行为（不会误跳过）。
+
+    既有一侧的采集时间走 `collection_time_of`，而不是直接读
+    `metadata.original_filename`：后者可能是入库时用 file_name 补写的**存储名**
+    （其时间戳是入库时刻），拿它比较会让该记录恒为最新，导致同模态文件
+    **全部**被判更旧而拒绝入库（2026-09-16 现场：12 个脑电文件无一入库）。
     """
     new_ts = parse_time_from_name(original_name)
     if new_ts is None:
@@ -1100,8 +1177,7 @@ def _newer_singleton_rows(existing_rows, original_name):
     for row in existing_rows:
         if not is_singleton_asset(row):
             continue
-        meta = row.metadata_json or {}
-        ex_ts = parse_time_from_name(meta.get("original_filename"))
+        ex_ts = collection_time_of(row, pseudo_id)
         if ex_ts is not None and ex_ts > new_ts:
             out.append(row)
     return out

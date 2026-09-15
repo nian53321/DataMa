@@ -155,7 +155,8 @@ def _iter_meta_time_values(meta: dict) -> Iterator[Any]:
 
 
 def resolve_collection_time(metadata=None, original_filename=None,
-                            extra_names=None, fallback_utc=None) -> Optional[datetime]:
+                            extra_names=None, fallback_utc=None,
+                            exclude_names=None) -> Optional[datetime]:
     """解析一条数据资产的采集时间（UTC datetime）
 
     Args:
@@ -163,6 +164,9 @@ def resolve_collection_time(metadata=None, original_filename=None,
         original_filename: 原始文件名（可选；不传时从 metadata 里取）
         extra_names: 额外的候选文件名（如规范化 file_name），按顺序兜底
         fallback_utc: 兜底时间，必须是 **UTC naive** datetime（如 datetime.utcnow()）
+        exclude_names: 需要排除的文件名（大小写不敏感）。用于剔除「入库时生成
+            的存储名」——其时间戳是入库时刻而非采集时刻，拿它当采集时间会让
+            该记录恒为最新（见 app.utils.singleton_assets.collection_time_of）
     Returns:
         UTC naive datetime；全部解析失败且无兜底时返回 None
     """
@@ -175,12 +179,17 @@ def resolve_collection_time(metadata=None, original_filename=None,
             return dt
 
     # 2. 文件名（原始名优先 → 规范化名兜底）
+    excluded = {str(n).strip().lower() for n in (exclude_names or []) if n}
     names = []
-    if original_filename:
-        names.append(original_filename)
-    if meta.get("original_filename"):
-        names.append(meta["original_filename"])
-    names.extend(extra_names or [])
+    candidates = (
+        ([original_filename] if original_filename else [])
+        + ([meta["original_filename"]] if meta.get("original_filename") else [])
+        + list(extra_names or [])
+    )
+    for name in candidates:
+        if str(name).strip().lower() in excluded:
+            continue
+        names.append(name)
     for name in names:
         dt = parse_time_from_name(name)
         if dt:

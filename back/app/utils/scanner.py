@@ -854,12 +854,36 @@ def _collapse_subject_singletons(subject):
     保留优先级：幽灵记录（文件缺失/大小不符）先淘汰 → 采集时间最新 → id 最大。
     """
     from flask import current_app
-    from app.utils.singleton_assets import collapse_singleton_duplicates
+    from app.models import DataAsset
+    from app.utils.singleton_assets import (
+        find_singleton_violations, pick_singleton_keeper,
+        absorb_sources, source_entry_of, absorbed_entries,
+    )
     try:
-        return collapse_singleton_duplicates(
-            subject_id=subject.id,
-            storage_root=current_app.config["DATA_LAKE_DIR"],
-        )
+        storage_root = current_app.config["DATA_LAKE_DIR"]
+        stale = []
+        for _key, assets in find_singleton_violations(
+                subject_id=subject.id, storage_root=storage_root).items():
+            keep_id = pick_singleton_keeper(assets, storage_root)
+            losing = [a for a in assets if a.id != keep_id]
+            stale.extend(a.id for a in losing)
+            if not (keep_id and losing):
+                continue
+            # 被淘汰记录的源文件登记到保留者：否则它们在 ingest-digest 里消失，
+            # 浏览器扫描每轮对账都会判定"后端没有该文件" → 作废重传 → 又被淘汰，
+            # 形成死循环（详见 AssetService._absorb_stale_sources）
+            keeper = DataAsset.query.get(keep_id)
+            if keeper is None:
+                continue
+            entries = []
+            for row in losing:
+                entry = source_entry_of(row)
+                if entry:
+                    entries.append(entry)
+                entries.extend(absorbed_entries(row))
+            if entries:
+                absorb_sources(keeper, entries)
+        return stale
     except Exception:
         logger.exception("单实例模态收敛失败（不影响本次扫描）：%s", subject.pseudo_id)
         return []

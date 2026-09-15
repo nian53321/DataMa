@@ -28,6 +28,7 @@ import os
 from datetime import datetime
 
 from app.models.data import DataAsset, DataType
+from app.utils.collection_time import resolve_collection_time
 from app.utils.source_identity import normalize_original_filename
 
 # 每受试者只允许一条的模态（data_type.value）
@@ -105,9 +106,65 @@ def _asset_alive(asset, storage_root):
         return False
 
 
+def _subject_pseudo_id(asset):
+    """尽力取出资产所属受试者的伪ID（取不到返回 None）
+
+    `find_singleton_violations` 返回的是 ORM 实例，可经关系懒加载取到；
+    upload_asset 的 `with_entities` 列查询取不到，需由调用方显式传参。
+    """
+    try:
+        subject = getattr(asset, "subject", None)
+    except Exception:      # 列查询 / 已 detach 的实例
+        return None
+    return getattr(subject, "pseudo_id", None)
+
+
+def _is_generated_collection_name(asset, name, pseudo_id=None):
+    """name 是否为**平台命名规范生成**的存储名（其时间戳是入库时刻）
+
+    两个条件同时满足才判定：
+    1. name 与 `file_name` 完全同名 —— 说明它是被补写的伪原始名（批量导入时
+       `meta["original_filename"] = file_name`，见 asset_service.batch_create_assets）
+    2. 该名里含本受试者的伪ID —— 命名模板 `{data_type}_{pseudo_id}_{timestamp}...`
+       的固定特征（见 utils/naming.py，{timestamp} 取 datetime.now()）
+
+    只靠条件 1 会误伤「命名规范未改写文件名」的正常记录（采集端原始名恰好等于
+    存储名），那类记录的时间戳是**真采集时间**，必须照常参与比较。
+    """
+    if not name:
+        return False
+    fn = (getattr(asset, "file_name", "") or "").strip().lower()
+    if not fn or str(name).strip().lower() != fn:
+        return False
+    pid = pseudo_id or _subject_pseudo_id(asset)
+    if not pid:
+        return False
+    return f"_{str(pid).strip().lower()}_" in fn
+
+
+def collection_time_of(asset, pseudo_id=None):
+    """资产的**真实采集时间**（UTC naive datetime），无法判定时返回 None
+
+    与 `DataAsset.timestamp_utc` 的区别：`timestamp_utc` 在解析不出采集时间时
+    用**入库时刻**兜底。拿它做「谁更新」的比较会让入库晚的老记录恒为最新
+    （入库晚 ≠ 采集晚）——2026-09-16 现场：一条脑电记录的采集时间被存储名里的
+    入库时刻污染，导致同目录 12 个脑电文件全部被判为"更旧"而拒绝入库。
+
+    解析不出即返回 None，由调用方退化为其它口径（如「后上传替换先上传」）。
+    """
+    meta = getattr(asset, "metadata_json", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    orig = meta.get("original_filename")
+    exclude = [orig] if _is_generated_collection_name(asset, orig, pseudo_id) else []
+    return resolve_collection_time(
+        meta, original_filename=orig, fallback_utc=None, exclude_names=exclude,
+    )
+
+
 def _sort_key(asset, storage_root):
     """保留优先级排序键（越大越优先保留）"""
-    ts = getattr(asset, "timestamp_utc", None)
+    ts = collection_time_of(asset)
     if ts is None:
         ts = datetime.min
     return (
@@ -153,6 +210,85 @@ def pick_singleton_keeper(assets, storage_root=None):
         return None
     best = max(assets, key=lambda a: _sort_key(a, storage_root))
     return best.id
+
+
+# metadata_json 中的键：被本规则淘汰、但**已被吸收**的源文件清单。
+#
+# 为什么需要：收敛会删除多余记录，被删记录在 ingest-digest 里就消失了。前端
+# 每次扫描都拿 digest 对账，判定"后端没有这个文件" → 作废本地记录 → 重传 →
+# 上传后又被单实例规则淘汰 → 下一轮再重传。实测表现（2026-09-16）：同一批
+# 12 个脑电文件每个扫描周期重传一次，每次还写 12 条"跳过旧采集文件"审计日志。
+#
+# 登记后 digest 会把这些源文件一并报为"已处理"，对账命中 → 不再重传 → 循环终止。
+ABSORBED_SOURCES_KEY = "absorbed_sources"
+
+
+def source_entry_of(row):
+    """从资产行取出其源文件条目 (original_filename, original_size)
+
+    无原始名（手动登记等）时返回 None —— 这类记录不在上传幂等与对账范围内。
+    """
+    meta = getattr(row, "metadata_json", None)
+    if not isinstance(meta, dict):
+        return None
+    name = meta.get("original_filename")
+    if not name:
+        return None
+    return (name, meta.get("original_size"))
+
+
+def absorbed_entries(asset_or_meta):
+    """取已登记的「已吸收源文件」条目 [[name, size], ...]"""
+    if hasattr(asset_or_meta, "metadata_json"):
+        meta = getattr(asset_or_meta, "metadata_json", None)
+    else:
+        meta = asset_or_meta
+    if not isinstance(meta, dict):
+        return []
+    out = []
+    for entry in (meta.get(ABSORBED_SOURCES_KEY) or []):
+        if isinstance(entry, (list, tuple)) and entry:
+            out.append([entry[0], entry[1] if len(entry) > 1 else None])
+    return out
+
+
+def absorb_sources(asset, sources):
+    """把被本规则淘汰的源文件登记到保留资产的 metadata
+
+    :param asset: 保留下来的资产（需要有 metadata_json 字段）
+    :param sources: [(name, size), ...]；name 空则跳过
+    :returns: bool 是否实际发生了变更（无变更时不必写库）
+    """
+    meta = dict(getattr(asset, "metadata_json", None) or {})
+    items = []
+    index = {}
+    for e in (meta.get(ABSORBED_SOURCES_KEY) or []):
+        if not (isinstance(e, (list, tuple)) and e):
+            continue
+        items.append([e[0], e[1] if len(e) > 1 else None])
+        index[str(e[0]).strip().lower()] = len(items) - 1
+    changed = False
+    for name, size in sources or []:
+        if not name:
+            continue
+        key = str(name).strip().lower()
+        if key in index:
+            # 同一源文件大小变了（磁盘上被重写/追加）→ 同步 size，否则前端
+            # 按（文件名+大小）对账永远命中不了，仍会每轮重传
+            at = index[key]
+            if items[at][1] != size:
+                items[at][1] = size
+                changed = True
+            continue
+        index[key] = len(items)
+        items.append([name, size])
+        changed = True
+    if not changed:
+        return False
+    meta[ABSORBED_SOURCES_KEY] = items
+    # 整体重新赋值：SQLAlchemy 对 JSON 列的原地修改不会被标记为 dirty
+    asset.metadata_json = meta
+    return True
 
 
 def collapse_singleton_duplicates(subject_id=None, storage_root=None):
