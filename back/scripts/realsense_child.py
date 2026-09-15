@@ -35,7 +35,7 @@ session 架构（消除预览↔录制切换的进程重启与设备抢占竞态
 数据流：只采集 彩色 + 深度 两路（不启用红外流），深度对齐到彩色坐标系。
 录制产物（输出目录，全部为最终格式）：
   color.mp4         彩色 H.264（libx264 CRF 23 / GOP 30，浏览器可播；参数见下方 COLOR_ENC_*）
-  depth_raw.zst     原始深度序列（DZST v2：16mm 量化+帧间差分+zstd，解码后为毫米）
+  depth_raw.zst     原始深度序列（DZST v2：32mm 量化+zstd，解码后为毫米近似值）
   frames.jsonl      逐帧同步记录（MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
   calibration.json  相机标定（depth_scale / RGB 内参 / 畸变 / 分辨率 / 序列号）
   meta.json         序列号 / 分辨率 / 帧数 / 编码信息
@@ -390,7 +390,8 @@ def _load_depth_zst():
 
 
 # 深度序列文件格式（DZST v2，见 app/utils/depth_zst.py）：
-#   16mm 量化 + 关键帧/帧间差分 + zstd，体积约为逐帧 zstd 的 1/4 ~ 1/3
+#   32mm 量化 + zstd（帧间差分在这类内容上实测基本失效，详见 depth_zst 模块注释）
+#   体积约为逐帧 zstd（v1）的 1/4 ~ 1/3
 def _zstd_writer(q, fobj, w, h):
     """写线程：从队列取 z16 深度帧字节，DZST v2 压缩追加写入；None 哨兵后回填帧数并关闭"""
     try:
@@ -664,11 +665,12 @@ def cmd_session(fps):
                 "depth_codec": "dzst2",
                 "pauses": snap.get("pauses") or [],
             }
-            # 量化步长与 depth_zst.QUANTUM 保持一致（当前 16mm，误差 ±8mm）
+            # 量化步长与 depth_zst.QUANTUM 保持一致；下方兜底值必须同步人工更新
+            # （当前 32mm，误差 ±16mm；近距人脸几何测量场景请调回 16）
             try:
                 meta["depth_quantum_mm"] = int(_load_depth_zst().QUANTUM)
             except Exception:
-                meta["depth_quantum_mm"] = 16
+                meta["depth_quantum_mm"] = 32
             try:
                 with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
                     json.dump(meta, f, ensure_ascii=False, indent=2)
