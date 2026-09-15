@@ -39,6 +39,22 @@
   ⚠️ **被否掉的方案**：「先扫一遍拿到"实际用到的级"，只建那几路」（v3 文档里的 TODO）。
   它要求 Pass1 **跑完**才知道用哪些级，于是丢掉并发：0.68 + 1.05(=3 路) ≈ 1.73 s，
   比直接减阶梯（1.05 s）**更慢**。实测同样否掉了"按需建支路"的收益预期。
+- **v5：再快 2.40×，只动线程参数、不动算法、输出逐字节不变**（现场"CPU 使用率低但慢"）。
+  `-filter_complex_threads 1`（默认 = 核数 16）+ `cv2.setNumThreads(4)`（默认 16）。
+  同一 1280x720 / 99.74 s / 2991 帧素材、容器内、采样器独立进程、3 次中位数（`v9_combo.py`）：
+
+      现状（cv2=16 + fc=auto）    20.06 s    CPU 47.0%（7.52 核）
+      fc=1                       11.42 s    CPU 74.8%
+      **cv2=4 + fc=1**            **8.37 s**  CPU 47.1%（7.53 核）
+
+  **"CPU 使用率低"的根因是线程在等同步，不是没活干** —— 决定性证据就是首末两行：
+  CPU 占用几乎不变（47.0% → 47.1%），耗时却少了 58%。机理与判据见常量
+  `FILTER_COMPLEX_THREADS` 上方的注释。
+  ⚠️ 两条纪律：① **单跑最优 ≠ 组合最优**（Pass2 单跑 fc=2 最快，进管线后 fc=1 更快，
+  因为 Pass1 同时在争 CPU）；② 参数**必须先扫出安全带**再定，别凭"线程多 = 快"的直觉。
+  同源的坑见 v1 时代"单条已占 89% CPU"的旧结论 —— 那是 12 级支路口径，v4 砍到 5 级后
+  单条只占 44.6%，故**多文件并行**从"无收益"变成 1.42~1.49×（仍远低于参数级的 2.40×，
+  故未落地；详见 `back/tools/README-视频脱敏最快方案.md` §十六）
 - **选级规则：取「不小于目标的最细一级」（向上取整），不再取"最接近"**。
   向上取整保证 块/人脸 **恒 ≥ 1/8**（实测最优档），"最接近"会掉到 1/11 附近；
   代价是块平均略粗（观感更方块化），换来的是**粗阶梯下也不会掉进"等于没脱敏"区**
@@ -102,6 +118,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -114,7 +131,10 @@ from app.utils.transcode import get_ffmpeg
 # v4：**提速**（现场反馈"人脸速度有点慢"）—— 阶梯 12 级 → 5 级、每路支路
 #     两次 scale → 单节点 pixelize、选级改"向上取整"（保证块/人脸恒 ≥ 1/8）。
 #     依据与实测见模块 docstring 的 v4 条，脚本 `bench_video_desens/v4_speed.py`
-VERSION_TAG = "video-desens-v4"
+# v5：**再提速 2.40×，只动线程参数、不动算法**（现场"CPU 使用率低但很慢"）。
+#     `-filter_complex_threads 1`（默认 = 核数） + `cv2.setNumThreads(4)`（默认 16）。
+#     输出与 v4 **逐字节相同**（sha256 一致，见 docstring v5 条与 `v7_verify.py`）。
+VERSION_TAG = "video-desens-v5"
 
 # 代理尺寸：按**面积**归一，与实测基准 480x270 等价。
 # 竖屏/超宽屏不会因为"宽度固定"而面积暴涨（拖动 Pass1 耗时）。
@@ -177,6 +197,41 @@ MAX_FACES_PER_FRAME = 16
 
 ENCODE_PRESET = "ultrafast"
 ENCODE_CRF = 23
+
+# ==================== 线程参数（v5 提速，2026-09-15 实测） ====================
+#
+# ⚠️ **这两个值都是"小图 + 多节点滤镜链"下的反直觉结论：默认值（= 核数）是负优化。**
+#    现场症状是"CPU 使用率低（47%）而且慢"—— 根因不是没活干，而是**线程在等同步**。
+#    决定性证据：CPU 占用 47.0% → 47.1%（几乎不变），耗时 20.06 s → 8.37 s（2.40×）。
+#
+# 机理：`-filter_complex_threads` 默认 = 核数(16)，于是滤镜链的**每个节点**都把 480x270
+#    的代理帧切成 16 条 slice —— 每 slice 只剩 8,100 px。12+ 个节点（5 pixelize + 5 lut +
+#    6 maskedmerge + split/scale）× 2991 帧 ≈ **57 万次 fork-join**，分派/同步开销远超
+#    计算收益。cv2 同理：容器默认 `getNumThreads() = 16`，而 YuNet 单帧输入只有 480x270。
+#
+# 实测（1280x720 / 99.74 s / 2991 帧真实素材，容器内，采样器独立进程，3 次中位数）：
+#     fc 扫描（Pass2 单独）  auto 16.64s | 1 → 7.93 | 2 → 7.60 | 4 → 7.92 | 8 → 10.72
+#     cv2 扫描（Pass1）      16 → 8.39s | 8 → 6.81 | 4 → 7.25 | 2 → 9.62 | 1 → 15.03
+#     端到端组合（`v9_combo.py`）  cv2=16+fc=auto 20.06s → **cv2=4+fc=1 8.37s**
+#     1080p 源复测（`v8_hd.py`）  默认 1.077s → fc=2 0.671s（1.61×，证明非 720p 特例）
+#
+# ⚠️ 注意 **单跑最优 ≠ 组合最优**：Pass2 单跑时 fc=2 最快，但进生产管线（Pass1 同时在跑、
+#    两者争 CPU）后 **fc=1 更快**。所以这里用的是组合口径 `v9_combo.py` 的结论。
+#
+# **正确性**：这两个开关只改并行度，不改逐像素结果 —— `v7_verify.py` 实测 fc 从 auto 到
+#    1/2/4 输出 **sha256 逐字节相同**（2993 帧 / 7,341,867 字节），生产完整管线同样一致。
+#    即"零风险"，不是"肉眼看不出"。
+FILTER_COMPLEX_THREADS = 1
+CV2_NUM_THREADS = 4
+
+# cv2 线程数是**进程全局**设置，而导出任务跑在 Flask API 进程的后台线程里、且允许并发
+# （`ExportTaskManager.create_task` 每任务起一条线程、无并发上限）。若直接"设 4 → 恢复 16"，
+# 先结束的那条任务会把还在跑的任务悄悄改回 16（不会出错，只是那一条静默变慢）。
+# 故用**引用计数**：首个进入者保存原值并设置，最后一个离开者才恢复。
+_CV2_THREAD_LOCK = threading.Lock()
+_CV2_THREAD_USERS = 0
+_CV2_THREAD_SAVED = None
+
 # 超时下限；实际按视频时长的 30 倍放宽（实测 RTF 0.175，余量约 170 倍）
 MIN_TIMEOUT_SECONDS = 600
 PROCESS_WAIT_SECONDS = 180
@@ -498,6 +553,42 @@ def build_filter_complex(fps, blocks, proxy_w, proxy_h, width, height):
            chain, prev, width, height))
 
 
+# ==================== cv2 线程数（进程全局，需引用计数） ====================
+
+def _cv2_threads_enter(cv2):
+    """进入"限线程"区间：首个进入者保存原值并把 cv2 线程数压到 CV2_NUM_THREADS。
+
+    必须与 :func:`_cv2_threads_exit` **成对调用**（放在 try/finally 里）。
+    引用计数的原因见常量区的注释：同进程可并发跑多个导出任务。
+    """
+    global _CV2_THREAD_USERS, _CV2_THREAD_SAVED
+    with _CV2_THREAD_LOCK:
+        if _CV2_THREAD_USERS == 0:
+            try:
+                saved = cv2.getNumThreads()
+                cv2.setNumThreads(CV2_NUM_THREADS)
+                _CV2_THREAD_SAVED = saved
+            except Exception:
+                # 拿不到/设不上就整段放弃，绝不让它影响脱敏本身
+                _CV2_THREAD_SAVED = None
+        _CV2_THREAD_USERS += 1
+
+
+def _cv2_threads_exit(cv2):
+    """离开"限线程"区间：最后一个离开者恢复原值"""
+    global _CV2_THREAD_USERS, _CV2_THREAD_SAVED
+    with _CV2_THREAD_LOCK:
+        if _CV2_THREAD_USERS <= 0:      # 兜底：未配对的 exit 不把计数带成负数
+            return
+        _CV2_THREAD_USERS -= 1
+        if _CV2_THREAD_USERS == 0 and _CV2_THREAD_SAVED is not None:
+            try:
+                cv2.setNumThreads(_CV2_THREAD_SAVED)
+            except Exception:
+                pass
+            _CV2_THREAD_SAVED = None
+
+
 # ==================== 主流程 ====================
 
 def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
@@ -574,6 +665,10 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
                   "-i", src_path,
                   "-f", "rawvideo", "-pix_fmt", "gray",
                   "-s", "%dx%d" % (proxy_w, proxy_h), "-r", "%.6f" % fps, "-i", "-",
+                  # 滤镜链线程数显式设为 1（默认 = 核数）：代理帧只有 480x270、节点却有 12+ 个，
+                  # 每个节点再切 16 条 slice 会让分派/同步开销远超计算收益。实测 Pass2
+                  # 16.755s → 8.130s（2.06×），且输出 sha256 逐字节不变（见常量区注释）
+                  "-filter_complex_threads", str(FILTER_COMPLEX_THREADS),
                   "-filter_complex", filter_complex,
                   "-map", "[v]", "-an",
                   "-fps_mode", "passthrough",
@@ -591,6 +686,10 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
     started = time.monotonic()
     failure = None
     succeeded = False
+    # cv2 线程数是进程全局设置：默认 = 核数(16)，而 YuNet 单帧输入只有 480x270 →
+    # 同样落在"线程在等同步"的坑里（实测 Pass1 8.39s → cv2=4 时 7.25s）。
+    # 用引用计数进出，保证并发导出时不会互相把设置改回去（见常量区注释）。
+    _cv2_threads_enter(cv2)
     try:
         with open(log_decode, "wb") as fh_dec, open(log_encode, "wb") as fh_enc:
             proc_decode = subprocess.Popen(cmd_decode, stdout=subprocess.PIPE,
@@ -755,3 +854,6 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
                     os.remove(dst_path)
             except OSError:
                 pass
+        # 必须与上面的 _cv2_threads_enter 成对：最后一个离开者恢复进程原有的 cv2 线程数
+        # （放 finally 保证任何异常路径都会恢复，不会把整个 API 进程的 cv2 永久压到 4 线程）
+        _cv2_threads_exit(cv2)
