@@ -83,6 +83,9 @@ generate_word_manual.py
 *.tmp.py
 .usb_check_tmp.py
 
+# ===================== 人脸检测模型（缺失时由代码自官方自动下载，不入库）=====================
+back/models/
+
 # ===================== 脱敏基准实验产物（开发期测算数据，不入库）=====================
 # bench_video_desens / bench_audio_desens 内含 mp4/jpg/大量实验 json，运行时不需要。
 back/tools/bench_video_desens/

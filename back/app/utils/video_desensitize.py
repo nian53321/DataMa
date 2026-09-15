@@ -92,14 +92,18 @@ SFace 余弦同一人判定阈值 0.363）：
 
 依赖：ffmpeg（`app.utils.transcode.get_ffmpeg`，imageio-ffmpeg 自带，无需系统安装）、
 `opencv-python-headless`（提供 `cv2.FaceDetectorYN`）、`numpy`、`av`。
-人脸检测模型 `models/face_detection_yunet_2023mar.onnx` 随镜像分发，可用环境变量
-`FACE_DETECT_MODEL_PATH` 覆盖。
+人脸检测模型 `models/face_detection_yunet_2023mar.onnx`（OpenCV Zoo YuNet）**不随代码入库**：
+本地缺失时由 :func:`model_path` 首次使用时从官方地址自动下载并按 SHA256 校验，
+可用环境变量 `FACE_DETECT_MODEL_PATH` 指定离线/自备模型。
 """
+import hashlib
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 import time
+import urllib.request
 
 from app.utils.transcode import get_ffmpeg
 
@@ -179,6 +183,15 @@ PROCESS_WAIT_SECONDS = 180
 
 MODEL_NAME = "face_detection_yunet_2023mar.onnx"
 
+# OpenCV Zoo 官方发布的 YuNet 人脸检测模型（与曾随包分发的版本完全一致）
+MODEL_DOWNLOAD_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/"
+    "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+# 固定正确哈希：下载后校验，拒绝损坏/被替换的模型
+MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+MODEL_DOWNLOAD_TIMEOUT = 90  # 秒
+
 __all__ = ["VERSION_TAG", "MODEL_NAME", "desensitize_video_file",
            "probe_video", "model_path", "build_filter_complex",
            "mosaic_ladder", "mosaic_level", "mask_level_value",
@@ -187,11 +200,54 @@ __all__ = ["VERSION_TAG", "MODEL_NAME", "desensitize_video_file",
 
 # ==================== 路径与探测 ====================
 
-def model_path():
-    """定位人脸检测模型；找不到返回 None
+def _sha256_file(path):
+    """流式计算文件 SHA256"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        block = f.read(1 << 20)
+        while block:
+            digest.update(block)
+            block = f.read(1 << 20)
+    return digest.hexdigest()
 
-    优先环境变量 `FACE_DETECT_MODEL_PATH`（便于离线/自备模型的部署），
-    否则取应用根目录下的 `models/<模型名>`（与 Dockerfile 的 COPY 路径一致）。
+
+def _download_model(candidate):
+    """把官方模型下载到 ``candidate``（校验哈希 + 原子落盘）；成功返回 True。
+
+    并发安全：写唯一临时文件后 ``os.replace`` 原子替换；即便两个进程同时下载，
+    两份内容相同（同哈希），后写覆盖先写，最终文件始终完整有效。
+    """
+    directory = os.path.dirname(candidate)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return False
+    tmp_path = os.path.join(directory, ".%s.%d.part" % (MODEL_NAME, os.getpid()))
+    try:
+        with urllib.request.urlopen(
+                MODEL_DOWNLOAD_URL, timeout=MODEL_DOWNLOAD_TIMEOUT) as resp, \
+                open(tmp_path, "wb") as f:
+            shutil.copyfileobj(resp, f, length=1 << 20)
+        if _sha256_file(tmp_path) != MODEL_SHA256:
+            return False
+        os.replace(tmp_path, candidate)
+        return True
+    except Exception:
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def model_path():
+    """定位人脸检测模型；本地缺失时自动下载，仍失败返回 None
+
+    优先环境变量 `FACE_DETECT_MODEL_PATH`（便于离线/自备模型的部署）；
+    否则取应用根目录下的 `models/<模型名>`，缺失时从 OpenCV Zoo 自动下载
+    并校验 SHA256。
     """
     env = os.environ.get("FACE_DETECT_MODEL_PATH")
     if env and os.path.exists(env):
@@ -201,6 +257,8 @@ def model_path():
         os.path.dirname(os.path.abspath(__file__))))
     cand = os.path.join(root, "models", MODEL_NAME)
     if os.path.exists(cand):
+        return cand
+    if _download_model(cand) and os.path.exists(cand):
         return cand
     return None
 
