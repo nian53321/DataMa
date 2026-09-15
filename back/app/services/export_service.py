@@ -43,7 +43,7 @@ from app.utils.signal_desensitize import (
     use_hmac_key,
 )
 from app.utils.restore_kit import build_kit_files
-from app.utils.video_desensitize import desensitize_video_file
+from app.utils.video_desensitize import desensitize_video_file_parallel
 
 
 class ExportService(BaseService):
@@ -473,7 +473,9 @@ class ExportService(BaseService):
                                     suffix=".mp4", prefix="export_video_")
                                 os.close(fd_out)
                                 tmp_paths.append(masked_path)
-                                ok, vid_err, vid_stats = desensitize_video_file(
+                                # 段级并行入口：按时长切段并发跑（实测 1.53×），
+                                # 切不动 / 任一段失败 / 拼接帧数不符都会自动退回单趟路径
+                                ok, vid_err, vid_stats = desensitize_video_file_parallel(
                                     plain_path, masked_path,
                                     logger=current_app.logger)
                                 # vid_stats 的明细（帧数/检出帧数/耗时）已由

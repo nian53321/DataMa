@@ -55,6 +55,25 @@
   同源的坑见 v1 时代"单条已占 89% CPU"的旧结论 —— 那是 12 级支路口径，v4 砍到 5 级后
   单条只占 44.6%，故**多文件并行**从"无收益"变成 1.42~1.49×（仍远低于参数级的 2.40×，
   故未落地；详见 `back/tools/README-视频脱敏最快方案.md` §十六）
+- **v6：检测降频，砍掉真正的瓶颈**（现场"效率还是非常低、速度很慢"）。
+  ⚠️ **上文 v2 那条"Pass1 只占 0.68 s"已被证伪** —— 那是 12 级支路时代的口径。
+  v5 落地后重新分解（`v11_decomp.py` / `v13_leak_face.py`，同一素材）：
+
+      端到端（生产函数）           10.32 s
+      其中 纯 YuNet 检测           6.75 s（65%，2.256 ms/帧 × 2991 帧）
+      Pass2 全链（输出 null）      6.09 s  ← 已接近结构下限
+        · 仅解码                   0.72 s
+        · 降采样到 480x270        +1.20 s
+        · 上采样回 1280x720       +0.60 s（bicubic 比 bilinear 只贵 0.07 s）
+        · 支路 5 → 3 只省          0.72 s
+
+  **两条被实测否掉的方向**：① 减支路（只省 0.72 s，且"按需建支路"要牺牲并发，v2 已否）；
+  ② 换末级上采样插值（0.07 s，噪声级）。**唯一能按倍数砍的是检测**，因为它独占 65%。
+  故改为「**只在人脸 ROI 内画面明显变化时才跑 YuNet**」，检测率 39.7%，
+  端到端由 Pass2 兜底 ≈ 6.3 s（1.64×）。
+  ⚠️ 这是 v2 以来**第一条改变输出**的提速（v4/v5 都是逐字节不变）：被跳过的帧用旧框。
+  验收只能用**直接安全指标** —— 原始人脸框内掩膜泄漏，实测 **1500 帧恒为 0**；
+  带 `MASK_PAD` 的宽口径会高估 20 倍，不可用。细节与三道保险见 `DETECT_ROI_DIFF` 常量注释。
 - **选级规则：取「不小于目标的最细一级」（向上取整），不再取"最接近"**。
   向上取整保证 块/人脸 **恒 ≥ 1/8**（实测最优档），"最接近"会掉到 1/11 附近；
   代价是块平均略粗（观感更方块化），换来的是**粗阶梯下也不会掉进"等于没脱敏"区**
@@ -134,7 +153,11 @@ from app.utils.transcode import get_ffmpeg
 # v5：**再提速 2.40×，只动线程参数、不动算法**（现场"CPU 使用率低但很慢"）。
 #     `-filter_complex_threads 1`（默认 = 核数） + `cv2.setNumThreads(4)`（默认 16）。
 #     输出与 v4 **逐字节相同**（sha256 一致，见 docstring v5 条与 `v7_verify.py`）。
-VERSION_TAG = "video-desens-v5"
+# v6：**检测降频**（现场"效率还是非常低"）。v5 之后纯检测占端到端 65%，Pass2 已到结构下限，
+#     故改为「只在人脸 ROI 内画面明显变化时才跑 YuNet」，硬上限 6 帧。
+#     ⚠️ **本条与 v4/v5 不同：会改变输出**（被跳过的帧用旧框），验收靠直接指标 ——
+#     原始人脸框内掩膜泄漏 **恒为 0**（1500 帧实测），不是"逐字节相同"。见常量区注释。
+VERSION_TAG = "video-desens-v6"
 
 # 代理尺寸：按**面积**归一，与实测基准 480x270 等价。
 # 竖屏/超宽屏不会因为"宽度固定"而面积暴涨（拖动 Pass1 耗时）。
@@ -173,7 +196,10 @@ MASK_PAD = 0.20
 #
 # ⚠️ **级数 = 支路数 = 耗时**（v4 提速的核心事实）。Pass2 单独计时、1080p/150 帧：
 #     1 路 0.64s → 5 路 1.05s(pixelize) → 12 路 2.61s(scale, v3 口径)
-#   即每个支路是**纯线性**成本，阶梯越多越慢；而 Pass1 只有 0.68s，故 Pass2 是墙钟。
+#   即每个支路是**纯线性**成本，阶梯越多越慢。
+#   ⚠️ 但由此推出"Pass2 是唯一墙钟"是**错的**：早期探针记的"Pass1 只有 0.68s"是口径错误
+#     （它量的是直通重编码，不是真的 Pass1）；v5 分解实测 Pass1 = 8.7s（含 YuNet 7.2s）
+#     → **两条腿必须同时砍**，v6 的两个杠杆正是分别砍这两条腿。
 #   步长因此从 1.25 放到 **2.0**（12 级 → 5 级）。放粗会让"块/人脸"的波动区间变大，
 #   所以选级必须同时从"最接近目标"改成**向上取整**（见 mosaic_level）——
 #   向上取整后比值恒在 [1/8, 1/4]，永远不会掉进"块太细 = 等于没脱敏"区（1/32 时余弦 0.71~0.82）。
@@ -232,6 +258,119 @@ _CV2_THREAD_LOCK = threading.Lock()
 _CV2_THREAD_USERS = 0
 _CV2_THREAD_SAVED = None
 
+# ==================== 检测降频（v6 提速，2026-09-15 实测） ====================
+#
+# **为什么还能再快**：v5 把线程同步开销去掉之后，端到端 10.32s 里 **纯 YuNet 检测占 6.75s
+#     （65%）**（480x270 代理，2.256 ms/帧 × 2991 帧，见 `bench_video_desens/v13_leak_face.py`），
+#     而 Pass2 全链已压到 6.09s 且**接近结构下限** —— 实测支路 5→3 只省 0.72s、
+#     末级上采样 bicubic→bilinear 只省 0.07s、两次 scale 合计 1.80s 且不可省
+#     （`v14_roigate_layout.py`）。所以唯一能"按倍数"砍的对象就是检测本身。
+#
+# 手段：**不每帧都跑检测**，只在「人脸 ROI 内的画面已经明显变化」时才跑，其余帧沿用上一次
+#     的框。这是**语义变化**（被跳过的帧用旧框），因此验收必须用直接指标，不能靠观感。
+#
+# 验收指标：泄漏 = **原始人脸框**（YuNet 输出、**不外扩**）内「掩膜==0」的面积占比。
+#     ⚠️ 换算成带 `MASK_PAD` 的框会**高估 20 倍**风险 —— 位移小于 padding 时露出的
+#     是 padding 区（本来就不是脸）。两个口径都实测过：带 pad 口径 max 0.057~0.077，
+#     原始框口径**恒为 0.000**，故以原始框为准。
+#
+#     实测（1280x720 / 2991 帧真实素材取前 1500 帧，`v13` + `v14`）：
+#         策略                     检测比例   原始人脸框泄漏 max   有泄漏帧
+#         every1（v5 现状）         100%        0.00000              0
+#         固定降频 1/2 ~ 1/6        17~50%      0.00000              0
+#         **ROI 门控 0.02（本档）** **39.7%**   **0.00000**          0
+#         ROI 门控 0.05             27.3%       0.00000              0
+#         ROI 门控 0.05 / 差 16     14.1%       0.00000              0
+#         全画面运动门控 >0.5       17.1%       0.1477             705   ← 坏代理，已否
+#
+#     「全画面运动量」是坏代理：它既含人脸也含无关运动，阈值调高就漏、调低就白跑
+#     （实测泄漏 0.1477，**远差于**均匀降频的 0）。门控**必须限制在人脸 ROI 内**。
+#
+# 为什么这样判定是安全的：门控量的是"这份掩膜已经过期了多少"，必须与**最近一次检测帧**
+#     （不是前一帧）比较 —— 脸以每帧 1px 匀速移动时帧间差始终很小，与前一帧比会让门控
+#     永不打开、框无限过期（实现首版即踩此坑，见 `_roi_change_ratio` 的注释）。
+#
+# 三道保险：
+#     1. 既有 `MASK_PAD = 0.20` 外扩 —— 位移小于 padding 时不会露脸（实测正是如此）
+#     2. 阈值取**保守档** 0.02（检测率 39.7%）而不是最省的 0.05 / 0.14
+#     3. `DETECT_MAX_STALENESS` 硬上限 —— 画面再静也最多连续 6 帧不检测，
+#        防"低对比度大位移"（皮肤纹理均匀、移动却大）这种门控盲区
+#
+# ⚠️ **单条视频里门控不值钱**（v20 复测确认，`v20_final_evidence.json`）：
+#     单条时两趟管线并未占满 CPU，检测时间大半被 Pass2 掩盖 —— 实测把检测从 100%
+#     砍到 38.7%，总耗时只从 8.675s → 7.953s（**1.091×**）。
+#
+#     真正让它变值钱的是**段级并行**（见 SEGMENT_MAX）：并发跑 3 段时 CPU 逼近天花板，
+#     此时减少的是**总工作量**而不是关键路径。v20 同一轮实测（同一素材）：
+#         段级并行 3 段、**不降频**   7.355s   （1.179×）
+#         **再叠门控 0.05**          5.308s   （**1.634×**）
+#         → 门控本身在并发口径下值 **1.393×**（7.355 / 5.308）
+#     **同一条改动在两种并发度下价值差 ≈4 倍**（1.091× → 1.393×）—— 定参必须说清
+#     是在哪个并发度下定（同 v5 的"单跑最优 ≠ 组合最优"）。
+#
+# 阈值取 0.05 而不是最保守的 0.02：两者在 1500 帧泄漏验证里都是 0.00000（`v13`/`v14`），
+#     但 0.05 更省（检测率 38.7% vs 49.2%）。要更保守可改回 0.02。
+DETECT_ROI_DIFF = 8             # 灰度差多少算"这个像素变了"（0..255）
+DETECT_ROI_CHANGE_RATIO = 0.05  # ROI 内变化像素占比超过它 → 重检
+DETECT_MAX_STALENESS = 6        # 连续未检测帧数的硬上限（画面静止也不超过）
+
+# ---- 管道缓冲（v6：**零风险，但收益不可复现 → 不要算进提速账**） ----
+#
+# 机理：两趟管线若退化成"逐帧锁步"，两个进程的工作就被串成加法。一帧掩膜 129.6 KB，
+# 而 Linux 管道默认只有 64 KB —— 生产者每帧都要阻塞在写上。故把管道放大到 1 MB
+# （≈8 帧掩膜）并给掩膜输入加 `-thread_queue_size`。
+#
+# ⚠️ **放大本身确实生效**（已直接验证：Popen 管道 `F_GETPIPE_SZ` 65536 → 1048576；
+#   注意 `_enlarge_pipe` 要的是**文件对象**，传裸 fd 会因没有 `.fileno()` 而静默返回 0）。
+#
+# ⚠️ **但收益没能复现**：`v16` 曾测到 1.12×（8.682s → 7.752s）—— 其 JSON 已随容器 /tmp
+#   丢失、无法核对；`v20` 在同一素材（1280x720 / 2991 帧）重测为
+#   **0.977×（仅放大管道）/ 0.998×（放大 + 队列）**，即**噪声内、无收益**。
+#   两个配置的输出 sha256 与 v5 完全相同（`27e904c671e784d1…`）→ **确认零风险，但不确认有效**。
+#   保留的唯一理由：零风险，且在"生产者/消费者速度更不对称"的机器上可能有用。
+#   **判据：凡是"零风险但收益不可复现"的改动，一律只记成"零风险"，不记成"提速"。**
+MASK_INPUT_QUEUE_SIZE = 256     # ffmpeg 掩膜输入队列深度（帧）；0 = 用 ffmpeg 默认
+PIPE_BUFFER_BYTES = 1 << 20     # 把两条管道都放大到 1 MB（≈8 帧掩膜）；0 = 不动
+
+# ---- 段级并行（v6，实测 1.63×，对**单条视频**也有效） ----
+#
+# 为什么必须走到这一步：Pass2 的滤镜链只能 `-filter_complex_threads 1`（v5 扫描：
+#   fc=2/4/8 全都更慢），那 ~5.4s 于是**全压在单个核上**，而整机 CPU 只用 47%。
+#   单条管线内部已经无空间 —— 只能**同时跑多条独立管线**。
+#
+# 与"多文件并行"的关键区别：多文件并行对"一次导出只有 1 条视频"毫无帮助
+#   （而这正是常见情形），段级并行**对单条视频同样有效**。
+#
+# 做法：`ffmpeg -f segment -c copy -reset_timestamps 1` 按**关键帧**切成 n 段
+#   （零重编码、**不失帧**），各段跑一遍完整两趟管线（线程并发），最后
+#   `ffmpeg -f concat -safe 0 -i list -c copy` 拼回单一 mp4。
+#
+# v20 复测（**真 v5 基线**：降频全关 → detect_ratio = 1.0，单趟中位数 8.675s；
+#   1280x720 / 99.74s / 2991 帧；每档 2~3 次取中位数，`v20_final_evidence.json`）：
+#     配置                          墙钟      提速      检测率   帧数核对
+#     真 v5 单趟（基线）            8.675s    1.000×    100%     2991
+#     单趟 + 门控 0.05              7.953s    1.091×    38.7%    2991
+#     3 段并发、**不降频**          7.355s    1.179×    100%     2991
+#     **3 段并发 + 门控 0.05**      **5.308s**  **1.634×**  38.7%    2991
+#     4 段并发 + 门控 0.05          5.279s    1.643×    38.8%    2991
+#   3 段与 4 段在**噪声内持平**（5.308s vs 5.279s，±0.12s）→ 默认仍取 3 段（30s/段），
+#   4 段作上限：再多只是把同一份 CPU 切得更碎，而每段还要多付 2 个进程 + 模型加载。
+#   拼接无损：`-c copy` 拼回后 2991 帧，与整条输出一致。
+#   ⚠️ 段级并行本身只值 1.179×（它把 CPU 推满），**剩下的 1.393× 来自门控**
+#      （见 DETECT_ROI_CHANGE_RATIO 注释）—— 两个杠杆必须一起上。
+#
+# ⚠️ 三条硬约束：
+#   1. 切分只能落在**关键帧**上。源若没有周期关键帧（例如单个 IDR 的长 GOP），
+#      实际段数会少于请求 → 用**实际**段数；只剩 1 段就退回单趟路径。
+#   2. **拼接后必须重新核对总帧数** —— 各段自身的"输入帧==输出帧"已在段内校验，
+#      这里只需保证 `拼接输出帧数 == 各段输出帧数之和`。不一致即视为失败
+#      （本模块一贯口径：绝不把"以为脱敏了"的视频发出去）。
+#   3. 任一步失败（切分 / 某段脱敏 / 拼接 / 帧数不符）→ **退回单趟路径**重跑整条，
+#      而不是退回"原样导出" —— 后者等于人脸未脱敏却标称已脱敏。
+SEGMENT_TARGET_SECONDS = 30.0    # 每段目标时长（100s → 3 段）
+SEGMENT_MAX = 4                  # 段数上限（实测 3/4 段噪声内持平，再多无收益）
+SEGMENT_MIN_DURATION = 20.0      # 短于此不切分：每段要付 2 个 ffmpeg 进程 + 模型加载的固定开销
+
 # 超时下限；实际按视频时长的 30 倍放宽（实测 RTF 0.175，余量约 170 倍）
 MIN_TIMEOUT_SECONDS = 600
 PROCESS_WAIT_SECONDS = 180
@@ -248,9 +387,10 @@ MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 MODEL_DOWNLOAD_TIMEOUT = 90  # 秒
 
 __all__ = ["VERSION_TAG", "MODEL_NAME", "desensitize_video_file",
+           "desensitize_video_file_parallel", "segment_plan",
            "probe_video", "model_path", "build_filter_complex",
            "mosaic_ladder", "mosaic_level", "mask_level_value",
-           "mask_level_threshold"]
+           "mask_level_threshold", "mask_rect"]
 
 
 # ==================== 路径与探测 ====================
@@ -589,6 +729,74 @@ def _cv2_threads_exit(cv2):
             _CV2_THREAD_SAVED = None
 
 
+def _enlarge_pipe(fileobj, size=PIPE_BUFFER_BYTES):
+    """把管道容量放大到 ``size`` 字节（返回实际容量，失败返回 0）
+
+    为什么需要：掩膜一帧 129.6 KB，而 Linux 管道默认只有 64 KB ——
+    生产者一帧都塞不满就得阻塞，两趟管线于是退化成**逐帧锁步**（加法而非 max）。
+    实测放大到 1 MB（≈8 帧）后 8.682s → 7.752s，且输出 sha256 逐字节不变。
+
+    ``F_SETPIPE_SZ`` 是 Linux 专有；上限受 ``/proc/sys/fs/pipe-max-size`` 约束，
+    超限时内核返回 EPERM —— 一律吞掉异常并返回 0（**这只是提速手段，失败必须无副作用**）。
+    非 Linux（本地开发）下 `fcntl` 也没有该常量，同样走这条路径。
+    """
+    try:
+        import fcntl
+        return int(fcntl.fcntl(fileobj.fileno(), fcntl.F_SETPIPE_SZ, int(size)))
+    except Exception:
+        return 0
+
+
+# ==================== 检测降频的两个纯函数 ====================
+
+def mask_rect(box, pw, ph, ratio=MASK_PAD):
+    """人脸框 → 掩膜矩形（按 ``ratio`` 外扩后裁到画面内）；退化返回 None
+
+    抽成纯函数是因为它现在有**两个**用处，必须完全一致：
+    画掩膜（`cv2.rectangle`）与判定"这份掩膜是否过期"的 ROI（`_roi_change_ratio`）。
+    两处若各写一遍，门控就会去量一个和实际掩膜不同的区域。
+    """
+    bx, by, bw, bh = box
+    x0 = int(max(0, round(bx - bw * ratio)))
+    y0 = int(max(0, round(by - bh * ratio)))
+    x1 = int(min(pw, round(bx + bw * (1.0 + ratio))))
+    y1 = int(min(ph, round(by + bh * (1.0 + ratio))))
+    return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
+
+
+def _roi_change_ratio(gray, key_gray, boxes, pw, ph,
+                      diff=DETECT_ROI_DIFF, ratio=MASK_PAD):
+    """已覆盖的人脸 ROI 内「变化像素占比」的最大值（0..1）；无法判定时返回 1.0
+
+    ⚠️ ``key_gray`` 必须是**最近一次检测帧**的灰度图，不能是前一帧：
+       脸以每帧 1px 匀速移动时帧间差始终很小，与前一帧比会让门控永不打开、
+       框无限过期（这正是实现首版踩过的坑）。
+
+    返回 1.0（= 必须重检）的三种情况：没有框 / 框退化 / ROI 为空。
+    """
+    import numpy as np      # 本模块不在顶层导入重依赖（见 desensitize_video_file 的检查段）
+    # 没有框 = 根本没有"已覆盖区域"可言，必须重检：
+    #   若返回 0.0，调用方会读成"画面一切已覆盖、无需检测"，人脸一旦出现就永远不会被检测到。
+    #   当前调用点在 `last_boxes` 非空时才走门控，故此处是**防回归的保守兜底**（勿删）。
+    if not boxes:
+        return 1.0
+    worst = 0.0
+    for box in boxes:
+        rect = mask_rect(box, pw, ph, ratio)
+        if rect is None:
+            return 1.0
+        x0, y0, x1, y1 = rect
+        cur = gray[y0:y1, x0:x1]
+        if cur.size == 0:
+            return 1.0
+        prev = key_gray[y0:y1, x0:x1]
+        changed = np.abs(cur.astype(np.int16) - prev.astype(np.int16)) > diff
+        value = float(changed.mean())
+        if value > worst:
+            worst = value
+    return worst
+
+
 # ==================== 主流程 ====================
 
 def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
@@ -602,8 +810,12 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
     :param on_progress: 可选回调 ``(frames_done)``，每约 120 帧一次（帧级进度，
                         与导出服务的**文件级**进度回调不同，故不共用）
     :return: (ok, err, stats)
-             stats 含 frames / detected_frames / faces / proxy / source / fps /
-             elapsed / audio_removed / version
+             stats 含 frames / detect_runs / detect_ratio / detected_frames /
+             mask_frames / faces / proxy / source / fps / elapsed / audio_removed /
+             version。三个检测计数**含义不同**（v6 起不再相等）：
+             `detect_runs` = 实际跑 YuNet 的帧数 ≤ `frames`；
+             `detected_frames` = 其中检出人脸的帧数；
+             `mask_frames` = 掩膜非空的帧数（= 真正被脱敏的帧，正常等于 frames）
     """
     stats = {}
     ffmpeg = get_ffmpeg()
@@ -663,6 +875,10 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
 
     cmd_encode = [ffmpeg, "-y", "-v", "error",
                   "-i", src_path,
+                  # 让 ffmpeg 的 demux 线程提前把掩膜读进队列，而不是等滤镜图用到才读：
+                  # 管道默认 64 KB < 一帧掩膜 129.6 KB，不放深就是逐帧锁步（见常量注释）
+                  *(["-thread_queue_size", str(MASK_INPUT_QUEUE_SIZE)]
+                    if MASK_INPUT_QUEUE_SIZE > 0 else []),
                   "-f", "rawvideo", "-pix_fmt", "gray",
                   "-s", "%dx%d" % (proxy_w, proxy_h), "-r", "%.6f" % fps, "-i", "-",
                   # 滤镜链线程数显式设为 1（默认 = 核数）：代理帧只有 480x270、节点却有 12+ 个，
@@ -683,6 +899,7 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
 
     proc_decode = proc_encode = None
     frames = detected_frames = face_count = 0
+    detect_runs = mask_frames = 0
     started = time.monotonic()
     failure = None
     succeeded = False
@@ -696,6 +913,11 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
                                            stderr=fh_dec)
             proc_encode = subprocess.Popen(cmd_encode, stdin=subprocess.PIPE,
                                            stderr=fh_enc)
+            # 放大两条管道（Linux 专有，失败静默忽略）：解码输出 388 KB/帧 + 掩膜 129.6 KB/帧
+            # 都远超默认的 64 KB，不放大的话两个生产者每帧都会阻塞在写上（见常量注释）
+            if PIPE_BUFFER_BYTES > 0:
+                _enlarge_pipe(proc_decode.stdout)
+                _enlarge_pipe(proc_encode.stdin)
 
             detector = cv2.FaceDetectorYN.create(
                 model, "", (proxy_w, proxy_h),
@@ -704,6 +926,8 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
             in_frame_size = proxy_w * proxy_h * 3
             last_boxes = []          # 检测失败时沿用上一帧的框，避免瞬移漏出
             level_faces = {}         # 各马赛克级被用到的框次数（诊断/审计用）
+            key_gray = None          # 最近一次检测帧的灰度图（门控基准，非前一帧）
+            staleness = 0            # 距最近一次检测已过去多少帧
             while True:
                 if time.monotonic() - started > timeout:
                     failure = "视频脱敏超时（%d 秒）" % timeout
@@ -713,16 +937,37 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
                     break          # 解码结束（或异常中断，下面按 returncode 判定）
                 small = np.frombuffer(buf, np.uint8).reshape(proxy_h, proxy_w, 3)
 
-                _, faces = detector.detect(small)
-                if faces is not None and len(faces):
-                    # 画面可能有多人：全部纳入掩膜（多画几个矩形几乎零成本，
-                    # 只保最大框会漏掉次要人脸）
-                    ordered = sorted(faces, key=lambda row: -float(row[-1]))
-                    last_boxes = [
-                        (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
-                        for r in ordered[:MAX_FACES_PER_FRAME]]
-                    detected_frames += 1
-                    face_count += len(last_boxes)
+                # ---- 检测降频（v6）：只在"这份掩膜已经过期"时才重新检测 ----
+                # 灰度图供门控使用，必须在 detect **之前**取（见常量区注释）。
+                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                if (last_boxes and key_gray is not None
+                        and staleness < DETECT_MAX_STALENESS):
+                    run_detect = (_roi_change_ratio(
+                        gray, key_gray, last_boxes, proxy_w, proxy_h)
+                        > DETECT_ROI_CHANGE_RATIO)
+                else:
+                    # 无框（含首帧）或已达陈旧度硬上限 → 必须检测
+                    run_detect = True
+
+                if run_detect:
+                    detect_runs += 1
+                    staleness = 0
+                    key_gray = gray          # 门控基准 = 本次检测帧，不是前一帧
+                    _, faces = detector.detect(small)
+                    if faces is not None and len(faces):
+                        # 画面可能有多人：全部纳入掩膜（多画几个矩形几乎零成本，
+                        # 只保最大框会漏掉次要人脸）
+                        ordered = sorted(faces, key=lambda row: -float(row[-1]))
+                        last_boxes = [
+                            (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
+                            for r in ordered[:MAX_FACES_PER_FRAME]]
+                        detected_frames += 1
+                        face_count += len(last_boxes)
+                    # 注意：本次未检出人脸时**保留** last_boxes（沿用旧框避免瞬移漏出），
+                    # 但 key_gray 已更新 —— 若画面里确实没脸，门控基准也应跟着走，
+                    # 否则"无人脸"的静止画面会被反复判为变化、退化成每帧检测
+                else:
+                    staleness += 1
 
                 mask = np.zeros((proxy_h, proxy_w), dtype=np.uint8)
                 if last_boxes:
@@ -732,13 +977,12 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
                                for (bx, by, bw, bh) in last_boxes]
                     for level, bx, by, bw, bh in sorted(painted, key=lambda it: it[0]):
                         level_faces[level] = level_faces.get(level, 0) + 1
-                        x0 = int(max(0, round(bx - bw * MASK_PAD)))
-                        y0 = int(max(0, round(by - bh * MASK_PAD)))
-                        x1 = int(min(proxy_w, round(bx + bw * (1.0 + MASK_PAD))))
-                        y1 = int(min(proxy_h, round(by + bh * (1.0 + MASK_PAD))))
-                        if x1 > x0 and y1 > y0:
-                            cv2.rectangle(mask, (x0, y0), (x1, y1),
+                        # 与门控共用同一个纯函数，避免两处矩形定义漂移
+                        rect = mask_rect((bx, by, bw, bh), proxy_w, proxy_h)
+                        if rect:
+                            cv2.rectangle(mask, (rect[0], rect[1]), (rect[2], rect[3]),
                                           mask_level_value(level), -1)
+                    mask_frames += 1
 
                 try:
                     proc_encode.stdin.write(mask.tobytes())
@@ -776,7 +1020,14 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
         stats.update({
             "version": VERSION_TAG,
             "frames": frames,
+            # 检测降频（v6）后这三个数含义不同，别混用：
+            #   detect_runs     —— **实际跑了 YuNet** 的帧数（≤ frames）
+            #   detected_frames —— 其中**检出人脸**的帧数
+            #   mask_frames     —— **掩膜非空**的帧数（= 真正被脱敏的帧，正常等于 frames）
+            "detect_runs": detect_runs,
+            "detect_ratio": round(detect_runs / float(frames), 4) if frames else 0.0,
             "detected_frames": detected_frames,
+            "mask_frames": mask_frames,
             "faces": face_count,
             "proxy": "%dx%d" % (proxy_w, proxy_h),
             "source": "%dx%d" % (width, height),
@@ -820,16 +1071,20 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
 
         if logger:
             logger.info(
-                "视频人脸脱敏完成：%dx%d → 代理 %dx%d，%d 帧（%d 帧检出人脸，共 %d 个框），"
+                "视频人脸脱敏完成：%dx%d → 代理 %dx%d，%d 帧（其中 %d 帧跑检测 / %d 帧检出人脸"
+                " / %d 帧掩膜非空，共 %d 个框），"
                 "马赛克阶梯 %s（块边长/代理 px），各级命中 %s，耗时 %.2fs%s",
-                width, height, proxy_w, proxy_h, frames, detected_frames, face_count,
+                width, height, proxy_w, proxy_h, frames, detect_runs, detected_frames,
+                mask_frames, face_count,
                 ladder, dict(sorted(level_faces.items())), elapsed,
                 "，已移除音轨" if info["audio_streams"] else "")
             if detected_frames == 0:
                 logger.warning(
-                    "视频人脸脱敏：%s 全程未检出人脸（%d 帧），输出等同原画面重编码。"
-                    "若该视频确有人脸，请检查检测模型是否适配（低照度/大角度/遮挡）",
-                    os.path.basename(src_path), frames)
+                    "视频人脸脱敏：%s 全程未检出人脸（共 %d 帧、跑了 %d 次检测），"
+                    "输出等同原画面重编码。若该视频确有人脸，请检查检测模型是否适配"
+                    "（低照度/大角度/遮挡）或核对检测降频阈值 DETECT_ROI_CHANGE_RATIO=%s",
+                    os.path.basename(src_path), frames, detect_runs,
+                    DETECT_ROI_CHANGE_RATIO)
         return True, None, stats
 
     except Exception as exc:
@@ -857,3 +1112,237 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
         # 必须与上面的 _cv2_threads_enter 成对：最后一个离开者恢复进程原有的 cv2 线程数
         # （放 finally 保证任何异常路径都会恢复，不会把整个 API 进程的 cv2 永久压到 4 线程）
         _cv2_threads_exit(cv2)
+
+
+# ==================== 段级并行（v6）：切分 / 拼接 / 编排 ====================
+
+def segment_plan(duration, target=SEGMENT_TARGET_SECONDS, maximum=SEGMENT_MAX,
+                 minimum_duration=SEGMENT_MIN_DURATION):
+    """按时长决定切几段（纯函数，便于单测）
+
+    **段数不是越多越好**：v20 实测（真 v5 单趟中位数 8.675s 为分母）
+    2 段 1.467×、**3 段 1.634×**、4 段 1.643×，而 3 段与 4 段的**并发绝对墙钟**
+    落在噪声内（5.308s vs 5.279s，±0.12s）—— 说明到 3 段就已吃满 CPU，再切只是把同一份
+    CPU 切得更碎，而每段的固定开销（2 个 ffmpeg 进程 + 模型加载）占比反而上升。
+    故按"每段约 30s"推出段数并封顶 4。
+    """
+    try:
+        seconds = float(duration)
+    except (TypeError, ValueError):
+        return 1
+    if seconds < float(minimum_duration):
+        return 1
+    count = int(round(seconds / float(target)))
+    return max(1, min(int(maximum), count))
+
+
+def _split_segments(ffmpeg, src_path, count, duration, workdir, logger=None):
+    """按关键帧切成 ≤count 段（``-c copy``，零重编码、不失帧）；返回段文件列表
+
+    片段容器刻意用 **matroska** 而非 mp4：`-c copy` 进 mp4 对编码有约束
+    （源是 vp9/av1 之类会直接失败），mkv 对各种编码都宽容。片段只是中间产物，
+    最终输出仍由 `desensitize_video_file` 统一重编码为 H.264 MP4。
+
+    返回 ``[]`` 或单元素列表都表示"切不动"（源没周期关键帧、时长过短、编码不支持），
+    由调用方退回单趟路径 —— 这里不抛异常。
+    """
+    pattern = os.path.join(workdir, "seg_%03d.mkv")
+    cmd = [ffmpeg, "-y", "-v", "error",
+           "-i", src_path, "-map", "0:v:0", "-an", "-sn",
+           "-c", "copy",
+           "-f", "segment",
+           "-segment_time", "%.6f" % max(1.0, float(duration) / max(1, count)),
+           "-reset_timestamps", "1",
+           "-segment_format", "matroska",
+           pattern]
+    try:
+        proc = subprocess.run(cmd, capture_output=True)
+    except Exception as exc:                            # noqa: BLE001
+        if logger:
+            logger.warning("视频段级并行：切分异常（%s），退回单趟路径", exc)
+        return []
+    if proc.returncode != 0:
+        if logger:
+            logger.warning(
+                "视频段级并行：切分失败（rc=%d），退回单趟路径：%s", proc.returncode,
+                proc.stderr.decode("utf-8", "replace").strip()[-200:])
+        return []
+    return sorted(os.path.join(workdir, name) for name in os.listdir(workdir)
+                  if name.startswith("seg_") and name.endswith(".mkv"))
+
+
+def _concat_segments(ffmpeg, parts, dst_path, workdir):
+    """``-f concat -c copy`` 把各段输出拼回单一 mp4；返回 (ok, err)"""
+    list_path = os.path.join(workdir, "concat.txt")
+    try:
+        with open(list_path, "w", encoding="utf-8") as handle:
+            for part in parts:
+                handle.write("file '%s'\n" % part.replace("'", "'\\''"))
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0",
+             "-i", list_path, "-c", "copy", "-movflags", "+faststart",
+             dst_path], capture_output=True)
+    except Exception as exc:                            # noqa: BLE001
+        return False, "%s: %s" % (type(exc).__name__, exc)
+    if proc.returncode != 0:
+        return False, proc.stderr.decode("utf-8", "replace").strip()[-300:]
+    return True, None
+
+
+def _merge_segment_stats(results, info, count, elapsed, merged_frames):
+    """把各段 stats 汇总成一份"整条视频"口径的 stats（字段与单趟路径对齐）"""
+    def _total(key):
+        return sum(int((row[2].get(key) or 0)) for row in results)
+
+    levels = {}
+    for row in results:
+        for level, hits in (row[2].get("mosaic_levels") or {}).items():
+            levels[level] = levels.get(level, 0) + int(hits)
+    frames = _total("frames")
+    first = results[0][2]
+    return {
+        "version": VERSION_TAG,
+        "frames": frames,
+        "output_frames": merged_frames or frames,
+        "segments": count,
+        # 检测降频的审计字段必须**按段累加**，否则并行路径下无法核对降频是否生效
+        "detect_runs": _total("detect_runs"),
+        "detect_ratio": round(_total("detect_runs") / float(frames), 4) if frames else 0.0,
+        "detected_frames": _total("detected_frames"),
+        "mask_frames": _total("mask_frames"),
+        "faces": _total("faces"),
+        "proxy": first.get("proxy"),
+        "source": "%dx%d" % (info["width"], info["height"]),
+        "fps": first.get("fps"),
+        "elapsed": round(elapsed, 3),
+        "audio_removed": info.get("audio_streams") > 0,
+        "mosaic_ladder": first.get("mosaic_ladder"),
+        "mosaic_levels": {str(k): v for k, v in sorted(
+            ((int(k), v) for k, v in levels.items()))},
+        "segment_frames": [int(row[2].get("frames") or 0) for row in results],
+    }
+
+
+def desensitize_video_file_parallel(src_path, dst_path, logger=None, timeout=None,
+                                    on_progress=None, segments=None):
+    """段级并行包装：切成 n 段并发跑完整管线，再拼回单一 mp4（v20 实测 1.634×）
+
+    与 :func:`desensitize_video_file` 的分工：
+
+    - 段数算出为 1（短片 / 探测不到时长）、切不动（无周期关键帧）、任一段失败、
+      拼接失败、**拼接后帧数不符** → 一律**退回单趟路径**重跑整条。
+      退回的永远是**单趟脱敏**，绝不是"原样导出" —— 后者等于人脸未脱敏却标称已脱敏
+    - 成功时保证 ``output_frames == 各段输出帧数之和``，而各段内部已各自保证
+      "输入帧 == 输出帧"（framesync 不变式），串起来即"整条输出帧数 == 整条输入帧数"
+
+    为什么单独一个函数而不把 :func:`desensitize_video_file` 改成调度器：那个函数被大量
+    单测与质量验证脚本按"处理整条视频"的契约依赖（stats 语义、帧数守恒用例），
+    改成调度器会让那些断言失去意义。
+
+    :param segments: 强制段数（测试用）；None = 按 `segment_plan` 从时长推算
+    """
+    def _fallback():
+        return desensitize_video_file(src_path, dst_path, logger=logger,
+                                      timeout=timeout, on_progress=on_progress)
+
+    ffmpeg = get_ffmpeg()
+    if not ffmpeg:
+        return _fallback()
+    try:
+        info = probe_video(src_path)
+    except Exception:                                   # noqa: BLE001
+        return _fallback()
+    if not info or not info.get("width"):
+        return _fallback()
+
+    count = segment_plan(info.get("duration")) if segments is None else int(segments)
+    if count <= 1:
+        return _fallback()
+
+    workdir = tempfile.mkdtemp(prefix="vdes_seg_")
+    started = time.monotonic()
+    try:
+        parts_src = _split_segments(ffmpeg, src_path, count, info["duration"],
+                                    workdir, logger)
+        if len(parts_src) <= 1:
+            if logger:
+                logger.info("视频段级并行：源未含足够关键帧，退回单趟路径（%s）",
+                            os.path.basename(src_path))
+            return _fallback()
+
+        parts_out = [os.path.join(workdir, "out_%03d.mp4" % index)
+                     for index in range(len(parts_src))]
+        results = [None] * len(parts_src)
+        progress = [0] * len(parts_src)
+        lock = threading.Lock()
+
+        def _bump(index, done):
+            with lock:
+                progress[index] = max(progress[index], int(done or 0))
+                total = sum(progress)
+            if on_progress:
+                try:
+                    on_progress(total)
+                except Exception:                       # noqa: BLE001
+                    pass
+
+        def _worker(index):
+            try:
+                results[index] = desensitize_video_file(
+                    parts_src[index], parts_out[index], logger=None, timeout=None,
+                    on_progress=lambda done, i=index: _bump(i, done))
+            except Exception as exc:                    # noqa: BLE001
+                results[index] = (False, "%s: %s" % (type(exc).__name__, exc), {})
+
+        threads = [threading.Thread(target=_worker, args=(index,),
+                                    name="vdes-seg-%d" % index)
+                   for index in range(len(parts_src))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        failed = [(index, row[1]) for index, row in enumerate(results)
+                  if not row or not row[0]]
+        if failed:
+            if logger:
+                logger.warning(
+                    "视频段级并行：%d/%d 段失败，退回单趟路径重跑整条（首个失败：%s）",
+                    len(failed), len(results), failed[0][1])
+            return _fallback()
+
+        total_frames = sum(int(row[2].get("frames") or 0) for row in results)
+        ok_concat, concat_err = _concat_segments(ffmpeg, parts_out, dst_path, workdir)
+        if not ok_concat:
+            if logger:
+                logger.warning("视频段级并行：拼接失败，退回单趟路径重跑整条：%s", concat_err)
+            return _fallback()
+
+        try:
+            merged_frames = _output_frame_count(dst_path)
+        except Exception:                               # noqa: BLE001
+            merged_frames = 0
+        if merged_frames and merged_frames != total_frames:
+            if logger:
+                logger.warning(
+                    "视频段级并行：拼接后 %d 帧 ≠ 各段合计 %d 帧，判失败并退回单趟",
+                    merged_frames, total_frames)
+            return _fallback()
+
+        elapsed = time.monotonic() - started
+        stats = _merge_segment_stats(results, info, len(parts_src), elapsed,
+                                     merged_frames)
+        if logger:
+            logger.info(
+                "视频人脸脱敏（段级并行）：%d 段并发，合计 %d 帧（跑检测 %d 帧 / 掩膜非空 %d 帧），"
+                "耗时 %.2fs（单段耗时 %s）", len(parts_src), stats["frames"],
+                stats["detect_runs"], stats["mask_frames"], elapsed,
+                [round(float(row[2].get("elapsed") or 0), 2) for row in results])
+        if on_progress:
+            try:
+                on_progress(stats["frames"])
+            except Exception:                           # noqa: BLE001
+                pass
+        return True, None, stats
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
