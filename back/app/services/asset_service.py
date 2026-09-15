@@ -44,13 +44,17 @@ from app.utils.desensitize import desensitize_list
 from app.utils.file_signature import check_signature
 from app.utils.like_query import build_like_contains
 from datetime import datetime
-from app.utils.collection_time import resolve_collection_time
+from app.utils.collection_time import resolve_collection_time, parse_time_from_name
 from app.utils.naming import (
     apply_naming_standard, get_naming_standard, validate_extension,
 )
 from app.utils.scale_adapter import detect_scale_type
 from app.utils.source_identity import (
     normalize_original_filename, stored_original_filename, source_group_key,
+)
+from app.utils.singleton_assets import (
+    is_singleton_asset, is_singleton_data_type, collapse_singleton_duplicates,
+    _dt_value, USERINFO_SOURCE_NAME,
 )
 from app.utils.response import paginate
 from werkzeug.utils import secure_filename
@@ -451,10 +455,21 @@ class AssetService(BaseService):
             existing = (
                 DataAsset.query
                 .filter_by(subject_id=subject_id, data_type=dt)
+                # data_type 一并取出：单实例模态收敛需要按「同一行是否 userInfo」
+                # 判定（json 模态里只有个人信息受约束，相机标定等辅助 JSON 可多份共存）
                 .with_entities(
                     DataAsset.id, DataAsset.file_name, DataAsset.metadata_json,
+                    DataAsset.data_type, DataAsset.timestamp_utc,
                 )
                 .all()
+            )
+            # 单实例模态（心电/脑电/音频/个人信息）：本次上传命中后，该受试者
+            # 同类只允许剩下这一条 → 新文件一旦入库，同类的其他记录全部作废
+            # （后一次采集覆盖前一次；重复入库的残留顺带清掉）
+            new_is_singleton = (
+                is_singleton_data_type(dt)
+                and (dt != DataType.JSON
+                     or normalize_original_filename(original_name) == USERINFO_SOURCE_NAME)
             )
             for ex in existing:
                 meta = ex.metadata_json or {}
@@ -482,6 +497,9 @@ class AssetService(BaseService):
                         if (normalize_original_filename(om.get("original_filename")) == source_name
                                 and om.get("video_type") == video_type):
                             stale_ids.append(other.id)
+                    stale_ids.extend(
+                        _singleton_stale_ids(existing, new_is_singleton, exclude_id=ex.id)
+                    )
                     if stale_ids:
                         self._purge_stale_uploads(stale_ids)
                     # 命中既有资产：补查完整模型实例返回（调用方需 to_dict）
@@ -491,6 +509,34 @@ class AssetService(BaseService):
                 # 幂等 key 不命中会双入库（半成品+成品两条）。视为同一文件的更新，
                 # 新文件入库后替换旧资产（先写新后删旧，新文件失败旧资产保留）
                 stale_ids.append(ex.id)
+
+            # 单实例模态：本次上传的文件若比库里已有的同类资产**采集时间更早**
+            # （目录里两次采集的文件按文件名排序先后到达，旧的可能后到），直接
+            # 跳过不入库，避免"后到的旧文件覆盖已有的新采集"。
+            # 判定只比较两侧文件名解析出的时间戳 —— 用 timestamp_utc 会被
+            # 「入库时刻兜底值」污染（无时间戳的老记录 ts = 入库时刻，恒最新）。
+            if new_is_singleton:
+                newer = _newer_singleton_rows(existing, original_name)
+                if newer:
+                    keeper = max(newer, key=lambda r: (r.timestamp_utc or datetime.min, r.id))
+                    log_operation(
+                        "upload", "asset", keeper.id,
+                        f"单实例模态跳过旧采集文件：已有更新资产 {keeper.file_name}"
+                        f"（本次 {original_name}）",
+                        operator=self._operator_user(),
+                    )
+                    self._commit()
+                    # 顺带收敛：该受试者同类若仍有多条，只留采集时间最新的这条
+                    stale = _singleton_stale_ids(existing, True, exclude_id=keeper.id)
+                    if stale:
+                        self._purge_stale_uploads(stale)
+                    return DataAsset.query.get(keeper.id), True
+
+            # 单实例模态：本受试者同类的既有记录（不同源文件 / 上一次采集的
+            # 残留）在新文件入库后全部作废，保证每类最终只剩一条。
+            # 与上面「同名演进」的区别：不要求同源，不同名的同类文件同样替换
+            # ——对应「后一次采集覆盖前一次」的业务口径。
+            stale_ids.extend(_singleton_stale_ids(existing, new_is_singleton))
 
             # 视频重采不在此处删旧：必须等新文件成功落盘入库后再删（见下方 _commit 之后），
             # 保证"先写新、后删旧"，新文件失败时旧视频仍保留，避免重采造成数据丢失。
@@ -948,8 +994,117 @@ class AssetService(BaseService):
             self._purge_stale_uploads(stale_ids)
         return len(stale_ids)
 
+    def singleton_violations(self, pseudo_ids: list, chunk_size: int = 500) -> dict:
+        """按伪ID查询违反「单实例」约束的受试者与模态
+
+        浏览器目录扫描的对账数据源之一：后端删掉多余记录后，前端 localStorage
+        仍认为这些文件"已上传"而永久跳过，被命名覆盖丢失的文件补不回来。
+        本接口告诉前端"哪些受试者需要重新扫描整个目录做验证修复"。
+
+        :returns: {pseudo_id: [data_type, ...]} 只含存在违反的受试者
+        """
+        cleaned = [str(p).strip() for p in (pseudo_ids or []) if p and str(p).strip()]
+        if not cleaned:
+            return {}
+        candidates = [dt for dt in DataType if is_singleton_data_type(dt)]
+        out = {}
+        for i in range(0, len(cleaned), chunk_size):
+            chunk = cleaned[i:i + chunk_size]
+            rows = (
+                db.session.query(
+                    Subject.pseudo_id, DataAsset.id, DataAsset.data_type,
+                    DataAsset.file_name, DataAsset.metadata_json,
+                )
+                .join(DataAsset, DataAsset.subject_id == Subject.id)
+                .filter(Subject.pseudo_id.in_(chunk))
+                .filter(DataAsset.data_type.in_(candidates))
+                .all()
+            )
+            groups = {}
+            for row in rows:
+                if not is_singleton_asset(row):
+                    continue  # json 里的辅助 JSON（相机标定等）不受约束
+                key = (row.pseudo_id, _dt_value(row.data_type))
+                groups.setdefault(key, []).append(row.id)
+            for (pseudo_id, dt_value), ids in groups.items():
+                if len(ids) > 1:
+                    out.setdefault(pseudo_id, []).append(dt_value)
+        return out
+
+    def purge_singleton_duplicates(self) -> int:
+        """系统自愈：清理违反「每受试者每类单实例」约束的资产
+
+        受约束模态：心电 ecg / 脑电 eeg / 音频 audio / 个人信息 userInfo(json)。
+        同一受试者下出现多份同类数据（重复入库、命名冲突覆盖后的幽灵记录、
+        上一次采集未被替换的残留）时，只保留一条。
+
+        保留优先级（用户 2026-09-16 确认）：
+        1. 淘汰幽灵记录（磁盘文件不存在 / file_size 与磁盘大小不一致）
+        2. 存活记录取采集时间最新（timestamp_utc）——后一次采集覆盖前一次
+        3. 仍相同则取 id 最大
+
+        与同源收敛的区别：同源收敛按「归一化原始名」分组，管不到**不同源**
+        的两份心电；本函数按 (受试者, 模态) 分组，覆盖该场景。
+        幂等可重复执行。
+        """
+        storage_root = current_app.config["DATA_LAKE_DIR"]
+        stale_ids = collapse_singleton_duplicates(storage_root=storage_root)
+        if stale_ids:
+            current_app.logger.warning(
+                "单实例约束自愈：清理 %d 条重复资产 %s", len(stale_ids), stale_ids,
+            )
+            self._purge_stale_uploads(stale_ids)
+        return len(stale_ids)
+
 
 # ==================== 模块级辅助函数（文件服务相关） ====================
+
+def _singleton_stale_ids(existing_rows, new_is_singleton, exclude_id=None):
+    """单实例模态下，需要被本次上传替换的既有资产 id
+
+    :param existing_rows: 该受试者同模态的既有资产行（需含 id/file_name/
+                          metadata_json/data_type）
+    :param new_is_singleton: 本次上传的文件是否属于受约束的单实例模态
+                             （json 模态下只有 userInfo 受约束）
+    :param exclude_id: 排除的资产 id（幂等命中的那条本身）
+    :returns: 待删 id 列表
+
+    删除时机由调用方控制（新文件落盘入库成功后才删 = 先写新后删旧）。
+    """
+    if not new_is_singleton:
+        return []
+    out = []
+    for row in existing_rows:
+        if exclude_id is not None and row.id == exclude_id:
+            continue
+        if is_singleton_asset(row):
+            out.append(row.id)
+    return out
+
+
+def _newer_singleton_rows(existing_rows, original_name):
+    """单实例模态下，采集时间比本次上传文件**更新**的既有资产行
+
+    场景：受试者目录里存在两次采集的两份心电（`ecg_20260717.csv` 与
+    `ecg_20260820.csv`）。扫描按文件名排序上传，若新采集的那份先入库，后到的
+    旧文件会把它替换掉 —— 结果与「后一次采集覆盖前一次」相反。这里在上传前
+    先判一次，已有更新的同类资产时直接跳过本次上传。
+
+    只在两侧文件名都能解析出时间戳时判定：解析不出时信息不足，退化为既有的
+    「后上传替换先上传」行为（不会误跳过）。
+    """
+    new_ts = parse_time_from_name(original_name)
+    if new_ts is None:
+        return []
+    out = []
+    for row in existing_rows:
+        if not is_singleton_asset(row):
+            continue
+        meta = row.metadata_json or {}
+        ex_ts = parse_time_from_name(meta.get("original_filename"))
+        if ex_ts is not None and ex_ts > new_ts:
+            out.append(row)
+    return out
 
 def _encryption_enabled():
     """是否启用数据湖文件加密"""

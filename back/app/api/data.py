@@ -261,6 +261,29 @@ def assets_ingest_digest():
     return success(result)
 
 
+@data_bp.route("/assets/singleton-violations", methods=["POST"])
+@jwt_required()
+def assets_singleton_violations():
+    """查询违反「每受试者每类单实例」约束的受试者与模态
+
+    受约束模态：心电 ecg / 脑电 eeg / 音频 audio / 个人信息 userInfo(json)。
+    浏览器目录扫描的对账接口：后端收敛删除多余记录后，前端 localStorage 仍
+    认为这些文件"已上传"而永久跳过。本接口返回需要**重新扫描整个受试者目录**
+    做验证修复的受试者，前端据此作废本地记录，下一轮全量重传该目录，由后端
+    按唯一性策略重新收敛。
+
+    请求：{"pseudo_ids": ["A001", ...]}
+    返回：{"A001": ["ecg", "audio"], ...}（无违反的受试者不出现）
+    """
+    data = request.get_json(silent=True) or {}
+    pseudo_ids = data.get("pseudo_ids")
+    if not isinstance(pseudo_ids, list):
+        return fail("pseudo_ids 必须为列表", 422)
+    if len(pseudo_ids) > 2000:
+        return fail("pseudo_ids 数量超过上限 2000", 422)
+    return success(_svc_asset().singleton_violations(pseudo_ids))
+
+
 @data_bp.route("/parse-userinfo", methods=["POST"])
 @role_required(Role.ADMIN, Role.NURSE, Role.ENGINEER)
 def parse_userinfo():

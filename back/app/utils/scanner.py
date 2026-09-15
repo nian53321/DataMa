@@ -524,6 +524,10 @@ def scan_watch_dir(config):
                     # ——覆盖"半成品+完整版共存"的历史存量，不必等下次重启的
                     # 启动自愈才消失。
                     pending_stale_ids += _collapse_subject_sources(existing)
+                    # 单实例模态收敛：同一受试者的心电/脑电/音频/个人信息每类
+                    # 只允许一条。与同源收敛的区别是不要求同源 —— 目录里存在
+                    # 两次采集的两份心电时，按「后一次采集覆盖前一次」保留最新。
+                    pending_stale_ids += _collapse_subject_singletons(existing)
                     # userInfo 字段自愈：首次扫描时 userInfo 尚在写入导致解析失败，
                     # 受试者创建时无元数据；此处检测到关键字段为空则重新解析补齐
                     _backfill_subject_fields(
@@ -562,6 +566,11 @@ def scan_watch_dir(config):
                         sub_dir, subject,
                         failure_collector=result["failures"],
                     ) or []
+                    # 单实例模态：首次导入时目录里可能已存在两次采集的两份同类
+                    # 数据（如 ecg_20260717 与 ecg_20260820），这里立即收敛为一条，
+                    # 不等下一轮扫描。flush 保证刚 add 的资产可被查询到。
+                    db.session.flush()
+                    pending_stale_ids += _collapse_subject_singletons(subject)
 
                 new_count += 1
 
@@ -833,6 +842,27 @@ def _collapse_subject_sources(subject):
         if len(ids) > 1:
             stale.extend(sorted(ids)[:-1])
     return stale
+
+
+def _collapse_subject_singletons(subject):
+    """对单个受试者做「单实例模态」收敛，返回待删资产 id 列表
+
+    受约束模态：心电 ecg / 脑电 eeg / 音频 audio / 个人信息 userInfo(json)。
+    分组键 = (受试者, 模态)，**不要求同源** —— 这正是它相对 `_collapse_subject_sources`
+    的补充：两份不同名的心电（两次采集）在同源口径下归不到一组。
+
+    保留优先级：幽灵记录（文件缺失/大小不符）先淘汰 → 采集时间最新 → id 最大。
+    """
+    from flask import current_app
+    from app.utils.singleton_assets import collapse_singleton_duplicates
+    try:
+        return collapse_singleton_duplicates(
+            subject_id=subject.id,
+            storage_root=current_app.config["DATA_LAKE_DIR"],
+        )
+    except Exception:
+        logger.exception("单实例模态收敛失败（不影响本次扫描）：%s", subject.pseudo_id)
+        return []
 
 
 def _purge_stale_assets(stale_ids):

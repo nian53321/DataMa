@@ -358,6 +358,19 @@ def create_app(env=None):
                 app.logger.info("启动自愈：已清理 %d 条命名冲突幽灵记录", collided)
         except Exception as e:
             app.logger.warning("命名冲突幽灵记录自愈清理失败: %s", e)
+        # 单实例模态自愈：每个受试者的心电/脑电/音频/个人信息每类只允许一条。
+        # 同源收敛按「归一化原始名」分组，管不到不同源的两份同类数据（两次采集
+        # 各一份心电），这里按 (受试者, 模态) 补收敛，保留采集时间最新的一条。
+        # 幂等可重复执行；失败不阻断启动
+        try:
+            from app.services.asset_service import AssetService
+            singleton_removed = AssetService().purge_singleton_duplicates()
+            if singleton_removed:
+                app.logger.info(
+                    "启动自愈：已清理 %d 条单实例模态重复数据资产", singleton_removed,
+                )
+        except Exception as e:
+            app.logger.warning("单实例模态重复资产自愈清理失败: %s", e)
 
     # 注册蓝图
     from app.api import ALL_BLUEPRINTS

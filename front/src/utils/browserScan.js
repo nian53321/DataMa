@@ -16,7 +16,7 @@ import { scanDirectory, verifyPermission, diffFiles } from '@/utils/dirWatcher'
 import { splitByObservation } from '@/utils/writeObserve'
 import {
   parseUserInfoApi, createSubjectApi, updateSubjectApi, uploadAssetApi,
-  getSubjectsApi, getIngestDigestApi,
+  getSubjectsApi, getIngestDigestApi, getSingletonViolationsApi,
 } from '@/api/data'
 
 // 伪ID合法格式：3-64位字母/数字/下划线/短横线（与后端 scanner 一致）
@@ -349,6 +349,52 @@ async function reconcileUploadedMap(effectiveMap) {
   return invalidated
 }
 
+/**
+ * 单实例模态违反对账：作废「同一受试者出现多份同类数据」的本地记录
+ *
+ * 业务规则：每个受试者的心电/脑电/音频/个人信息每类只允许一条。后端收敛
+ * （删除多余记录）后，本地 localStorage 仍认为这些文件"已上传"而永久跳过 ——
+ * 被命名冲突覆盖丢失的那份文件就再也补不回来。
+ *
+ * 这里作废**违反模态对应文件**的本地记录（不是整个受试者目录 —— 那样会让
+ * 视频等允许多份的模态也一并重传，反而制造新的重复），使这些文件在下一轮
+ * 重新进入观察期并全量重传，由后端按「后一次采集覆盖前一次」重新收敛，
+ * 完成"重新扫这个受试者的目录做验证修复"。
+ *
+ * @returns {string[]} 被作废的路径（调用方需同步清掉写入观察期基线）
+ */
+async function invalidateSingletonViolations(effectiveMap) {
+  const invalidated = []
+  const paths = Object.keys(effectiveMap)
+  if (!paths.length) return invalidated
+  const pseudoIds = [...new Set(
+    paths.map((p) => p.split('/')[0]).filter(Boolean)
+  )]
+  let violations
+  try {
+    const res = await getSingletonViolationsApi(pseudoIds)
+    violations = res.data || {}
+  } catch {
+    // 接口不可用（旧后端/鉴权失败）时静默跳过，不影响主扫描流程
+    return invalidated
+  }
+  const badSubjects = Object.keys(violations).filter((k) => violations[k]?.length)
+  if (!badSubjects.length) return invalidated
+  const badMap = new Map(badSubjects.map((k) => [k, new Set(violations[k])]))
+  for (const p of paths) {
+    const segs = p.split('/')
+    const badTypes = badMap.get(segs[0])
+    if (!badTypes) continue
+    // 文件名 → 模态必须与后端判定同口径（detectDataType 与后端
+    // scanner._detect_data_type 一致）；userInfo 归为 json
+    if (badTypes.has(detectDataType(segs[segs.length - 1]))) {
+      delete effectiveMap[p]
+      invalidated.push(p)
+    }
+  }
+  return invalidated
+}
+
 // ==================== 单次扫描编排 ====================
 
 /**
@@ -404,6 +450,9 @@ export async function runScanFromFiles(allFiles, options = {}) {
   // 与后端资产对账：平台侧删除过的资产/受试者，本地记录未感知会永久跳过
   // 这些文件，作废失效记录后由 diff 重新发现（重新上传入库/重建受试者）
   const invalidatedPaths = await reconcileUploadedMap(effectiveMap)
+  // 单实例模态违反（同一受试者多份心电/脑电/音频/个人信息）：作废对应文件的
+  // 本地记录，下一轮全量重传这些文件做验证修复（后端按唯一性重新收敛）
+  invalidatedPaths.push(...(await invalidateSingletonViolations(effectiveMap)))
 
   // 4. 写入观察期（双轮读数比对，观察期 = 一个自动扫描周期）
   //

@@ -29,6 +29,11 @@ export const uploadAssetApi = (formData, onProgress) =>
 export const getIngestDigestApi = (pseudoIds) =>
   request.post('/data/assets/ingest-digest', { pseudo_ids: pseudoIds })
 
+// 查询违反「每受试者每类只允许一条」约束的受试者（心电/脑电/音频/个人信息）
+// 返回 { pseudo_id: ['ecg', 'audio'] }，供浏览器扫描作废本地记录后重扫验证
+export const getSingletonViolationsApi = (pseudoIds) =>
+  request.post('/data/assets/singleton-violations', { pseudo_ids: pseudoIds })
+
 // 解析 userInfo.json 文件（支持明文/外部加密），返回受试者字段映射
 export const parseUserInfoApi = (formData) =>
   request.post('/data/parse-userinfo', formData, {
