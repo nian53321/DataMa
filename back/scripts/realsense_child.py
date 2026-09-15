@@ -34,7 +34,7 @@ session 架构（消除预览↔录制切换的进程重启与设备抢占竞态
 
 数据流：只采集 彩色 + 深度 两路（不启用红外流），深度对齐到彩色坐标系。
 录制产物（输出目录，全部为最终格式）：
-  color.mp4         彩色 H.264（libx264 CRF 18，浏览器可播）
+  color.mp4         彩色 H.264（libx264 CRF 23 / GOP 30，浏览器可播；参数见下方 COLOR_ENC_*）
   depth_raw.zst     原始深度序列（DZST v2：16mm 量化+帧间差分+zstd，解码后为毫米）
   frames.jsonl      逐帧同步记录（MP4/ZST 帧序号 + RGB/深度硬件时间戳 + 硬件帧号）
   calibration.json  相机标定（depth_scale / RGB 内参 / 畸变 / 分辨率 / 序列号）
@@ -58,6 +58,26 @@ DEFAULT_FPS = 30
 # 流配置：原生最高规格直接启动，不做分辨率/帧率试错降级（实测可直启）
 STREAM_COLOR = (1280, 800)
 STREAM_DEPTH = (1280, 720)
+
+# 彩色视频编码参数（**调体积只改这里**；改完必须重建 backend 与 celery-worker 镜像才生效）
+#
+# 实测基线（1280x800@30，CRF 18 + GOP 15）：≈20 Mbps → 2min ≈ 300MB，
+#   远超该分辨率 CRF18 的正常落点 5~8 Mbps。超额来自两处：
+#     ① GOP=15（每 0.5s 一个 I 帧）在 CRF 模式下额外占 20~40%；
+#     ② 深度流开启时 IR 散斑落在 RGB 传感器上形成高频噪声，H.264 对高频极敏感。
+#
+# 2026-09-15 调整为 CRF 23 + GOP 30（预期 ≈100~120MB / 2min），依据：
+#   - CRF 23 与本项目其余编码路径对齐：video_desensitize.ENCODE_CRF / orbbec.py /
+#     transcode.py / visualization.py 全部为 23，CRF 18 是孤立的高码率孤岛；
+#   - CRF +5 按 x264 经验约降到 42%，GOP 放宽一倍再省 8~15%。
+#
+# GOP 取值下限受两处约束，**勿再放大**：
+#   ① 视频脱敏 v6 段级并行用 `-f segment -c copy` **按关键帧**切分，GOP 越大切点吸附
+#      误差越大、各段长度越不均（SEGMENT_TARGET_SECONDS=30s，GOP 30 时误差 ≤1s，可忽略）；
+#   ② 浏览器 seek / 前端裁剪依赖关键帧密度（同 orbbec.py 预览转码的口径）。
+COLOR_ENC_PRESET = "fast"
+COLOR_ENC_CRF = 23
+COLOR_ENC_GOP = 30
 
 # 设备忙重试预算（秒）：上一会话进程退出后内核释放 USB 需要 1~2.5s，期间
 # pipe.start 报 EBUSY，短间隔重试等到释放即可；预算耗尽仍忙则失败。
@@ -457,6 +477,11 @@ def cmd_session(fps):
     except Exception:
         dev_info["depth_units_mm"] = 1.0
 
+    # 实际生效的彩色编码参数：回写到 meta.json 与 rec_started 事件，事后可确认某批视频
+    # 是用哪档参数落的 —— 避免"改了参数却仍在跑旧镜像"时无法取证。
+    eff_enc = {"preset": COLOR_ENC_PRESET, "crf": COLOR_ENC_CRF,
+               "gop": COLOR_ENC_GOP, "pix_fmt": "yuv420p"}
+
     # 深度对齐到彩色坐标系（对齐后深度逐像素对应彩色，分辨率也变为彩色分辨率）
     align = rs.align(rs.stream.color)
 
@@ -496,8 +521,8 @@ def cmd_session(fps):
             enc = _spawn_ffmpeg([
                 "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{cw}x{ch}",
                 "-r", str(actual_fps), "-i", "pipe:0",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "15",
+                "-c:v", "libx264", "-preset", COLOR_ENC_PRESET, "-crf", str(COLOR_ENC_CRF),
+                "-pix_fmt", "yuv420p", "-g", str(COLOR_ENC_GOP), "-keyint_min", str(COLOR_ENC_GOP),
                 "-movflags", "+faststart", "-an", color_mp4], logf)
         except Exception as e:
             if logf is not None:
@@ -571,7 +596,7 @@ def cmd_session(fps):
             })
         send_evt({"evt": "rec_started", "dir": out_dir, "fps": actual_fps,
                   "serial": dev_info["serial"], "name": dev_info["name"],
-                  "firmware": dev_info["firmware"]})
+                  "firmware": dev_info["firmware"], "encoding": eff_enc})
 
     def _finalize_rec(snap):
         """录制收尾（后台线程）：哨兵→写线程 EOF→ffmpeg flush→校验→元数据→rec_done
@@ -634,6 +659,8 @@ def cmd_session(fps):
                 "frame_count": frame_idx,
                 "depth_raw": bool(raw_ok),
                 "color_codec": "h264",
+                # 落盘回写：事后可从 meta.json 反查该视频的实际编码档位
+                "color_encoding": dict(eff_enc),
                 "depth_codec": "dzst2",
                 "pauses": snap.get("pauses") or [],
             }
