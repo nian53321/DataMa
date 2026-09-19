@@ -841,14 +841,6 @@
                   <div v-else-if="!exportPreview.loading" style="font-size: 12px; color: #909399">
                     预览加载失败，导出功能不受影响
                   </div>
-                  <el-alert
-                    v-if="exportLimitWarning"
-                    type="warning"
-                    :closable="false"
-                    :title="exportLimitWarning"
-                    show-icon
-                    style="margin-top: 8px"
-                  />
                 </div>
 
                 <el-button
@@ -2490,8 +2482,6 @@ const exportPreview = reactive({
   totalSize: 0,
   byType: {},
   byLayer: {},
-  exceedsCountLimit: false,
-  exceedsSizeLimit: false,
   items: [],
 })
 
@@ -2514,8 +2504,6 @@ const _doRefreshExportPreview = async () => {
     exportPreview.totalSize = d.total_size || 0
     exportPreview.byType = d.by_type || {}
     exportPreview.byLayer = d.by_layer || {}
-    exportPreview.exceedsCountLimit = !!d.exceeds_count_limit
-    exportPreview.exceedsSizeLimit = !!d.exceeds_size_limit
     exportPreview.items = d.items || []
     exportPreview.loaded = true
   } catch {
@@ -2541,12 +2529,8 @@ const exportLayerText = (ly) => {
   const m = { raw: '原始层', cleaned: '清洗层', feature: '特征层', annotation: '标注层' }
   return m[ly] || ly
 }
-const exportLimitWarning = computed(() => {
-  const parts = []
-  if (exportPreview.exceedsCountLimit) parts.push('文件数超过上限 200 个')
-  if (exportPreview.exceedsSizeLimit) parts.push('总大小超过上限 2048 MB')
-  return parts.length ? `${parts.join('，')}，导出将被拒绝，请缩小范围分批导出` : ''
-})
+// 后端已放开导出规模限制（文件数 / 总大小），预览不再做超限拦截，
+// 仅展示命中数量与总大小供用户判断导出范围。
 
 const handleExport = async () => {
   // 未勾选受试者时后端按"全部受试者"导出，二次确认防误触全量导出

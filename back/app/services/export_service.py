@@ -5,7 +5,7 @@
 - 按 asset_ids 列表或 subject_ids/data_types/layers 筛选导出
 - 加密导出（保持 DMEC 格式，文件追加 .dmec 后缀）
 - 明文导出（解密后打包原文件）
-- 单次最多 200 文件 / 2GB
+- 导出规模不限制（文件数 / 总大小上限均可配，当前为 None 即不限制；>4GB 走 ZIP64）
 - 异步任务 + 实时压缩进度回调（ExportTaskManager）
 
 复用：
@@ -14,6 +14,7 @@
 """
 import os
 import json
+import shutil
 import tempfile
 import threading
 import time
@@ -46,11 +47,68 @@ from app.utils.restore_kit import build_kit_files
 from app.utils.video_desensitize import desensitize_video_file_parallel
 
 
+# ==================== 打包压缩策略 ====================
+# 实测（back/tools/bench_zip_pack.py + bench_export_path.py，2026-09-20，真实数据湖文件）：
+#   243MB 密文 mkv：deflate(level6，现状) 5.370s / 45.4 MB/s，压缩率 1.0003
+#                   （压完还大 0.03%）；level1 5.278s —— **降级别无效**
+#                   （成本在"匹配失败"的扫描，不在熵编码）
+#                   stored + zf.write 0.408s（13.2×）；stored + 1MB 分块流式 0.206s（26.1×）
+#   512MB 文本 CSV：deflate6 1.783s → 1.5MB（0.29%），stored 0.910s → 512MB
+#                   ⇒ 文本该压（体积差 340×，时间只多 0.9s）
+# 结论：逐条目按"内容是否可压缩"分派，而不是整包一个级别。
+#   - 密文（加密导出 / .dmec）与已编码媒体（视频/音频/图片/归档）→ ZIP_STORED
+#   - 明文文本类（csv/json/...）→ ZIP_DEFLATED
+_ZIP_TEXT_EXT = {".csv", ".tsv", ".txt", ".json", ".xml", ".yml", ".yaml", ".md", ".log"}
+_ZIP_INCOMPRESSIBLE_EXT = {
+    # 密文
+    ".dmec",
+    # 视频
+    ".mkv", ".mp4", ".avi", ".mov", ".webm", ".flv", ".m4v", ".mpg", ".mpeg", ".ts",
+    # 音频
+    ".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg", ".opus", ".wma",
+    # 图片
+    ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
+    # 归档/已压缩
+    ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".pdf", ".zst", ".br",
+}
+# zipfile.write() 内部用 8KB 块拷贝；实测 1MB 块再快约 2×（Python 层循环次数）
+_ZIP_CHUNK = 1024 * 1024
+
+
+def _zip_add_file(zf, src_path: str, arcname: str, cipher: bool = False) -> None:
+    """把一个磁盘文件写进 zip：1MB 分块流式 + 按内容决定压缩方式
+
+    :param cipher: 写入 zip 的内容是密文（加密导出 / .dmec）→ 一律 ZIP_STORED。
+       密文不可压缩，deflate 只会白烧 CPU（实测 13~26× 的时间换 0% 的体积）。
+    """
+    ext = os.path.splitext(arcname)[1].lower()
+    if cipher or ext in _ZIP_INCOMPRESSIBLE_EXT:
+        comp_type, level = zipfile.ZIP_STORED, None
+    elif ext in _ZIP_TEXT_EXT:
+        comp_type, level = zipfile.ZIP_DEFLATED, None
+    else:
+        # 未知类型：体积小优先，保守沿用压缩
+        comp_type, level = zipfile.ZIP_DEFLATED, None
+
+    st = os.stat(src_path)
+    zi = zipfile.ZipInfo(arcname, date_time=time.localtime(st.st_mtime)[:6])
+    zi.compress_type = comp_type
+    zi.compress_level = level
+    zi.external_attr = (st.st_mode & 0xFFFF) << 16
+    zi.file_size = st.st_size
+    # force_zip64 保持 False：file_size 已知，zipfile 会**按需**给 >2GB 的条目加
+    # ZIP64 扩展；不强行给小文件也套上（部分老旧解压工具不认 ZIP64 条目）。
+    with zf.open(zi, "w") as dst, open(src_path, "rb") as src:
+        shutil.copyfileobj(src, dst, _ZIP_CHUNK)
+
+
 class ExportService(BaseService):
     """数据资产批量导出服务"""
 
-    EXPORT_MAX_FILE_COUNT = 200
-    EXPORT_MAX_TOTAL_SIZE = 2 * 1024 ** 3  # 2GB
+    # 导出规模上限：None = 不限制（2026-09-20 起放开，导出范围完全由界面选择决定）。
+    # 需要重新加闸时把这两项改回正整数即可，_validate_limits / preview_export 无需改动。
+    EXPORT_MAX_FILE_COUNT = None
+    EXPORT_MAX_TOTAL_SIZE = None
 
     def prepare_export(self, payload: dict, progress_callback=None,
                        assets: List[DataAsset] = None) -> Tuple[str, str, list]:
@@ -142,8 +200,8 @@ class ExportService(BaseService):
         return {
             "total_count": total_count,
             "total_size": total_size,
-            "exceeds_count_limit": total_count > self.EXPORT_MAX_FILE_COUNT,
-            "exceeds_size_limit": total_size > self.EXPORT_MAX_TOTAL_SIZE,
+            "exceeds_count_limit": self._exceeded(total_count, self.EXPORT_MAX_FILE_COUNT),
+            "exceeds_size_limit": self._exceeded(total_size, self.EXPORT_MAX_TOTAL_SIZE),
             "max_file_count": self.EXPORT_MAX_FILE_COUNT,
             "by_type": by_type,
             "by_layer": by_layer,
@@ -216,16 +274,24 @@ class ExportService(BaseService):
             raise ValidationError("未选择任何数据资产")
         return assets
 
+    @staticmethod
+    def _exceeded(value: int, limit) -> bool:
+        """是否超上限；limit 为 None（不限制）时恒为 False"""
+        return limit is not None and value > limit
+
     def _validate_limits(self, assets: List[DataAsset]):
-        """校验导出规模上限"""
-        if len(assets) > self.EXPORT_MAX_FILE_COUNT:
+        """校验导出规模上限（上限为 None 时该项不校验）"""
+        if self._exceeded(len(assets), self.EXPORT_MAX_FILE_COUNT):
             raise ValidationError(
                 f"导出文件数超过上限：{len(assets)} > {self.EXPORT_MAX_FILE_COUNT}，请分批导出"
             )
+        if self.EXPORT_MAX_TOTAL_SIZE is None:
+            return
         total_size = sum(int(a.file_size or 0) for a in assets)
         if total_size > self.EXPORT_MAX_TOTAL_SIZE:
             raise ValidationError(
-                f"导出总大小超过上限：{total_size / 1024 / 1024:.1f} MB > 2048 MB，请分批导出"
+                f"导出总大小超过上限：{total_size / 1024 / 1024:.1f} MB > "
+                f"{self.EXPORT_MAX_TOTAL_SIZE / 1024 / 1024:.1f} MB，请分批导出"
             )
 
     def _build_zip(self, assets: List[DataAsset], encrypted: bool,
@@ -313,7 +379,10 @@ class ExportService(BaseService):
             return encrypt_bytes(plaintext)
 
         try:
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # allowZip64=True：放开规模上限后 zip 可能 >4GB，必须允许 ZIP64 扩展
+            # （Python 3.x 默认已是 True，此处显式写出以防被后续改动关掉）
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED,
+                                 allowZip64=True) as zf:
                 for asset in assets:
                     # zip 内已写入的条目数：用于识别"本资产新写进去的密文条目"
                     before_entries = len(zf.NameToInfo)
@@ -382,7 +451,8 @@ class ExportService(BaseService):
                                 else:
                                     pack_path = masked_path
                                     arcname = f"{pseudo_id}/{layer}/{data_type}/{file_name}"
-                                zf.write(pack_path, arcname)
+                                _zip_add_file(zf, pack_path, arcname,
+                                              cipher=encrypted)
                             finally:
                                 for p in tmp_paths:
                                     _remove_file_safely(p)
@@ -448,7 +518,8 @@ class ExportService(BaseService):
                                 else:
                                     pack_path = masked_path
                                     arcname = f"{pseudo_id}/{layer}/{data_type}/{out_name}"
-                                zf.write(pack_path, arcname)
+                                _zip_add_file(zf, pack_path, arcname,
+                                              cipher=encrypted)
                             finally:
                                 for p in tmp_paths:
                                     _remove_file_safely(p)
@@ -499,7 +570,8 @@ class ExportService(BaseService):
                                 else:
                                     pack_path = masked_path
                                     arcname = f"{pseudo_id}/{layer}/{data_type}/{out_name}"
-                                zf.write(pack_path, arcname)
+                                _zip_add_file(zf, pack_path, arcname,
+                                              cipher=encrypted)
                             finally:
                                 for p in tmp_paths:
                                     _remove_file_safely(p)
@@ -566,7 +638,8 @@ class ExportService(BaseService):
                                 else:
                                     pack_path = masked_path
                                     arcname = f"{pseudo_id}/{layer}/{data_type}/{file_name}"
-                                zf.write(pack_path, arcname)
+                                _zip_add_file(zf, pack_path, arcname,
+                                              cipher=encrypted)
                             finally:
                                 for p in tmp_paths:
                                     _remove_file_safely(p)
@@ -590,18 +663,22 @@ class ExportService(BaseService):
                                         suffix=".dmec", prefix="export_rewrap_")
                                     os.close(fd)
                                     rewrap_dmec_file(abs_path, tmp_path, pack_master_key)
-                                    zf.write(tmp_path, arcname)
+                                    _zip_add_file(zf, tmp_path, arcname,
+                                                  cipher=True)
                                 finally:
                                     if tmp_path:
                                         _remove_file_safely(tmp_path)
                             else:
-                                zf.write(abs_path, arcname)
+                                # 数据湖里的文件若本就是明文（未加密入库），
+                                # 则按扩展名决定压不压；密文一律不压
+                                _zip_add_file(zf, abs_path, arcname,
+                                              cipher=src_encrypted)
                         else:
                             # 明文导出：解密到临时文件后打包，arcname 保持原文件名
                             tmp_path, is_temp = _decrypt_for_serving(abs_path, suffix=suffix)
                             try:
                                 arcname = f"{pseudo_id}/{layer}/{data_type}/{file_name}"
-                                zf.write(tmp_path, arcname)
+                                _zip_add_file(zf, tmp_path, arcname)
                             finally:
                                 if is_temp:
                                     _remove_file_safely(tmp_path)
