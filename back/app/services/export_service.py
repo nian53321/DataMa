@@ -13,6 +13,7 @@
 - _remove_file_safely：复用 subject_service 安全删除文件
 """
 import os
+import inspect
 import json
 import shutil
 import tempfile
@@ -102,6 +103,67 @@ def _zip_add_file(zf, src_path: str, arcname: str, cipher: bool = False) -> None
         shutil.copyfileobj(src, dst, _ZIP_CHUNK)
 
 
+# ==================== 导出进度口径 ====================
+# 现场问题（2026-09-20）："文件都压缩完了，进度条没走完，还要等一会"。
+# 根因是进度按**文件数**算，与真实工作量（字节数 / 视频脱敏耗时）完全脱节：
+#   实测数据湖 179 文件 / 2.32GB：前 7 个 243MB 视频已占 69% 字节，按文件数却只有 3%；
+#   反过来大文件排在后面时，进度条早早冲到 90%+ 然后长时间一动不动 —— 用户看到的
+#   "都压缩完了还卡着"就是这种失真。
+# 新口径：
+#   - 打包阶段按**字节**加权（耗时 ∝ 字节数），占 5%~95%
+#   - 收尾（脱敏参数 / 还原包 / 关闭压缩包 / 审计日志）显式占 96%~99%，
+#     配明确文案，不再停在 95% 无任何反馈
+#   - 每个文件**开始处理前**就上报一次并带上文件名，使大文件 / 视频脱敏
+#     期间界面能说清"正在处理谁"，而不是干等
+STAGE_PACKING = "packing"      # 逐个文件处理（含脱敏、加密、写入压缩包）
+STAGE_FINISHING = "finishing"  # 文件全部处理完，写 manifest / 还原包
+STAGE_DONE = "done"            # 压缩包已关闭，剩余收尾
+
+_PCT_PARSE = 5          # 解析导出范围阶段预留的进度
+_PCT_PACK_SPAN = 90     # 打包阶段跨度：5 → 95
+_PCT_FINISHING = 96
+_PCT_DONE = 99
+
+
+def _progress_percent(stage, processed, total, size_done, size_total) -> int:
+    """导出进度百分比：字节加权 + 收尾阶段显式分档
+
+    :param stage: STAGE_PACKING / STAGE_FINISHING / STAGE_DONE
+    :return: 0~100 的整数百分比
+    """
+    if stage == STAGE_FINISHING:
+        return _PCT_FINISHING
+    if stage == STAGE_DONE:
+        return _PCT_DONE
+    if size_total > 0:
+        # 字节口径：耗时与字节数成正比，剩余时间估计最诚实
+        ratio = max(0.0, min(1.0, size_done / size_total))
+    elif total > 0:
+        # 资产未记录大小时退回文件数口径（不能因此卡死在 0%）
+        ratio = max(0.0, min(1.0, processed / total))
+    else:
+        ratio = 1.0
+    return _PCT_PARSE + int(ratio * _PCT_PACK_SPAN)
+
+
+def _progress_text(stage, processed, total, size_done, size_total,
+                   current=None, frame_hint=None) -> str:
+    """导出进度文案：说清"正在处理谁"，大文件 / 视频脱敏期间不留空窗"""
+    size_part = f"{format_size(size_done)} / {format_size(size_total)}"
+    if stage == STAGE_FINISHING:
+        return f"全部文件已处理完，正在写入脱敏参数与还原包...（{size_part}）"
+    if stage == STAGE_DONE:
+        return f"压缩包已写完，正在收尾...（{size_part}）"
+    if current:
+        # 处理**开始前**上报，故当前是第 processed+1 个
+        text = f"正在处理第 {processed + 1}/{total} 个：{current}（{size_part}）"
+    else:
+        text = f"已处理 {processed}/{total} 个文件（{size_part}）"
+    if frame_hint:
+        text += f"，视频脱敏已处理 {int(frame_hint)} 帧"
+    return text
+
+
 class ExportService(BaseService):
     """数据资产批量导出服务"""
 
@@ -136,7 +198,12 @@ class ExportService(BaseService):
             desensitized: bool           # → userinfo
             audio_desensitize: bool      # → audio
         }
-        :param progress_callback: 可选回调(processed, total, size_done, size_total)
+        :param progress_callback: 可选回调
+            (processed, total, size_done, size_total, stage=, current=, frame_hint=)
+            —— 后三个为关键字参数，旧式 4 参数回调仍兼容（按签名探测自动降级）。
+            stage ∈ {STAGE_PACKING, STAGE_FINISHING, STAGE_DONE}；
+            current = 正在处理的文件名（处理**开始前**上报）；frame_hint = 视频脱敏
+            已处理帧数。百分比口径见 :func:`_progress_percent`。
         :param assets: 已解析并通过限额校验的资产列表（异步任务线程传入，
                        避免与 resolve_assets 重复查询数据库）；缺省时内部解析
         :return: (zip_tmp_path, download_filename, skipped_errors)
@@ -329,7 +396,10 @@ class ExportService(BaseService):
           **任一脱敏失败都不回退为原样导出**，记入 errors 跳过
           （宁可缺文件，不可明文外泄）
         - 部分文件丢失：跳过，记入 errors（不写入 zip，返回给调用方展示/审计）
-        - progress_callback(processed, total, size_done, size_total)：可选进度回调
+        - progress_callback(processed, total, size_done, size_total,
+          stage=, current=, frame_hint=)：可选进度回调。每个文件**开始处理前**与
+          处理完后各上报一次，收尾阶段（写 manifest / 还原包 / 关闭压缩包）单独上报；
+          百分比口径见 :func:`_progress_percent`（按字节加权，不按文件数）
         :return: (zip_tmp_path, skipped_errors)
         """
         desens = desens or {}
@@ -383,9 +453,32 @@ class ExportService(BaseService):
             # （Python 3.x 默认已是 True，此处显式写出以防被后续改动关掉）
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED,
                                  allowZip64=True) as zf:
+                # 兼容旧的 4 参数回调：预先探测一次签名，而不是靠 try/except TypeError
+                # 兜底 —— 后者会把回调**内部**抛出的 TypeError 当成签名不匹配，
+                # 静默吞掉真实错误并重复调用一次。
+                try:
+                    _cb_accepts_stage = len(
+                        inspect.signature(progress_callback).parameters) > 4
+                except (TypeError, ValueError):
+                    _cb_accepts_stage = False
+
+                def _emit(stage, current=None, frame_hint=None):
+                    """统一进度上报：闭包读取当前的 processed / size_done"""
+                    if not progress_callback:
+                        return
+                    if _cb_accepts_stage:
+                        progress_callback(processed, total_files, size_done,
+                                          total_size, stage=stage,
+                                          current=current, frame_hint=frame_hint)
+                    else:
+                        progress_callback(processed, total_files, size_done, total_size)
+
                 for asset in assets:
                     # zip 内已写入的条目数：用于识别"本资产新写进去的密文条目"
                     before_entries = len(zf.NameToInfo)
+                    # 处理**开始前**先上报一次：大文件 / 视频脱敏（分钟级）期间
+                    # 界面据此显示"正在处理第 N 个：xxx"，而不是进度条长时间不动
+                    _emit(STAGE_PACKING, current=getattr(asset, "file_name", None))
                     try:
                         if not asset.file_path:
                             errors.append({
@@ -546,9 +639,17 @@ class ExportService(BaseService):
                                 tmp_paths.append(masked_path)
                                 # 段级并行入口：按时长切段并发跑（实测 1.53×），
                                 # 切不动 / 任一段失败 / 拼接帧数不符都会自动退回单趟路径
+                                def _video_frame_cb(frames, _name=file_name):
+                                    # 视频人脸脱敏是整条导出链的分钟级大头；接帧级回调
+                                    # 后进度条在此期间也有反馈（回调可能来自段级并行的
+                                    # 工作线程，此处只写任务字段，不做复合读改写）
+                                    _emit(STAGE_PACKING, current=_name,
+                                          frame_hint=frames)
+
                                 ok, vid_err, vid_stats = desensitize_video_file_parallel(
                                     plain_path, masked_path,
-                                    logger=current_app.logger)
+                                    logger=current_app.logger,
+                                    on_progress=_video_frame_cb)
                                 # vid_stats 的明细（帧数/检出帧数/耗时）已由
                                 # desensitize_video_file 内部记入日志
                                 if not ok:
@@ -707,12 +808,11 @@ class ExportService(BaseService):
                             type(e).__name__, e, exc_info=True)
 
                     processed += 1
-                    if progress_callback:
-                        try:
-                            progress_callback(processed, total_files, size_done, total_size)
-                        except Exception:
-                            pass
+                    _emit(STAGE_PACKING)
 
+                # 收尾阶段（写 manifest / 还原包 / 关闭压缩包 / 审计日志）显式上报：
+                # 现场反馈"文件都处理完了进度条还不动"，缺的就是这一段的可观测性
+                _emit(STAGE_FINISHING)
                 # 可逆脱敏（脑电/心电/音频）的还原参数随包写出（**不含密钥**，只含每列
                 # 精度/噪声幅度/时间平移量、每声道的噪声幅度、原文校验和）。持密钥方
                 # 据此可逐字节还原；无密钥方拿到它也无法回推原文。
@@ -757,6 +857,9 @@ class ExportService(BaseService):
             # zip 构建失败，清理临时文件后重新抛出
             _remove_file_safely(zip_path)
             raise
+
+        # 走到这里：with 已退出 ⇒ ZipFile.close() 完成，压缩包已完整落盘
+        _emit(STAGE_DONE)
 
         if do_userinfo:
             current_app.logger.info(
@@ -1077,17 +1180,21 @@ class ExportTaskManager:
                 assets = svc.resolve_assets(payload)
                 task["total_files"] = len(assets)
                 task["total_size"] = sum(int(a.file_size or 0) for a in assets)
+                task["percent"] = _PCT_PARSE
                 task["status_text"] = f"开始压缩 {task['total_files']} 个文件..."
 
-                def on_progress(processed, total, size_done, size_total):
+                def on_progress(processed, total, size_done, size_total,
+                                stage=STAGE_PACKING, current=None, frame_hint=None):
                     task["processed_files"] = processed
                     task["processed_size"] = size_done
-                    if total > 0:
-                        task["percent"] = min(99, int(processed / total * 95))
-                    task["status_text"] = (
-                        f"正在压缩 {processed}/{total} 个文件"
-                        f"（{format_size(size_done)} / {format_size(size_total)}）"
-                    )
+                    # 进度按**字节**加权：耗时与字节数成正比，按文件数会让
+                    # "一堆小文件 + 几个大文件"的进度条严重失真（实测 7 个 243MB
+                    # 视频已占 69% 字节，按文件数只有 3%）
+                    task["percent"] = _progress_percent(
+                        stage, processed, total, size_done, size_total)
+                    task["status_text"] = _progress_text(
+                        stage, processed, total, size_done, size_total,
+                        current=current, frame_hint=frame_hint)
 
                 zip_path, filename, skipped = svc.prepare_export(
                     payload, progress_callback=on_progress, assets=assets)

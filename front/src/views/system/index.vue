@@ -856,7 +856,12 @@
                 <!-- 进度条 -->
                 <div v-if="exportProgress.visible" style="margin-top: 12px">
                   <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #606266; margin-bottom: 4px">
-                    <span>
+                    <!-- 状态文案会带上"正在处理第 N 个：文件名"，可能很长：
+                         单行省略 + 悬停全文，避免把右侧百分比挤出去 -->
+                    <span
+                      :title="exportProgress.status"
+                      style="flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap"
+                    >
                       <el-tag size="small" :type="exportProgress.phase === 'download' ? 'success' : 'warning'" style="margin-right: 6px">
                         {{ exportProgress.phase === 'download' ? '下载中' : '压缩中' }}
                       </el-tag>
