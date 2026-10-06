@@ -53,6 +53,9 @@ from app.services.annotation_service import AnnotationService
 from app.services.label_service import LabelService
 from app.services.external_key_service import ExternalKeyService
 from app.services.export_service import ExportService, export_task_manager
+from app.services.desensitize_asset_service import (
+    AssetDesensitizeService, desensitize_task_manager, resolve_desens_config,
+)
 
 __all__ = [
     "BaseService",
@@ -76,4 +79,6 @@ __all__ = [
     "LabelService",
     "ExternalKeyService",
     "ExportService",
+    "AssetDesensitizeService",
+    "resolve_desens_config",
 ]

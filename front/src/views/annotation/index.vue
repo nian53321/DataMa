@@ -12,14 +12,12 @@
           <el-radio-button value="rejected">已驳回</el-radio-button>
         </el-radio-group>
         <el-select v-model="dataTypeFilter" placeholder="数据类型" clearable size="small" style="width: 120px" @change="onFilterChange">
+          <!-- 标注仅支持这 5 种模态（与后端 _ANNOTATABLE_DATA_TYPES 一致） -->
           <el-option label="视频" value="video" />
           <el-option label="音频" value="audio" />
           <el-option label="脑电" value="eeg" />
           <el-option label="心电" value="ecg" />
           <el-option label="眼动" value="eye" />
-          <el-option label="步态" value="gait" />
-          <el-option label="量表" value="scale" />
-          <el-option label="认知任务" value="task" />
         </el-select>
         <el-button v-if="canAnnotate || isAdmin" type="success" :icon="Document" @click="openMyTasks">我的标注工作台</el-button>
         <el-button v-if="canAnnotate" type="primary" :icon="Plus" @click="openCreateDialog">新建标注任务</el-button>
@@ -185,14 +183,12 @@
       <el-form :inline="true" style="margin-bottom: 12px">
         <el-form-item label="数据类型">
           <el-select v-model="assetFilter.data_type" placeholder="全部" clearable style="width: 130px" @change="filterAssets">
+            <!-- 标注仅支持这 5 种模态（与后端 _ANNOTATABLE_DATA_TYPES 一致） -->
             <el-option label="视频" value="video" />
             <el-option label="音频" value="audio" />
             <el-option label="脑电" value="eeg" />
             <el-option label="心电" value="ecg" />
             <el-option label="眼动" value="eye" />
-            <el-option label="步态" value="gait" />
-            <el-option label="量表" value="scale" />
-            <el-option label="认知任务" value="task" />
           </el-select>
         </el-form-item>
         <el-form-item label="受试者">
@@ -431,19 +427,31 @@
                   <span>数据预览</span>
                 </div>
               </template>
-              <!-- 视频预览 -->
+              <!-- 视频预览：必须等签名 URL 就绪后才渲染 <video>。
+                   签名是异步获取的，若此时先渲染，src="" 会让浏览器立刻抛出
+                   MEDIA_ERR_SRC_NOT_SUPPORTED(=4)，被 onMediaError 误报成
+                   "格式不支持或文件损坏"（真实原因只是"URL 还没到"）。 -->
               <div v-if="assetInfo?.data_type === 'video' && assetInfo?.file_path" class="preview-media">
                 <video
+                  v-if="playUrl(assetInfo)"
                   :src="playUrl(assetInfo)"
                   controls
                   controlslist="nodownload"
                   style="max-width: 100%; max-height: 320px"
                   @error="onMediaError"
                 />
+                <div v-else class="preview-box"><p class="sub">{{ playUrlError || '视频加载中…' }}</p></div>
               </div>
-              <!-- 音频预览 -->
+              <!-- 音频预览（同理，避免空 src 触发一次无效请求） -->
               <div v-else-if="assetInfo?.data_type === 'audio' && assetInfo?.file_path" class="preview-media">
-                <audio :src="playUrl(assetInfo)" controls controlslist="nodownload" style="width: 100%" />
+                <audio
+                  v-if="playUrl(assetInfo)"
+                  :src="playUrl(assetInfo)"
+                  controls
+                  controlslist="nodownload"
+                  style="width: 100%"
+                />
+                <div v-else class="preview-box"><p class="sub">{{ playUrlError || '音频加载中…' }}</p></div>
               </div>
               <!-- 脑电/心电预览（共用 ECharts 容器） -->
               <div v-else-if="assetInfo?.data_type === 'eeg' || assetInfo?.data_type === 'ecg'" class="preview-media">
@@ -537,12 +545,57 @@
     />
 
     <!-- 复核弹窗 -->
-    <el-dialog v-model="reviewDialog" title="医生复核" width="800px" top="5vh">
+    <el-dialog v-model="reviewDialog" title="医生复核" width="900px" top="5vh">
       <div v-loading="wsLoading">
         <el-descriptions :column="2" border size="small" style="margin-bottom: 12px">
           <el-descriptions-item label="任务ID">#{{ currentTaskId }}</el-descriptions-item>
           <el-descriptions-item label="已标注数量">{{ annotations.length }} 个标签</el-descriptions-item>
         </el-descriptions>
+
+        <!-- 数据预览：复核必须能看到被标注的原始数据，否则无法判断标注是否正确 -->
+        <el-card shadow="never" style="margin-bottom: 12px">
+          <template #header>
+            <div class="ws-card-title"><span>数据预览</span></div>
+          </template>
+          <el-descriptions :column="{ xs: 1, sm: 2, md: 3 }" border size="small" style="margin-bottom: 12px">
+            <el-descriptions-item label="数据类型">{{ dataTypeText(assetInfo?.data_type) }}</el-descriptions-item>
+            <el-descriptions-item label="文件名">{{ assetInfo?.file_name || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="采样率">{{ assetInfo?.sample_rate || '—' }} Hz</el-descriptions-item>
+          </el-descriptions>
+          <!-- 与工作台一致：必须等签名 URL 就绪后再渲染 <video>/<audio>，
+               否则 src="" 会立刻抛 MEDIA_ERR_SRC_NOT_SUPPORTED(=4) 被误报为"格式不支持" -->
+          <div v-if="assetInfo?.data_type === 'video' && assetInfo?.file_path" class="preview-media">
+            <video
+              v-if="playUrl(assetInfo)"
+              :src="playUrl(assetInfo)"
+              controls
+              controlslist="nodownload"
+              style="max-width: 100%; max-height: 320px"
+              @error="onMediaError"
+            />
+            <div v-else class="preview-box"><p class="sub">{{ playUrlError || '视频加载中…' }}</p></div>
+          </div>
+          <div v-else-if="assetInfo?.data_type === 'audio' && assetInfo?.file_path" class="preview-media">
+            <audio
+              v-if="playUrl(assetInfo)"
+              :src="playUrl(assetInfo)"
+              controls
+              controlslist="nodownload"
+              style="width: 100%"
+              @error="onMediaError"
+            />
+            <div v-else class="preview-box"><p class="sub">{{ playUrlError || '音频加载中…' }}</p></div>
+          </div>
+          <div v-else-if="assetInfo?.data_type === 'eeg' || assetInfo?.data_type === 'ecg'" class="preview-media">
+            <div ref="rvEegRef" style="width: 100%; height: 320px"></div>
+          </div>
+          <div v-else class="preview-box">
+            <el-icon size="48"><component :is="dataTypeIcon" /></el-icon>
+            <p>{{ dataTypeText(assetInfo?.data_type) }} 数据</p>
+            <p class="sub">{{ assetInfo?.file_name || '—' }}</p>
+            <p class="sub" v-if="assetInfo?.file_format">格式：{{ assetInfo.file_format }}</p>
+          </div>
+        </el-card>
 
         <!-- 标注列表（可编辑） -->
         <div style="margin-bottom: 12px">
@@ -736,23 +789,38 @@ const groupTasks = ref([])
 const groupIndex = ref(0)
 const groupTaskStatus = ref('')
 const wsMode = ref('group') // 'group' | 'my_tasks'
-// 工作台 EEG 预览
+// EEG/ECG 预览容器：工作台（ws）与医生复核弹窗（rv）各持一份。
+// 两个 el-dialog 关闭后 DOM 仍保留，若共用同一个模板 ref 会互相覆盖。
 const wsEegRef = ref()
-let wsEegChart = null
-let wsEegReqSeq = 0  // EEG/ECG 图表加载请求序号：切换任务/卸载后丢弃过期响应
+const rvEegRef = ref()
+// 每个容器独立维护 { chart, chartEl, seq }：
+//   chartEl 记录图表绑定的 DOM 节点，容器被 v-if 重建后需重新 init，否则画在已脱离文档的节点上
+//   seq 为请求序号，切换任务/重建容器后丢弃过期响应，避免数据错配
+const eegSlots = {
+  ws: { chart: null, chartEl: null, seq: 0 },
+  rv: { chart: null, chartEl: null, seq: 0 },
+}
 
 const playSignedUrl = ref('')
+const playUrlError = ref('')   // 签名 URL 获取失败原因（对用户可见，不再静默吞掉）
 // 当前资产变化时异步获取短期签名 URL（媒体标签不支持 Authorization 头，
 // 用 5 分钟过期的资源绑定签名替代长期 JWT 进 URL，避免 token 泄漏）
 watch(assetInfo, (asset) => {
   playSignedUrl.value = ''
+  playUrlError.value = ''
   if (!asset?.id) return
   fetchSignedUrlApi({ kind: 'asset_play', asset_id: asset.id })
     .then((res) => {
       const url = res?.data?.url
-      if (url && assetInfo.value?.id === asset.id) playSignedUrl.value = url
+      if (assetInfo.value?.id !== asset.id) return
+      if (url) playSignedUrl.value = url
+      else playUrlError.value = '无法获取媒体播放地址（服务端未返回签名）'
     })
-    .catch(() => {})
+    .catch(() => {
+      if (assetInfo.value?.id === asset.id) {
+        playUrlError.value = '无法获取媒体播放地址（签名请求失败，请重试或检查网络）'
+      }
+    })
 }, { immediate: true })
 
 const playUrl = (asset) => (asset?.id && assetInfo.value?.id === asset.id) ? playSignedUrl.value : ''
@@ -765,7 +833,12 @@ const playUrl = (asset) => (asset?.id && assetInfo.value?.id === asset.id) ? pla
 // 仅 MEDIA_ERR_DECODE(3) / MEDIA_ERR_SRC_NOT_SUPPORTED(4) 表示格式不支持/损坏
 let lastMediaErrAt = 0
 const onMediaError = (e) => {
-  const code = e?.target?.error?.code
+  const el = e?.target
+  const code = el?.error?.code
+  // 空 src 是"签名 URL 尚未就绪"的中间态，浏览器会以 code=4
+  // (MEDIA_ELEMENT_ERROR: Empty src attribute) 报错，并非真实故障。
+  // 不排除掉的话，每次打开任务都会被下面的提示误报一次。
+  if (!el?.getAttribute?.('src')) return
   if (code === 1 || code === 2) return
   if (code !== undefined && code !== 3 && code !== 4) return
   const now = Date.now()
@@ -1256,25 +1329,35 @@ const openMyTasks = async () => {
   }
 }
 
-const loadWsEeg = async (assetId, dataType = 'eeg') => {
-  if (!wsEegRef.value) return
-  // 容器可能因对话框动画未完成而尺寸为 0，等待后重试
-  if (wsEegRef.value.offsetWidth === 0 || wsEegRef.value.offsetHeight === 0) {
-    setTimeout(() => loadWsEeg(assetId, dataType), 200)
+const loadWsEeg = async (assetId, dataType = 'eeg', slot = 'ws', retry = 0) => {
+  const container = (slot === 'rv' ? rvEegRef : wsEegRef).value
+  const state = eegSlots[slot] || eegSlots.ws
+  // 仅新一轮加载（retry=0）递增序号，使在途的旧请求作废；重试沿用同一序号
+  if (retry === 0) state.seq += 1
+  const seq = state.seq
+  // 容器可能尚未渲染（对话框动画未完成）或尺寸为 0，等待后重试（上限约 3s）
+  if (!container || container.offsetWidth === 0 || container.offsetHeight === 0) {
+    if (retry < 20) setTimeout(() => loadWsEeg(assetId, dataType, slot, retry + 1), 150)
     return
   }
-  // 请求序号：快速切换任务或组件卸载后，过期响应被丢弃，避免数据错配/写已销毁图表
-  const seq = ++wsEegReqSeq
-  if (!wsEegChart) wsEegChart = echarts.init(wsEegRef.value)
-  wsEegChart?.resize()
-  wsEegChart?.showLoading()
-  const chart = wsEegChart
+  // 容器被重建（如模态从 视频 切回 脑电）时旧图表绑在脱离文档的节点上，必须重新 init
+  if (state.chart && state.chartEl !== container) {
+    state.chart.dispose()
+    state.chart = null
+  }
+  if (!state.chart) {
+    state.chart = echarts.init(container)
+    state.chartEl = container
+  }
+  state.chart?.resize()
+  state.chart?.showLoading()
+  const chart = state.chart
   try {
     // 根据数据类型选择对应 API（EEG 返回多通道，ECG 返回单通道）
     const res = dataType === 'ecg'
       ? await getEcgAssetApi(assetId)
       : await getEegAssetApi(assetId)
-    if (seq !== wsEegReqSeq) return  // 过期响应丢弃
+    if (seq !== state.seq) return  // 过期响应丢弃
     if (res.code === 200 && res.data) {
       // 统一转换为 channels 数组格式
       let channels = []
@@ -1349,7 +1432,7 @@ const loadWsEeg = async (assetId, dataType = 'eeg') => {
       chart?.setOption({ title: { text: res.message || '解析失败', left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
     }
   } catch (e) {
-    if (seq !== wsEegReqSeq) return  // 过期响应丢弃
+    if (seq !== state.seq) return  // 过期响应丢弃
     chart?.hideLoading()
     const errText = dataType === 'ecg' ? '心电数据加载失败' : '脑电数据加载失败'
     chart?.setOption({ title: { text: errText, left: 'center', top: 'center', textStyle: { color: '#909399', fontSize: 14 } } }, true)
@@ -1390,8 +1473,8 @@ const switchTask = async (dir) => {
     const dtype2 = assetInfo.value?.data_type
     if ((dtype2 === 'eeg' || dtype2 === 'ecg') && assetInfo.value?.id) {
       setTimeout(() => loadWsEeg(assetInfo.value.id, dtype2), 100)
-    } else if (wsEegChart) {
-      wsEegChart.setOption({ series: [] }, true)
+    } else if (eegSlots.ws.chart) {
+      eegSlots.ws.chart.setOption({ series: [] }, true)
     }
   } catch (e) {
     ElMessage.error('切换任务失败，请重试')
@@ -1475,6 +1558,14 @@ const openReview = async (id) => {
       } catch (e) { /* ignore */ }
     }
     presetLabels.value = labels
+    // EEG/ECG 波形预览（延迟等待对话框动画完成、容器尺寸就绪）
+    const dtype = assetInfo.value?.data_type
+    if ((dtype === 'eeg' || dtype === 'ecg') && assetInfo.value?.id) {
+      setTimeout(() => loadWsEeg(assetInfo.value.id, dtype, 'rv'), 300)
+    } else if (eegSlots.rv.chart) {
+      // 切换为非信号模态时清掉复核侧残留波形，避免下一轮显示旧数据
+      eegSlots.rv.chart.setOption({ series: [] }, true)
+    }
   } catch (e) {
     ElMessage.error('任务详情加载失败')
   } finally {
@@ -1520,13 +1611,16 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', handleResize)
   // 使在途 EEG/ECG 请求失效，避免响应写已销毁图表
-  wsEegReqSeq++
+  eegSlots.ws.seq++
+  eegSlots.rv.seq++
   statusPieChart?.dispose()
   statusPieChart = null
   annotatorBarChart?.dispose()
   annotatorBarChart = null
-  wsEegChart?.dispose()
-  wsEegChart = null
+  eegSlots.ws.chart?.dispose()
+  eegSlots.ws.chart = null
+  eegSlots.rv.chart?.dispose()
+  eegSlots.rv.chart = null
 })
 </script>
 

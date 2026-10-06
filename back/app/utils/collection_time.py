@@ -7,15 +7,31 @@ DataAsset.timestamp_utc 此前在所有写入路径（create_asset / batch_creat
 upload_asset / scanner）均未赋值，DB 中恒为 NULL，导致导出界面展开受试者时
 "采集时间"列显示为 "-"。
 
-时区约定（实测确认）
---------------------
-采集端（AgeCog）把 epoch 毫秒格式化成字符串时使用**北京时间**：
-样例 userInfo.json 中 createDatetime="2026-06-14 12:50:46"，同目录 ID
-17814126460001001 的前 13 位 = 1781412646000 ms = UTC 2026-06-14 04:50:46，
-两者相差正好 +8h。文件名里的 14 位时间戳出自同一采集端，同为北京时间。
+时区约定（2026-10-06 实测修订，与本文档旧版结论相反）
+----------------------------------------------------
+⚠️ `_beijing_to_utc` 只对**平台自己生成的时间戳**有实测支持；对**设备侧字段**的
+时区假设已被证伪。改这一块前必须先读下面两条，并重跑判据。
+
+1. 平台生成的规范化名 / 入库名（`<模态>_<伪ID>_YYYYMMDDHHMMSS_...`）是**北京时间**。
+   例：`json_111111112_20260820223544_1_B01.json` 对应资产 `created_at`(UTC)
+   2026-08-20 14:35:43 → 北京 22:35:44，逐秒吻合。⇒ 对这类名字 `_beijing_to_utc` 正确。
+
+2. 设备侧 `userInfo.createDatetime` 实测是 **UTC**。判据：`userInfo.id` 的前 13 位
+   是采集端 epoch 毫秒（UTC 语义），把 createDatetime 按 UTC 解释后与之比较。
+   5 份 userInfo 的 Δ 全为 **0.000 h**。例：pseudo_id `17887542610890003` →
+   1788754261089 ms → 2026-09-07 04:11:01Z，同文件 createDatetime 一字不差。
+   原始输出见 `back/scripts/_diag_userinfo_tz.py` 与 `.workbuddy/memory/2026-10-06.md`。
+   （旧版文档据以立论的样例 `17814126460001001` / createDatetime `12:50:46` 现已无
+   userInfo 可复核，不能作准。）
+   ⇒ 后果：`parse_time_from_name()` 若要解析 createDatetime 这类**字符串**，会偏 -8h。
+   目前受试者表那条链是安全的 —— `scanner._parse_create_datetime` 对字符串是
+   **当 UTC 直接落库**、不走本模块。
 
 DB 列 timestamp_utc 存 UTC，展示时由 utils.time.to_local_str 加回 8 小时。
-因此本模块所有返回值统一为 **UTC（即北京时间 - 8h）**，可直接写库。
+因此本模块所有返回值统一为 **UTC（北京时间 - 8h）**，可直接写库。
+
+⛔ 别顺手把 createDatetime 也"统一"成北京时间 —— 那会让导出页「采集时间」列整体
+   偏移 8 小时。要改，先按上面判据重跑交叉验证。
 
 取值优先级（高 → 低）
 --------------------

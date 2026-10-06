@@ -104,7 +104,7 @@
           :label="fieldLabel(key)"
           :span="isLongVal(val) ? 2 : 1"
         >
-          <span class="snap-val">{{ formatVal(val) }}</span>
+          <span class="snap-val">{{ formatVal(privacy.mask(key, val)) }}</span>
         </el-descriptions-item>
       </el-descriptions>
       <template #footer>
@@ -120,6 +120,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, RefreshLeft } from '@element-plus/icons-vue'
 import { getSnapshotsApi, getSnapshotApi, rollbackSnapshotApi } from '@/api/data'
 import { useUserStore } from '@/stores/user'
+import { usePrivacyStore } from '@/stores/privacy'
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -128,6 +129,8 @@ const emit = defineEmits(['update:visible', 'rollback-success'])
 
 const userStore = useUserStore()
 const isAdmin = computed(() => userStore.role === 'admin')
+// 快照内容含受试者隐私字段，按右上角开关决定是否打码展示
+const privacy = usePrivacyStore()
 
 const modelTypeMap = {
   subject: '受试者',

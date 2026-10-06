@@ -59,6 +59,27 @@ def _ensure_schema_upgrade(database):
                     conn.commit()
             except Exception as e:
                 logger.warning("schema 升级失败: %s", e)
+        # desensitized_artifacts.source_mtime 由 FLOAT 提升为 DECIMAL(20,6)
+        # 根因见 app/models/desensitize_artifact.py 的列注释：MySQL 的 FLOAT 只有 4 字节，
+        # epoch 秒（≈1.79e9）在该精度下 ULP 高达 128 秒 → 落库再读出与真实 mtime 差
+        # 几十秒，**恒大于** desens_artifact._MTIME_TOL=1.0 → 所有脱敏产物被判"源已变化"，
+        # 导出复用永远命中不了（2026-10-06 真实容器实测偏差 30.018 s）。
+        # 幂等：已是 DECIMAL 就跳过；SQLite 不支持 MODIFY 且其 FLOAT 本就是 8 字节 REAL。
+        if "desensitized_artifacts" in inspector.get_table_names():
+            mt_col = next((c for c in inspector.get_columns("desensitized_artifacts")
+                           if c["name"] == "source_mtime"), None)
+            if mt_col and str(mt_col["type"]).upper().startswith("FLOAT"):
+                with database.engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            "ALTER TABLE desensitized_artifacts "
+                            "MODIFY COLUMN source_mtime DECIMAL(20, 6) NULL"))
+                        conn.commit()
+                        logger.info("schema 升级：desensitized_artifacts.source_mtime "
+                                    "FLOAT → DECIMAL(20,6)（原类型会丢失 mtime 精度）")
+                    except Exception as e:
+                        conn.rollback()
+                        logger.warning("source_mtime 列类型升级失败: %s", e)
         # annotation_tasks 表补 group_id / remark 字段
         if "annotation_tasks" in inspector.get_table_names():
             ann_cols = [c["name"] for c in inspector.get_columns("annotation_tasks")]
@@ -384,6 +405,17 @@ def create_app(env=None):
     # 清扫上次进程异常退出残留的导出临时 zip（单进程部署）
     from app.services.export_service import cleanup_orphan_export_zips
     cleanup_orphan_export_zips(logger=app.logger)
+
+    # 清扫 .desensitized/ 下无 DB 记录的脱敏产物残留文件
+    # （资产/受试者删除是"commit 后 best-effort 删磁盘"，中断就会留文件；
+    #  这些文件永远不会被复用逻辑引用，纯粹占空间，故启动时统一收掉）
+    try:
+        from app.utils.desens_artifact import cleanup_orphan_artifact_files
+        with app.app_context():
+            cleanup_orphan_artifact_files(app.config["DATA_LAKE_DIR"],
+                                          logger=app.logger)
+    except Exception as e:
+        app.logger.warning("脱敏产物残留文件清扫失败（不影响启动）: %s", e)
 
     # 初始化文件加密主密钥（启用加密时自动生成 master.key）
     if app.config.get("ENCRYPT_DATA_LAKE", True):

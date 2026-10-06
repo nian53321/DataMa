@@ -593,9 +593,6 @@
                       <el-option label="轻度" value="轻度" />
                       <el-option label="中度" value="中度" />
                       <el-option label="重度" value="重度" />
-                      <el-option label="正常" value="normal" />
-                      <el-option label="轻度认知障碍" value="mci" />
-                      <el-option label="痴呆" value="dementia" />
                       <el-option label="未评估" value="none" />
                     </el-select>
                   </el-form-item>
@@ -753,6 +750,55 @@
                     <el-checkbox v-model="exportForm.desensitize.eeg">脑电（EEG）</el-checkbox>
                     <el-checkbox v-model="exportForm.desensitize.ecg">心电（ECG）</el-checkbox>
                   </div>
+
+                  <!-- 视频马赛克档位：改动只影响"目标块/人脸比值"，不是越强越好 */
+                  <div
+                    v-if="exportForm.desensitize.enabled && exportForm.desensitize.video"
+                    style="margin-top: 8px; padding: 8px 10px; border: 1px solid #e4e7ed; border-radius: 6px"
+                  >
+                    <div style="display: flex; align-items: center; flex-wrap: wrap; gap: 8px">
+                      <span style="font-size: 13px">视频马赛克强度</span>
+                      <el-radio-group v-model="exportForm.desensitize.video_strength" size="small">
+                        <el-radio-button v-for="o in VIDEO_STRENGTH_OPTIONS" :key="o.value" :value="o.value">
+                          {{ o.label }}
+                        </el-radio-button>
+                      </el-radio-group>
+                      <span style="color: #909399; font-size: 12px">{{ currentVideoStrengthHint }}</span>
+                    </div>
+                    <div style="color: #909399; font-size: 12px; line-height: 1.6; margin-top: 4px">
+                      档位描述的是<b>目标块/人脸比值</b>：块边长按当帧人脸短边自适应分级，
+                      选级为<b>向上取整</b>，故实际比目标更粗（不会更细）—— 例如「加强」在大脸上实际约 1/3。
+                      实测 SFace 余弦在三档下均远低于同一人阈值 0.363，<b>默认取「最强」</b>（与清洗页
+                      「批量脱敏」同档）；<b>两侧档位必须一致</b>，否则导出时会因为配置指纹不同而重做。
+                    </div>
+                  </div>
+
+                  <!-- 复用已存脱敏产物（清洗页「批量脱敏」的产物） -->
+                  <div
+                    v-if="exportForm.desensitize.enabled && anyDesensModalityOn"
+                    style="margin-top: 8px; padding: 8px 10px; border: 1px solid #e4e7ed; border-radius: 6px"
+                  >
+                    <el-checkbox v-model="exportForm.desensitize.reuse_existing">
+                      优先复用已存脱敏文件
+                      <span style="color: #909399; font-size: 12px">
+                        — 取用「数据清洗及标准化 → 批量脱敏」的产物，跳过实时处理（视频是分钟级，复用后几乎秒出）
+                      </span>
+                    </el-checkbox>
+                    <div
+                      v-if="exportForm.desensitize.restore_kit"
+                      style="color: #e6a23c; font-size: 12px; line-height: 1.6; margin-top: 4px"
+                    >
+                      已勾选「随包附带还原包」，两者<b>按模态分工</b>：
+                      <b>音频 / 脑电 / 心电实时重做</b>——它们的还原参数要用本包一次性密钥派生噪声，
+                      与已存产物的平台密钥口径不同，混在一个包里会让还原清单自相矛盾（一部分能还原、一部分不能）；
+                      <b>视频 / 受试者信息照旧复用</b>——人脸马赛克与字段掩码<b>不可逆</b>，包内本就不存在
+                      任何可回推原文的参数，与密钥口径无关（否则一勾还原包就要把分钟级的人脸检测整包重跑）。
+                    </div>
+                    <div v-else style="color: #909399; font-size: 12px; line-height: 1.6; margin-top: 4px">
+                      仅当<b>脱敏配置一致、源文件未变、产物仍在</b>时才会命中；任一不符即回落到实时脱敏，
+                      绝不凑合用口径不同的产物。
+                    </div>
+                  </div>
                   <div
                     v-if="exportForm.desensitize.enabled && (exportForm.desensitize.eeg || exportForm.desensitize.ecg || exportForm.desensitize.audio || exportForm.encrypted)"
                     style="margin-top: 8px; padding: 8px 10px; border: 1px solid #e4e7ed; border-radius: 6px"
@@ -786,7 +832,7 @@
                       · <b>音频</b>：在定点 PCM 域加<b>确定性噪声</b>（按受试者 + 逻辑路径 + 声道派生，幅度 R 随录音响度自适应，SNR 约 -9.5 dB）破坏声纹（语音内容基本不可懂），<b>只改样本区</b>——RIFF 头块等其余字节一字不动，<b>采样率/声道/帧数逐样本不变</b>。非整数 PCM 的源（mp3/m4a/浮点 wav）会先转成 <b>16-bit PCM WAV</b>（文件名后缀同步改为 .wav）。仅作用于「音频」类型；<b>视频内音轨由「视频」开关处理（直接移除）</b>。凭导出时的同一密钥可<b>逐字节无损还原</b>（不再有变调带来的毫秒级时间漂移）
                     </div>
                     <div v-if="exportForm.desensitize.video">
-                      · <b>视频</b>：逐帧检测人脸，<b>只对人脸区域做不可逆马赛克（像素化）</b>——把脸区降采样成粗块再放大回来，块边长 = <b>人脸短边 ÷ 8</b>（按当帧人脸大小自适应分级，脸越近块越粗），背景/身体/衣着逐像素保留。实测 4 档人脸尺度（脸短边 37 / 77 / 116 / 151 px）SFace 余弦 = <b>0.114 / 0.043 / 0.063 / 0.062</b>，全部远低于同一人判定阈值 0.363（旧版模糊档最差 0.260，已贴近阈值）；YuNet 在脱敏画面上<b>四档全部检不出人脸</b>。块内像素被整块替换，属于<b>结构性破坏</b>而非「只是更糊」：<b>脱敏后人脸区域不能再做任何下游人脸分析</b>（检测 / 关键点 / 表情 / 视线均不可用），旧版「弱模糊仍可定位大致位置」的说法已不再成立；人脸以外的发型轮廓、体型、衣着等软生物特征不在覆盖范围内。<b>音轨一律移除</b>（视频音轨含声纹，音频开关只作用于「音频」类型资产）；输出统一重编码为 <b>H.264 MP4</b>（文件名后缀同步改为 .mp4），<b>无法还原</b>——不写还原清单（包内不存在可回推参数）。加密导出时该文件仍会被随包脚本<b>解密</b>，但解出来的仍是人脸马赛克（像素化）的视频。仅支持单视频轨，含深度/红外多轨的录制会被跳过并提示
+                      · <b>视频</b>：逐帧检测人脸，<b>只对人脸区域做不可逆马赛克（像素化）</b>——把脸区降采样成粗块再放大回来，块边长按当帧人脸大小<b>自适应分级</b>（脸越近块越粗），当前档位 <b>{{ videoStrengthLabel }}</b>（目标 ≈ 人脸短边 ÷ {{ videoStrengthDivisor }}），背景/身体/衣着逐像素保留。实测 4 档人脸尺度（脸短边 37 / 77 / 116 / 151 px）SFace 余弦 = <b>0.114 / 0.043 / 0.063 / 0.062</b>，全部远低于同一人判定阈值 0.363（旧版模糊档最差 0.260，已贴近阈值）；YuNet 在脱敏画面上<b>四档全部检不出人脸</b>。块内像素被整块替换，属于<b>结构性破坏</b>而非「只是更糊」：<b>脱敏后人脸区域不能再做任何下游人脸分析</b>（检测 / 关键点 / 表情 / 视线均不可用），旧版「弱模糊仍可定位大致位置」的说法已不再成立；人脸以外的发型轮廓、体型、衣着等软生物特征不在覆盖范围内。<b>音轨一律移除</b>（视频音轨含声纹，音频开关只作用于「音频」类型资产）；输出统一重编码为 <b>H.264 MP4</b>（文件名后缀同步改为 .mp4），<b>无法还原</b>——不写还原清单（包内不存在可回推参数）。加密导出时该文件仍会被随包脚本<b>解密</b>，但解出来的仍是人脸马赛克（像素化）的视频。仅支持单视频轨，含深度/红外多轨的录制会被跳过并提示
                     </div>
                     <div v-if="exportForm.desensitize.eeg">
                       · <b>脑电</b>：逐通道按信号幅度自适应加噪，破坏脑纹可识别性；<b>全列保留</b>——列名、通道数、采样点数均不变，绝对时间列（Timestamp / Board Timestamp）做<b>整列常量平移</b>（保持采样间隔与单调递增，无法定位真实采集时刻）。实测：波形相关约 0.99（时间结构仍可用），频带功率占比改变 20%~43%、通道间相干性下降 6%~52%（随原始通道间相关性而变）；凭导出时的同一密钥可<b>逐字节无损还原</b>
@@ -836,6 +882,44 @@
                       <el-tag v-for="(count, type) in exportPreview.byType" :key="type" size="small" type="info">
                         {{ exportTypeText(type) }} × {{ count }}
                       </el-tag>
+                    </div>
+                    <!-- 复用状态：让用户提前知道"这次导出是秒出还是要等几分钟" -->
+                    <div
+                      v-if="exportPreview.totalCount > 0 && exportPreview.reuse.requested"
+                      style="margin-top: 8px; font-size: 12px; line-height: 1.7"
+                    >
+                      <template v-if="exportPreview.reuse.enabled">
+                        <el-tag size="small" type="success" effect="plain">复用已存脱敏文件</el-tag>
+                        <span style="color: #67c23a; margin-left: 6px">
+                          <b>{{ exportPreview.reuse.reusable_count }}</b> / {{ exportPreview.reuse.to_process_count }} 个待脱敏文件可直接取用已有产物
+                        </span>
+                        <span
+                          v-if="exportPreview.reuse.to_process_count > exportPreview.reuse.reusable_count"
+                          style="color: #909399"
+                        >
+                          ，其余 {{ exportPreview.reuse.to_process_count - exportPreview.reuse.reusable_count }} 个将实时脱敏（无产物或配置不一致）
+                        </span>
+                      </template>
+                      <template v-else>
+                        <el-tag size="small" type="warning" effect="plain">复用未生效</el-tag>
+                        <span style="color: #e6a23c; margin-left: 6px">
+                          <template v-if="exportPreview.reuse.blocked_by_restore_kit">
+                            本次待脱敏文件均为 {{ blockedModalityText }}：已勾选「随包附带还原包」→
+                            与已存产物的密钥口径冲突，将<b>全部实时脱敏</b>
+                          </template>
+                          <template v-else>
+                            本次没有可直接取用的已存脱敏产物，将<b>全部实时脱敏</b>
+                          </template>
+                        </span>
+                      </template>
+                      <!-- 部分被挡：说清"哪几类、多少个"要实时重做，避免被误读成"复用整个没生效" -->
+                      <div
+                        v-if="exportPreview.reuse.enabled && exportPreview.reuse.blocked_by_restore_kit"
+                        style="color: #e6a23c; margin-top: 2px"
+                      >
+                        另有 {{ exportPreview.reuse.blocked_count }} 个（{{ blockedModalityText }}）因勾选「随包附带还原包」改为<b>实时重做</b>
+                        —— 还原包的噪声用本包一次性密钥派生，与已存产物的平台密钥口径冲突
+                      </div>
                     </div>
                   </div>
                   <div v-else-if="!exportPreview.loading" style="font-size: 12px; color: #909399">
@@ -2339,6 +2423,11 @@ const exportLayerOptions = [
   { label: '标注层 annotation', value: 'annotation' },
 ]
 
+// ⚠️ 视频马赛克默认档必须与**清洗页「批量脱敏」**（views/data/index.vue 的 desensConfig）
+//    取同一个值：两侧一旦分叉，导出复用会静默失效（产物配置指纹不匹配 ⇒ 视频整个重跑一遍）。
+//    后端唯一口径见 `app/utils/video_desensitize.py::DEFAULT_VIDEO_STRENGTH`。
+const DEFAULT_VIDEO_STRENGTH = 'strongest'
+
 const exportForm = reactive({
   data_types: [],
   layers: [],
@@ -2348,8 +2437,8 @@ const exportForm = reactive({
   //   userinfo → userInfo 文件字段级脱敏
   //   audio    → 音频声纹脱敏（定点 PCM 域确定性加噪，可逆；只改样本区，帧数/采样率不变）
   //   video    → 视频人脸区域脱敏（逐帧检测 + 人脸区不可逆马赛克 + 移除音轨）
-  //                马赛克块边长按人脸短边自适应（= 人脸短边 / 8）；v3 起不再用模糊，
-  //                因为模糊加大到一定程度后 SFace 余弦会回升（越糊越像同一人）
+  //                马赛克块边长按人脸短边自适应分级（档位见 video_strength）；
+  //                v3 起不再用模糊，因为模糊加大到一定程度后 SFace 余弦会回升（越糊越像同一人）
   //   eeg      → 脑电值级脱敏（全列保留：信号列加噪 + 绝对时间列整列平移）
   //   ecg      → 心电值级脱敏（全列保留：value 列加噪，heart_rate 列同样加噪）
   //   restore_kit → 随包附带「还原包」：离线还原脚本 + 本包专用密钥 + 说明
@@ -2357,6 +2446,18 @@ const exportForm = reactive({
   //                 ⚠️ 附带密钥等于把"脱敏"降级为"加扰"：若不希望接收方能还原，需手动取消勾选
   //                 注：视频脱敏不可逆（马赛克），不在还原包覆盖范围内；且脱敏后
   //                     人脸区域无法再被检测/识别，下游人脸分析不可用
+  //   video_strength → 视频马赛克档位（standard=标准 / strong=加强 / strongest=最强(默认)）
+  //                    ⚠️ 必须与清洗页「批量脱敏」同档，否则导出复用静默失效（见 DEFAULT_VIDEO_STRENGTH）
+  //                 名称只描述方向与相对关系，不承诺字面比值：选级是"向上取整"，
+  //                 实际块/人脸落在 [目标, 目标×2)，加强档在大脸上实际约 1/3
+  //   reuse_existing → 优先复用「数据清洗及标准化 → 批量脱敏」已落盘的产物，
+  //                 跳过实时脱敏（视频脱敏是分钟级，复用后几乎秒出）
+  //                 ⚠️ 与 restore_kit **按模态分工**（不是互斥）：还原包改用本包
+  //                    一次性密钥派生噪声 ⇒ 只有**可逆模态**（音频/脑电/心电 —— 噪声
+  //                    密钥要写进还原清单）必须实时重做；**不可逆模态**（视频/受试者
+  //                    信息）包内不存在可回推参数、与密钥口径无关，照旧复用。
+  //                    预览处会分别报"可复用几个 / 被挡下几个"
+  //                    （判定唯一出口：backend `export_service._reuse_allowed_for`）
   desensitize: {
     enabled: true,
     userinfo: true,
@@ -2365,6 +2466,8 @@ const exportForm = reactive({
     eeg: true,
     ecg: true,
     restore_kit: true,
+    video_strength: DEFAULT_VIDEO_STRENGTH,
+    reuse_existing: true,
   },
 })
 const exportSubjectList = ref([])
@@ -2463,11 +2566,11 @@ const exportToggleAllSubjects = () => {
 }
 
 const exportRiskText = (level) => {
-  const m = { normal: '正常', mci: '轻度障碍', dementia: '痴呆', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }
+  const m = { '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }
   return m[level] || '未评估'
 }
 const exportRiskTagType = (level) => {
-  const m = { normal: 'success', mci: 'warning', dementia: 'danger', '无': 'info', '轻度': 'warning', '中度': 'danger', '重度': 'danger' }
+  const m = { '无': 'info', '轻度': 'warning', '中度': 'danger', '重度': 'danger' }
   return m[level] || 'info'
 }
 
@@ -2488,7 +2591,54 @@ const exportPreview = reactive({
   byType: {},
   byLayer: {},
   items: [],
+  // 复用已存脱敏产物统计（仅勾了「优先复用已存脱敏文件」时后端才查表）
+  reuse: {
+    enabled: false,
+    requested: false,
+    // 勾了还原包时**可逆模态**（音频/脑电/心电）的复用被挡下 —— 不是整体关闭：
+    // 不可逆模态（视频/受试者信息）仍照旧复用，故用 blocked_modalities 说清"是哪几类"
+    blocked_by_restore_kit: false,
+    blocked_modalities: [],
+    blocked_count: 0,
+    reusable_count: 0,
+    to_process_count: 0,
+    by_modality: {},
+  },
 })
+
+// 视频马赛克档位：名称只描述方向与相对关系，不承诺字面比值。
+// 选级是"向上取整"且阶梯步长 2.0 → 实际块/人脸落在 [目标, 目标×2)。
+// 与清洗页 VIDEO_STRENGTH_OPTIONS 同一套口径（后端唯一出口见 video_desensitize 常量区）。
+const VIDEO_STRENGTH_OPTIONS = [
+  { value: 'standard', label: '标准', hint: '目标 ≈ 人脸短边 ÷ 8（历史口径）', divisor: 8 },
+  { value: 'strong', label: '加强', hint: '目标 ≈ 人脸短边 ÷ 6', divisor: 6 },
+  { value: 'strongest', label: '最强', hint: '目标 ≈ 人脸短边 ÷ 4（默认）', divisor: 4 },
+]
+const _videoStrengthOption = computed(() =>
+  VIDEO_STRENGTH_OPTIONS.find(o => o.value === exportForm.desensitize.video_strength)
+  || VIDEO_STRENGTH_OPTIONS.find(o => o.value === DEFAULT_VIDEO_STRENGTH))
+const currentVideoStrengthHint = computed(() => _videoStrengthOption.value.hint)
+const videoStrengthLabel = computed(() => _videoStrengthOption.value.label)
+const videoStrengthDivisor = computed(() => _videoStrengthOption.value.divisor)
+
+// 是否勾了任一需要脱敏的模态（决定"复用开关"是否有意义）
+const anyDesensModalityOn = computed(() => {
+  const d = exportForm.desensitize
+  return !!(d.userinfo || d.audio || d.video || d.eeg || d.ecg)
+})
+
+// 「随包还原包」挡下复用的模态名（后端只回模态 key，中文文案在前端拼）
+//
+// ⚠️ 这**不再是"二选一"**：勾还原包只挡**可逆模态**（音频/脑电/心电 —— 噪声密钥要写进
+// 还原清单，作用域不同就不能混包），**不可逆模态**（视频/受试者信息）包内不存在可回推
+// 原文的参数、与密钥口径无关，照旧复用（视频是分钟级，这是复用收益最大的一类）。
+// 判定唯一出口是后端 `export_service._reuse_allowed_for`。
+const MODALITY_TEXT = {
+  userinfo: '受试者信息', audio: '音频', video: '视频', eeg: '脑电', ecg: '心电',
+}
+const blockedModalityText = computed(() =>
+  (exportPreview.reuse.blocked_modalities || [])
+    .map(m => MODALITY_TEXT[m] || m).join(' / '))
 
 let _exportPreviewTimer = null
 const refreshExportPreview = () => {
@@ -2499,10 +2649,27 @@ const refreshExportPreview = () => {
 const _doRefreshExportPreview = async () => {
   exportPreview.loading = true
   try {
+    const d0 = exportForm.desensitize
     const res = await exportPreviewApi({
       subject_ids: exportSelectedSubjects.value.map(s => s.id),
       data_types: exportForm.data_types,
       layers: exportForm.layers,
+      // 必须把脱敏配置一起送过去：后端的"可复用数量"依赖本次配置指纹
+      // （含视频档位）—— 不传就会出现"预览说能复用、导出却全量重跑"
+      desensitize: {
+        enabled: d0.enabled,
+        userinfo: d0.userinfo,
+        audio: d0.audio,
+        video: d0.video,
+        eeg: d0.eeg,
+        ecg: d0.ecg,
+        video_strength: d0.video_strength,
+        reuse_existing: d0.reuse_existing,
+        // ⚠️ 必须传：后端的"哪几类被还原包挡下"（blocked_modalities/blocked_count）
+        // 依赖它。漏传时后端按缺省 False 算 ⇒ 界面显示"可复用 N 个"、实际导出却把
+        // 它们全部实时重做（两端静默不一致，2026-10-06 修）
+        restore_kit: d0.restore_kit,
+      },
     })
     const d = res.data || {}
     exportPreview.totalCount = d.total_count || 0
@@ -2510,6 +2677,7 @@ const _doRefreshExportPreview = async () => {
     exportPreview.byType = d.by_type || {}
     exportPreview.byLayer = d.by_layer || {}
     exportPreview.items = d.items || []
+    exportPreview.reuse = Object.assign({}, exportPreview.reuse, d.reuse || {})
     exportPreview.loaded = true
   } catch {
     exportPreview.loaded = false
@@ -2519,7 +2687,10 @@ const _doRefreshExportPreview = async () => {
 }
 
 watch(
-  [exportSelectedSubjects, () => exportForm.data_types, () => exportForm.layers],
+  [exportSelectedSubjects, () => exportForm.data_types, () => exportForm.layers,
+   () => exportForm.desensitize.enabled, () => exportForm.desensitize.reuse_existing,
+   () => exportForm.desensitize.video_strength, () => exportForm.desensitize.restore_kit,
+   anyDesensModalityOn],
   refreshExportPreview,
   { deep: true },
 )

@@ -33,9 +33,10 @@
           style="width: 140px"
           @change="onSearch"
         >
-          <el-option label="正常" value="normal" />
-          <el-option label="轻度认知障碍" value="mci" />
-          <el-option label="痴呆" value="dementia" />
+          <el-option label="无" value="无" />
+          <el-option label="轻度" value="轻度" />
+          <el-option label="中度" value="中度" />
+          <el-option label="重度" value="重度" />
           <el-option label="未评估" value="none" />
         </el-select>
         <el-select
@@ -152,14 +153,6 @@
           <el-descriptions-item label="MoCA">{{ subjectInfo?.moca_score ?? '—' }}</el-descriptions-item>
           <el-descriptions-item label="AD8">{{ subjectInfo?.ad8_score ?? '—' }}</el-descriptions-item>
         </el-descriptions>
-      </el-card>
-
-      <!-- 统一时间轴工具栏 -->
-      <el-card style="margin-bottom: 16px">
-        <div class="timeline-toolbar">
-          <el-tag>粒度 10ms</el-tag>
-          <el-tag type="success" style="margin-left: 8px">已对齐 {{ tracks.length }} 路信号</el-tag>
-        </div>
       </el-card>
 
       <!-- 分模态可视化 -->
@@ -842,7 +835,6 @@ const filteredFileAssets = computed(() => fileAssetList.value.filter((a) => {
 }))
 
 const riskText = (r) => ({
-  normal: '正常', mci: '轻度认知障碍', dementia: '痴呆',
   '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度',
 }[r] || (r || '未评估'))
 
@@ -1487,7 +1479,7 @@ const updateRadarChart = () => {
           s.mmse_score ?? 0,
           s.moca_score ?? 0,
           s.ad8_score ?? 0,
-          { normal: 1, mci: 2, dementia: 3, '无': 0, '轻度': 1, '中度': 2, '重度': 3 }[s.cognitive_risk_level] ?? 0,
+          { '无': 0, '轻度': 1, '中度': 2, '重度': 3 }[s.cognitive_risk_level] ?? 0,
         ],
         name: '量表得分',
       }],
@@ -1847,7 +1839,8 @@ const loadSubjects = async () => {
 // 概览图表：风险分级饼图 + 模态分布柱状图
 const updateOverviewCharts = () => {
   if (riskPieChart) {
-    const counts = { normal: 0, mci: 0, dementia: 0, unknown: 0, '无': 0, '轻度': 0, '中度': 0, '重度': 0 }
+    // 认知风险分级仅 无/轻度/中度/重度 四级（2026-10-06 统一）
+    const counts = { unknown: 0, '无': 0, '轻度': 0, '中度': 0, '重度': 0 }
     allSubjects.value.forEach((s) => {
       const r = s.cognitive_risk_level
       if (r in counts) counts[r]++
@@ -1858,9 +1851,6 @@ const updateOverviewCharts = () => {
       { name: '轻度', value: counts['轻度'], itemStyle: { color: '#e6a23c' } },
       { name: '中度', value: counts['中度'], itemStyle: { color: '#f56c6c' } },
       { name: '重度', value: counts['重度'], itemStyle: { color: '#f56c6c' } },
-      { name: '正常', value: counts.normal, itemStyle: { color: '#67c23a' } },
-      { name: '轻度认知障碍', value: counts.mci, itemStyle: { color: '#e6a23c' } },
-      { name: '痴呆', value: counts.dementia, itemStyle: { color: '#f56c6c' } },
     ]
     if (counts.unknown) data.push({ name: '未评估', value: counts.unknown, itemStyle: { color: '#909399' } })
     riskPieChart.setOption({
@@ -1874,8 +1864,11 @@ const updateOverviewCharts = () => {
     }, true)
   }
   if (assetBarChart) {
-    const typeText = { video: '视频', audio: '音频', eeg: '脑电', ecg: '心电', eye: '眼动', gait: '步态', scale: '量表', task: '任务' }
-    const types = ['video', 'audio', 'eeg', 'ecg', 'eye', 'gait', 'scale', 'task']
+    // 模态分布不含步态（2026-10-06 需求）：types 是硬编码类别列表，
+    // 数据源里没有 gait 资产时仍会画出 0 值空柱，故从列表中移除
+    const typeText = { video: '视频', audio: '音频', eeg: '脑电', ecg: '心电', eye: '眼动', scale: '量表', task: '任务' }
+    const types = ['video', 'audio', 'eeg', 'ecg', 'eye', 'scale', 'task']
+    const typeColor = ['#409eff', '#67c23a', '#e6a23c', '#f56c6c', '#909399', '#00bcd4', '#ff9800']
     const counts = types.map((t) => allAssets.value.filter((a) => a.data_type === t).length)
     assetBarChart.setOption({
       tooltip: { trigger: 'axis' },
@@ -1884,7 +1877,7 @@ const updateOverviewCharts = () => {
       yAxis: { type: 'value', minInterval: 1 },
       series: [{
         type: 'bar', barWidth: '50%',
-        data: counts.map((c, i) => ({ value: c, itemStyle: { color: ['#409eff', '#67c23a', '#e6a23c', '#f56c6c', '#909399', '#9c27b0', '#00bcd4', '#ff9800'][i] } })),
+        data: counts.map((c, i) => ({ value: c, itemStyle: { color: typeColor[i] } })),
         label: { show: true, position: 'top' },
       }],
     }, true)
@@ -1935,10 +1928,6 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped lang="scss">
-.timeline-toolbar {
-  display: flex;
-  align-items: center;
-}
 .stat-card {
   :deep(.el-card__body) {
     display: flex;

@@ -31,7 +31,15 @@ from app.models import DataAsset, DataType, DataLayer, Subject
 from app.services.base import BaseService, ValidationError, NotFoundError
 from app.services.asset_service import _decrypt_for_serving
 from app.services.subject_service import _remove_file_safely
+from app.models.desensitize_artifact import (
+    MODALITY_AUDIO, MODALITY_ECG, MODALITY_EEG, MODALITY_LABELS,
+    MODALITY_USERINFO, MODALITY_VIDEO,
+)
 from app.utils.audit import log_operation
+from app.utils.desens_artifact import (
+    REVERSIBLE_MODALITIES, artifact_abspath, artifact_reuse_blocker,
+    artifacts_for_assets, decrypt_artifact_to_temp, desens_config_hash,
+)
 from app.utils.audio_desensitize import desensitize_audio_file
 from app.utils.crypto import (encrypt_bytes, encrypt_bytes_with_key,
                               get_key_fingerprint, is_encrypted_file,
@@ -45,7 +53,9 @@ from app.utils.signal_desensitize import (
     use_hmac_key,
 )
 from app.utils.restore_kit import build_kit_files
-from app.utils.video_desensitize import desensitize_video_file_parallel
+from app.utils.video_desensitize import (
+    DEFAULT_VIDEO_STRENGTH, desensitize_video_file_parallel,
+)
 
 
 # ==================== 打包压缩策略 ====================
@@ -193,6 +203,8 @@ class ExportService(BaseService):
                 eeg: bool,               # 脑电值级脱敏（全列保留，可逆）
                 ecg: bool,               # 心电值级脱敏（全列保留，可逆）
                 video: bool,             # 视频人脸区域脱敏（不可逆，音轨移除）
+                video_strength: str,     # 视频马赛克档位（standard/strong/strongest）
+                reuse_existing: bool,    # 优先复用「批量脱敏」已落盘的产物
             }
             # 旧版单模态键，仍兼容（仅在 desensitize 缺省时生效）：
             desensitized: bool           # → userinfo
@@ -214,14 +226,16 @@ class ExportService(BaseService):
         """
         encrypted = bool(payload.get("encrypted", True))
         desens = _resolve_desens_config(payload)
+        build_stats = {}
         if assets is None:
             assets = self._resolve_assets(payload)
             self._validate_limits(assets)
         zip_path, skipped = self._build_zip(
             assets, encrypted, desens=desens,
-            progress_callback=progress_callback)
+            progress_callback=progress_callback, stats=build_stats)
         self._log_audit(assets, encrypted, skipped_count=len(skipped),
-                        desens=desens, skipped=skipped)
+                        desens=desens, skipped=skipped,
+                        reused_count=build_stats.get("reused_files", 0))
         return zip_path, self._build_filename(encrypted), skipped
 
     def resolve_assets(self, payload: dict):
@@ -235,6 +249,10 @@ class ExportService(BaseService):
 
         供导出界面在选择条件变化时实时展示"将导出哪些数据资产"，
         并提前暴露超限风险（文件数/总大小），避免用户提交后才被拒绝。
+
+        v7 起额外返回 ``reuse``：勾了「优先复用已存脱敏文件」时，说明本次有多少个
+        文件能直接复用、有多少会被实时处理（**否则用户无从判断这次导出是秒出
+        还是要等几分钟**）。未勾选复用时不查产物表，预览零额外开销。
         """
         assets = self._resolve_assets(payload, require_nonempty=False)
         total_count = len(assets)
@@ -244,6 +262,9 @@ class ExportService(BaseService):
         subjects = {}
         if subject_ids:
             subjects = {s.id: s for s in Subject.query.filter(Subject.id.in_(subject_ids)).all()}
+
+        desens = _resolve_desens_config(payload)
+        reuse = self._reuse_summary(assets, desens)
 
         by_type, by_layer = {}, {}
         items = []
@@ -262,6 +283,7 @@ class ExportService(BaseService):
                     "file_size": int(a.file_size or 0),
                     "pseudo_id": subject.pseudo_id if subject else f"subject_{a.subject_id}",
                     "real_name": subject.real_name if subject else None,
+                    "reusable": reuse["reusable_ids"].get(a.id, False),
                 })
 
         return {
@@ -273,7 +295,70 @@ class ExportService(BaseService):
             "by_type": by_type,
             "by_layer": by_layer,
             "items": items,
+            "reuse": {k: v for k, v in reuse.items() if k != "reusable_ids"},
         }
+
+    def _reuse_summary(self, assets: List[DataAsset], desens: dict) -> dict:
+        """统计本次导出可复用多少已存脱敏产物
+
+        未勾选复用（或未勾任何脱敏模态）时直接短路，**不查产物表**。
+
+        返回：``{enabled, requested, blocked_by_restore_kit, blocked_modalities,
+        blocked_count, reusable_count, to_process_count, by_modality, reusable_ids}``
+        （``reusable_ids`` 供明细行打标，不进 API 响应）
+
+        ⚠️ ``to_process_count`` 是**全部**待脱敏资产数，``reusable_count`` 只统计
+        本次真正能复用的（两者之差 = 要实时跑的量）。``blocked_*`` 说明"为什么有些
+        文件明明有产物却没用上" —— 勾了还原包时可逆模态必然落空，不说清楚用户会以为
+        页面在偷偷重跑。
+        """
+        blocked_mods = _reuse_blocked_modalities(desens)
+        out = {
+            "enabled": False,
+            "requested": bool(desens.get("reuse_requested")),
+            # 兼容旧字段名：含义收窄为"确实有模态被还原包挡下"（不再是"整体被关掉"）
+            "blocked_by_restore_kit": bool(blocked_mods),
+            "blocked_modalities": blocked_mods,
+            "blocked_count": 0,
+            "reusable_count": 0,
+            "to_process_count": 0,
+            "by_modality": {},
+            "reusable_ids": {},
+        }
+        if not desens.get("reuse_existing"):
+            return out
+        # 需要脱敏的资产（未勾模态的资产本来就不走脱敏，和复用无关）
+        targets = [a for a in assets if _desens_enabled_for(_asset_modality(a), desens)]
+        out["to_process_count"] = len(targets)
+        # 被还原包挡下的部分：先数出来（否则"全被挡"时会因提前 return 而报成 0）
+        out["blocked_count"] = sum(
+            1 for a in targets if _asset_modality(a) in blocked_mods)
+        # 只查"本次允许复用"的资产：可逆模态在勾还原包时必然落空，没必要查表
+        reuse_targets = [a for a in targets
+                         if _reuse_allowed_for(_asset_modality(a), desens)]
+        out["enabled"] = bool(reuse_targets)
+        if not reuse_targets:
+            return out
+
+        storage_root = current_app.config["DATA_LAKE_DIR"]
+        mapping = artifacts_for_assets([a.id for a in reuse_targets])
+        for asset in reuse_targets:
+            modality = _asset_modality(asset)
+            row = (mapping.get(asset.id) or {}).get(modality)
+            if row is None:
+                continue
+            if not asset.file_path:
+                continue
+            blocker = artifact_reuse_blocker(
+                row, storage_root,
+                desens_config_hash(modality, {"strength": desens.get("video_strength")}),
+                os.path.join(storage_root, asset.file_path))
+            if blocker is not None:
+                continue
+            out["reusable_ids"][asset.id] = True
+            out["reusable_count"] += 1
+            out["by_modality"][modality] = out["by_modality"].get(modality, 0) + 1
+        return out
 
     # ==================== 私有辅助 ====================
 
@@ -362,7 +447,8 @@ class ExportService(BaseService):
             )
 
     def _build_zip(self, assets: List[DataAsset], encrypted: bool,
-                   desens: dict = None, progress_callback=None) -> Tuple[str, list]:
+                   desens: dict = None, progress_callback=None,
+                   stats: dict = None) -> Tuple[str, list]:
         """构建 zip 临时文件
 
         - encrypted=True：原 DMEC 加密文件直接打包，arcname 追加 .dmec 后缀
@@ -375,6 +461,19 @@ class ExportService(BaseService):
             ecg      → 心电值级脱敏（全列保留：value 列加噪，heart_rate 列同样加噪）
             video    → 视频人脸区域脱敏（逐帧检测 + 人脸区不可逆马赛克 + 移除音轨）
             restore_kit → 是否随包附带"还原包"（离线还原脚本 + 本包专用密钥 + 说明）
+            reuse_existing → 优先复用「批量脱敏」已落盘的产物
+          `reuse_existing` 的产物来自 `AssetDesensitizeService`（清洗页「批量脱敏」），
+          **同一套脱敏实现**、同一份路径派生口径，只是结果留档在
+          `{DATA_LAKE_DIR}/.desensitized/` 而不是直接塞进 zip。命中条件三缺一不可：
+          配置指纹一致（含视频档位）+ 源文件未变（size/mtime）+ 产物文件仍在；
+          不命中就静默落到实时脱敏（但会逐条记日志说明原因）。
+          ⚠️ 勾了 `restore_kit` 时复用**按模态分别对待**（见 :func:`_reuse_allowed_for`）：
+          还原包改用本包一次性密钥派生噪声 ⇒ 只有**可逆模态**（音频/脑电/心电 ——
+          噪声密钥要写进还原清单）才与已存产物（平台密钥口径）冲突，改为实时重做；
+          **不可逆模态**（视频人脸马赛克 / userInfo 字段掩码）包里不存在可回推参数，
+          照旧复用 —— 否则一勾还原包就要把分钟级的人脸检测整包重跑一遍。
+          带还原包的加密导出里，复用来的产物密文会被 `rewrap_dmec_file` **流式重包裹**
+          到本包主密钥（内容密文逐字节不变），否则接收方用包内 `master.key` 解不开。
           video 是唯一**不可逆**的脱敏项：马赛克是结构性破坏（块内像素被整块替换，
           原始细节已不存在），与 EEG/ECG/音频的值级脱敏不同，故不写 manifest、
           不参与 restore_kit（包内不存在任何可回推原人脸的参数）。
@@ -400,6 +499,8 @@ class ExportService(BaseService):
           stage=, current=, frame_hint=)：可选进度回调。每个文件**开始处理前**与
           处理完后各上报一次，收尾阶段（写 manifest / 还原包 / 关闭压缩包）单独上报；
           百分比口径见 :func:`_progress_percent`（按字节加权，不按文件数）
+        :param stats: 可选输出字典；会写入 ``{"reused_files": int}``
+          （复用已存脱敏产物的文件数，供审计日志说明"这次到底重跑了多少"）
         :return: (zip_tmp_path, skipped_errors)
         """
         desens = desens or {}
@@ -408,6 +509,21 @@ class ExportService(BaseService):
         do_eeg = bool(desens.get("eeg"))
         do_ecg = bool(desens.get("ecg"))
         do_video = bool(desens.get("video"))
+        # 复用「批量脱敏」已落盘的产物：产物表**只查一次**（逐资产 query 会 N+1，
+        # 导出动辄上百个资产）。命中判据见 `desens_artifact.artifact_reuse_blocker`。
+        do_reuse = bool(desens.get("reuse_existing"))
+        reuse_map = artifacts_for_assets([a.id for a in assets]) if do_reuse else {}
+        reused_desensitized_files = 0
+        # 被「随包还原包」挡下复用的模态（只可能是可逆模态：音频/脑电/心电）。
+        # 不可逆模态（视频/受试者信息）照旧复用 —— 包里没有可回推原文的参数，
+        # 与密钥口径无关，连带禁掉只会白白重跑分钟级的人脸检测。
+        reuse_blocked_mods = _reuse_blocked_modalities(desens)
+        if reuse_blocked_mods:
+            current_app.logger.warning(
+                "本次导出勾选了「随包附带还原包」⇒ %s 的已存脱敏产物**不复用**"
+                "（还原包用本包一次性密钥派生噪声，与平台密钥口径的产物混在一个包里会让"
+                "还原清单自相矛盾），这几类改为实时脱敏；视频/受试者信息不受影响，仍复用。",
+                "/".join(MODALITY_LABELS.get(m, m) for m in reuse_blocked_mods))
         storage_root = current_app.config["DATA_LAKE_DIR"]
         # 预加载受试者 pseudo_id（避免 N+1 查询）
         subject_ids = {a.subject_id for a in assets}
@@ -516,7 +632,107 @@ class ExportService(BaseService):
                         # 同一套噪声，还原方不必关心当初是哪种导出模式
                         logical_path = f"{pseudo_id}/{layer}/{data_type}/{file_name}"
 
-                        if do_userinfo and _is_userinfo_asset(asset):
+                        # ---------- 0) 优先复用「批量脱敏」已落盘的产物 ----------
+                        # 命中条件（三缺一不可，见 desens_artifact.artifact_reuse_blocker）：
+                        #   ① 配置指纹一致（含视频档位）② 源文件未变 ③ 产物文件仍在
+                        # 任一条不满足就落到下面的实时脱敏分支 —— 绝不"凑合用"一份口径
+                        # 不同的产物（那会让包内内容与界面说明不符，且完全静默）。
+                        reuse_hit = None
+                        if do_reuse:
+                            reuse_mod = _asset_modality(asset)
+                            if _desens_enabled_for(reuse_mod, desens) and \
+                                    _reuse_allowed_for(reuse_mod, desens):
+                                reuse_row = (reuse_map.get(asset.id) or {}).get(reuse_mod)
+                                if reuse_row is not None:
+                                    reuse_blocker = artifact_reuse_blocker(
+                                        reuse_row, storage_root,
+                                        desens_config_hash(reuse_mod, {
+                                            "strength": desens.get("video_strength")}),
+                                        abs_path)
+                                    if reuse_blocker is None:
+                                        reuse_hit = (reuse_mod, reuse_row)
+                                    else:
+                                        # 有产物却不能用，必须说清为什么 ——
+                                        # 只报"未命中"会让现场完全无法排查
+                                        current_app.logger.info(
+                                            "导出未复用 asset_id=%s（%s）的已存脱敏产物：%s",
+                                            asset.id, file_name, reuse_blocker)
+
+                        if reuse_hit is not None:
+                            # 产物在数据湖里就是平台主密钥的 DMEC 密文：
+                            #   · 不带还原包 → 包内封装密钥同样是平台主密钥
+                            #     ⇒ **密文字节可直接进包**，零加解密开销
+                            #     （大视频也不必整读进内存）
+                            #   · 带还原包（加密导出）→ 包内封装密钥是**本包一次性
+                            #     主密钥** ⇒ 必须把产物密文的 DEK 重包裹过去，否则
+                            #     接收方用包内 master.key 解不开（交付事故）。用
+                            #     `rewrap_dmec_file` 流式做，内容密文逐字节不变 ——
+                            #     比"解密再 `encrypt_bytes_with_key`"省掉全量读写与
+                            #     整读进内存（与非复用路径同一处理口径）
+                            reuse_mod, artifact = reuse_hit
+                            out_name = artifact.file_name or file_name
+                            art_abs = artifact_abspath(storage_root, artifact.file_path)
+                            arc_file = (out_name if out_name.endswith(".dmec")
+                                        else f"{out_name}.dmec")
+                            if encrypted and artifact.encrypted:
+                                if pack_master_key:
+                                    tmp_path = None
+                                    try:
+                                        fd, tmp_path = tempfile.mkstemp(
+                                            suffix=".dmec", prefix="export_rewrap_")
+                                        os.close(fd)
+                                        rewrap_dmec_file(art_abs, tmp_path,
+                                                         pack_master_key)
+                                        arcname = (f"{pseudo_id}/{layer}/{data_type}/"
+                                                   f"{arc_file}")
+                                        _zip_add_file(zf, tmp_path, arcname,
+                                                      cipher=True)
+                                    finally:
+                                        if tmp_path:
+                                            _remove_file_safely(tmp_path)
+                                else:
+                                    arcname = (f"{pseudo_id}/{layer}/{data_type}/"
+                                               f"{arc_file}")
+                                    _zip_add_file(zf, art_abs, arcname, cipher=True)
+                            elif encrypted:
+                                # 产物是明文（将来若改成明文落盘）→ 必须重新加密，
+                                # 否则会出现"名字是 .dmec、内容却是明文"的交付事故
+                                with open(art_abs, "rb") as f:
+                                    pack_path = _write_temp_bytes(
+                                        _encrypt_for_pack(f.read()), suffix=".dmec")
+                                try:
+                                    arcname = (f"{pseudo_id}/{layer}/{data_type}/"
+                                               f"{arc_file}")
+                                    _zip_add_file(zf, pack_path, arcname, cipher=True)
+                                finally:
+                                    _remove_file_safely(pack_path)
+                            else:
+                                tmp_path, is_temp = decrypt_artifact_to_temp(
+                                    artifact, storage_root)
+                                try:
+                                    arcname = f"{pseudo_id}/{layer}/{data_type}/{out_name}"
+                                    _zip_add_file(zf, tmp_path, arcname)
+                                finally:
+                                    if is_temp:
+                                        _remove_file_safely(tmp_path)
+                            # 可还原模态（音频/脑电/心电）：产物里的还原参数原样带进
+                            # manifest —— 噪声值/精度/原文校验和一字不动，只覆盖
+                            # "包内路径"相关字段（arcname / encrypted / layer / data_type）
+                            if artifact.manifest_json:
+                                entry = dict(artifact.manifest_json)
+                                entry_arc = (
+                                    out_name if not encrypted
+                                    else (out_name if out_name.endswith(".dmec")
+                                          else f"{out_name}.dmec"))
+                                entry["arcname"] = (
+                                    f"{pseudo_id}/{layer}/{data_type}/{entry_arc}")
+                                entry["encrypted"] = bool(encrypted)
+                                entry["layer"] = layer
+                                entry["data_type"] = data_type
+                                signal_manifest_entries.append(entry)
+                                signal_desensitized_files += 1
+                            reused_desensitized_files += 1
+                        elif do_userinfo and _is_userinfo_asset(asset):
                             # 脱敏导出：解出明文 → 字段级脱敏 → 按目标模式打包。
                             # 加密模式必须重新 DMEC 封装，否则脱敏后的明文被原样带出
                             tmp_paths = []
@@ -649,7 +865,8 @@ class ExportService(BaseService):
                                 ok, vid_err, vid_stats = desensitize_video_file_parallel(
                                     plain_path, masked_path,
                                     logger=current_app.logger,
-                                    on_progress=_video_frame_cb)
+                                    on_progress=_video_frame_cb,
+                                    strength=desens.get("video_strength"))
                                 # vid_stats 的明细（帧数/检出帧数/耗时）已由
                                 # desensitize_video_file 内部记入日志
                                 if not ok:
@@ -869,18 +1086,25 @@ class ExportService(BaseService):
                 "音频声纹脱敏完成：共处理 %d 个音频文件", audio_desensitized_files)
         if do_video:
             current_app.logger.info(
-                "视频人脸脱敏完成：共处理 %d 个视频文件（人脸区不可逆马赛克，音轨已移除）",
-                video_desensitized_files)
+                "视频人脸脱敏完成：共处理 %d 个视频文件（人脸区不可逆马赛克，音轨已移除，"
+                "档位 %s）",
+                video_desensitized_files, desens.get("video_strength"))
+        if do_reuse:
+            current_app.logger.info(
+                "导出复用已存脱敏产物：%d 个文件（跳过了实时脱敏；不可复用的按原因逐条记日志）",
+                reused_desensitized_files)
         if do_eeg or do_ecg:
             current_app.logger.info(
                 "信号级脱敏完成：共处理 %d 个 EEG/ECG 文件（全部列保留，"
                 "还原参数已写入包内 %s）",
                 signal_desensitized_files, SIGNAL_MANIFEST_NAME)
 
+        if stats is not None:
+            stats["reused_files"] = reused_desensitized_files
         return zip_path, errors
 
     def _log_audit(self, assets: List[DataAsset], encrypted: bool, skipped_count: int = 0,
-                   desens: dict = None, skipped: list = None):
+                   desens: dict = None, skipped: list = None, reused_count: int = 0):
         """记录导出审计日志（在 send_file 之前 commit）"""
         desens = desens or {}
         skipped = skipped or []
@@ -917,6 +1141,21 @@ class ExportService(BaseService):
                       if desens.get("video") else "")
         signal_note = ("，脑电/心电已值级脱敏（全列保留，凭密钥可无损还原）"
                        if (desens.get("eeg") or desens.get("ecg")) else "")
+        # 复用/未复用都要留痕：审计要能回答"这次到底重跑了多少脱敏"
+        if reused_count:
+            reuse_note = "，复用已存脱敏文件 %d 个（未重跑脱敏，视频档位 %s）" % (
+                reused_count, desens.get("video_strength"))
+        elif desens.get("reuse_requested"):
+            reuse_note = "，已请求复用已存脱敏文件但**未生效**"
+        else:
+            reuse_note = ""
+        # 「勾了还原包 ⇒ 哪几类必须实时重做」与"复用了几何"是正交信息，单独拼 ——
+        # 否则一旦有别的东西复用了（如视频），这条约束就被审计吃掉了
+        blocked_mods = _reuse_blocked_modalities(desens)
+        if blocked_mods:
+            reuse_note += "（%s因随包还原包改用本包一次性密钥，已实时重做；" \
+                          "视频/受试者信息不受影响）" % "/".join(
+                              MODALITY_LABELS.get(m, m) for m in blocked_mods)
         # 还原包是"把可还原性一并交出去"的动作，审计必须留痕：谁在什么时候
         # 把密钥随数据一起发出去了（加密导出还会额外给出本包专用主密钥）
         if desens.get("restore_kit") and (desens.get("eeg") or desens.get("ecg")):
@@ -936,6 +1175,7 @@ class ExportService(BaseService):
                 f"{audio_note}"
                 f"{video_note}"
                 f"{signal_note}"
+                f"{reuse_note}"
                 f"{kit_note}"
                 f"{skipped_note}）"
             ),
@@ -1029,6 +1269,64 @@ def _video_arc_name(file_name: str) -> str:
 _DESENS_ITEMS = ("userinfo", "audio", "video", "eeg", "ecg")
 
 
+def _asset_modality(asset):
+    """资产 → 脱敏模态（`app.models.desensitize_artifact` 的 MODALITY_*）
+
+    不参与脱敏的资产返回 ``None``。判定顺序与前几处 `_is_*_asset` 的分支顺序一致。
+    **唯一的模态判定出口**：`AssetDesensitizeService` 也用它，避免"批量脱敏认成
+    video、导出认成别的"这种两处口径分叉（那会让复用永远命中不了，且完全静默）。
+    """
+    if _is_video_asset(asset):
+        return MODALITY_VIDEO
+    if _is_audio_asset(asset):
+        return MODALITY_AUDIO
+    if _is_eeg_asset(asset):
+        return MODALITY_EEG
+    if _is_ecg_asset(asset):
+        return MODALITY_ECG
+    if _is_userinfo_asset(asset):
+        return MODALITY_USERINFO
+    return None
+
+
+def _desens_enabled_for(modality, desens: dict) -> bool:
+    """该模态本次是否开启了脱敏"""
+    return modality is not None and bool(desens.get(modality))
+
+
+def _reuse_allowed_for(modality, desens: dict) -> bool:
+    """该模态本次是否允许复用「批量脱敏」已落盘的产物
+
+    「复用了但包里说明不成立」是这条链上最难查的静默错误，故判据只放这一处
+    （预览统计、打包、审计都调它）。
+
+    ⚠️ 勾了「随包附带还原包」时**不是一刀切禁掉复用**：还原包改用本包一次性密钥
+    （`os.urandom(32)`）派生噪声，这条只与**可逆模态**（音频/脑电/心电，噪声密钥
+    要写进还原清单）冲突；**不可逆模态**（视频人脸马赛克、userInfo 字段掩码）包内
+    不存在任何可回推参数，与密钥口径无关 —— 连带禁掉只会白白重跑分钟级的人脸检测
+    （实测"勾还原包 ⇒ 整包重做"的主要代价就在这里）。
+    """
+    if not modality or not desens.get("reuse_existing"):
+        return False
+    if desens.get("restore_kit") and modality in REVERSIBLE_MODALITIES:
+        return False
+    return True
+
+
+def _reuse_blocked_modalities(desens: dict) -> list:
+    """因「随包还原包」而被挡下复用的模态（按 _DESENS_ITEMS 顺序，供日志/预览文案用）
+
+    ⚠️ **只列本次确实开了脱敏的可逆模态**：审计日志与预览文案都照着这份列表写
+    "这几类改为实时重做"，把没勾选的模态写进去等于谎报 —— 声称处理了实际压根
+    没处理的东西（比不说更糟）。`blocked_count` 数的是受影响的**资产数**，与
+    这里是否收窄无关（没勾的模态本来就没有待脱敏资产）。
+    """
+    if not (desens.get("reuse_existing") and desens.get("restore_kit")):
+        return []
+    return [m for m in _DESENS_ITEMS
+            if m in REVERSIBLE_MODALITIES and _desens_enabled_for(m, desens)]
+
+
 def _resolve_desens_config(payload: dict) -> dict:
     """把新旧两种脱敏载荷收敛为统一配置
 
@@ -1048,18 +1346,40 @@ def _resolve_desens_config(payload: dict) -> dict:
         desensitized: bool        → userinfo
         audio_desensitize: bool   → audio
 
+    v7 起追加两个键：
+
+    - ``video_strength``：视频马赛克档位（standard/strong/strongest），
+      缺省 = `DEFAULT_VIDEO_STRENGTH`（**最强**，2026-10-07 起与批量脱敏同为一最强）。
+      **必须参与复用指纹**，否则"批量脱敏用一档、导出用另一档"会错误命中（或漏命中）同一份产物。
+    - ``reuse_existing``：优先复用「批量脱敏」已落盘的产物，跳过实时脱敏。
+
+    ⚠️ **勾了 ``restore_kit`` 时按模态分别对待**（`reuse_requested` 始终如实记录原始请求）：
+    还原包改用本包一次性密钥派生噪声，这条只与**可逆模态**（音频/脑电/心电 —— 噪声
+    密钥要写进还原清单）冲突，故它们实时重做；**不可逆模态**（视频人脸马赛克、
+    userInfo 字段掩码）包内不存在任何可回推参数，照旧复用（否则勾还原包就要把
+    分钟级的人脸检测全部重跑一遍）。判定唯一出口见 :func:`_reuse_allowed_for`。
+
     两者都未给时**全部关闭** —— 后端不主动改写数据，避免 API/CLI 直接调用时
     静默脱敏，导致下游拿不到原始数据。
     """
     cfg = {k: False for k in _DESENS_ITEMS}
     cfg["restore_kit"] = False   # 非脱敏变换项：是否随包附带还原脚本与密钥
+    cfg["video_strength"] = DEFAULT_VIDEO_STRENGTH
+    cfg["reuse_requested"] = False
+    cfg["reuse_existing"] = False
     raw = payload.get("desensitize")
     if isinstance(raw, dict):
         if bool(raw.get("enabled", True)):
             for k in _DESENS_ITEMS:
                 cfg[k] = bool(raw.get(k, False))
             cfg["restore_kit"] = bool(raw.get("restore_kit", False))
+            cfg["video_strength"] = (raw.get("video_strength")
+                                     or DEFAULT_VIDEO_STRENGTH)
+            cfg["reuse_requested"] = bool(raw.get("reuse_existing", False))
         # enabled=False → 保持全部 False（总开关优先）
+        # 复用不再被 restore_kit 一刀切关掉：能不能复用**按模态**判定
+        # （见 `_reuse_allowed_for`）—— 还原包只与"带还原参数的可逆模态"冲突
+        cfg["reuse_existing"] = cfg["reuse_requested"]
         return cfg
     # 旧键兼容
     cfg["userinfo"] = bool(payload.get("desensitized", False))

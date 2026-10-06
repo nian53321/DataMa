@@ -45,6 +45,12 @@ class BaseConfig:
     CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
     CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
 
+    # 异步任务（批量脱敏等）状态的 Redis 连接串，供 app/utils/task_store.py 使用。
+    # 留空 = 从 CELERY_BROKER_URL 派生（db 号换成 2），与 celery 的 broker/result 分库。
+    # 之所以要独立存储：任务状态若只存在创建它的进程内存里，"关掉页面过一会儿
+    # 再回来看进度"会落到别的 worker（或 worker 被回收）→ 读不到任务。
+    TASK_STATE_REDIS_URL = os.getenv("TASK_STATE_REDIS_URL", "")
+
     # 文件存储路径（轻量级数据湖本地存储目录）
     DATA_LAKE_DIR = os.path.join(BASE_DIR, "data_lake")
     UPLOAD_DIR = os.path.join(DATA_LAKE_DIR, "raw")

@@ -6,6 +6,8 @@ const TOKEN_KEY = 'token'
 const REFRESH_TOKEN_KEY = 'refresh_token'
 const USER_INFO_KEY = 'userInfo'
 const MENUS_KEY = 'menus'
+// 隐私信息可见性（仅管理员会话使用）：'1' 显示明文，'0'/缺省 隐藏（按脱敏规则打码）
+const SHOW_SENSITIVE_KEY = 'showSensitive'
 // 部署版本标记：由 vite define 注入构建时间戳，用于检测前端是否已重新构建/部署
 const BUILD_TIME_KEY = 'app_build_time'
 const APP_BUILD_TIME = __APP_BUILD_TIME__
@@ -43,6 +45,15 @@ export const clearAuth = () => {
   localStorage.removeItem(REFRESH_TOKEN_KEY)
   localStorage.removeItem(USER_INFO_KEY)
   localStorage.removeItem(MENUS_KEY)
+}
+
+// 隐私信息可见性开关（管理员右上角开关）：
+// 默认 false = 隐藏隐私信息（按后端脱敏规则在前端打码展示）。
+// 属于用户视图偏好，登出时不清除，重登后沿用上次选择。
+export const getStoredShowSensitive = () =>
+  localStorage.getItem(SHOW_SENSITIVE_KEY) === '1'
+export const setStoredShowSensitive = (value) => {
+  localStorage.setItem(SHOW_SENSITIVE_KEY, value ? '1' : '0')
 }
 
 // 检测前端是否重新构建/部署。构建时间戳变化说明新版本已上线，

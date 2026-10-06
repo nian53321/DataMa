@@ -13,6 +13,10 @@ services:
       - GUNICORN_WORKER_CLASS=gthread
       - GUNICORN_THREADS=16
       - GUNICORN_TIMEOUT=0
+      # 禁用 worker 自动回收：worker 里挂着批量脱敏/导出任务的后台线程，
+      # 达到 max_requests 的 worker 优雅退出会把正在跑的脱敏任务一并杀掉
+      # （表现：进度永远卡在 running）。详见 gunicorn_config.py 的说明。
+      - GUNICORN_MAX_REQUESTS=0
     volumes:
       # 数据湖改为宿主机绑定挂载：容器内加密后的文件直接落盘到 ./back/data_lake
       # （保持 raw/cleaned/feature/annotation 四层结构，见 README）

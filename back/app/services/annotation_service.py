@@ -38,6 +38,10 @@ _REASSIGNABLE_STATUSES = {
     AnnotationStatus.REJECTED, AnnotationStatus.ANNOTATING,
 }
 
+# 可参与人工标注的模态白名单（标注界面只能选择这 5 类）：
+# 步态/量表/认知任务/JSON 辅助文件不进入标注候选列表。
+_ANNOTATABLE_DATA_TYPES = ("video", "audio", "eeg", "ecg", "eye")
+
 
 class AnnotationService(BaseService):
     """标注任务管理服务"""
@@ -160,16 +164,37 @@ class AnnotationService(BaseService):
                          keyword: str = "") -> dict:
         """获取可用于创建标注任务的数据资产
 
-        排除已有非驳回状态任务的资产，避免重复分配。
+        - 仅返回标注支持的 5 种模态（视频/音频/脑电/心电/眼动）；步态、量表、
+          认知任务与 JSON 辅助文件不进入标注候选列表
+        - 排除 RealSense 深度视频：其 data_type 同为 video，仅能靠
+          metadata.depth_raw 区分
+        - 排除已有非驳回状态任务的资产，避免重复分配。
         """
         query = DataAsset.query
         if data_type:
-            query = query.filter_by(data_type=data_type)
+            # 非白名单模态直接返回空页（前端下拉已收敛，此处兜住直连 API 的调用）
+            if data_type not in _ANNOTATABLE_DATA_TYPES:
+                return {"items": [], "total": 0, "page": page,
+                        "page_size": page_size, "pages": 0}
+            # 显式转枚举成员再比较：data_type 列存的是枚举 name（'VIDEO'），
+            # 直接传小写字符串只能靠 MySQL 的大小写不敏感 collation 蒙对，
+            # 在 SQLite（测试库）上恒匹配 0 行。
+            query = query.filter(DataAsset.data_type == DataType(data_type))
+        else:
+            query = query.filter(DataAsset.data_type.in_(
+                [DataType(t) for t in _ANNOTATABLE_DATA_TYPES]))
         if subject_id:
             query = query.filter_by(subject_id=subject_id)
         if keyword:
             like = build_like_contains(keyword)
             query = query.filter(DataAsset.file_name.like(like, escape="|"))
+
+        # 排除 RealSense 深度视频（metadata.depth_raw=true）：深度序列与彩色视频
+        # 同属 video 模态，只能靠 metadata 区分；深度数据不参与人工标注。
+        # json_extract 在 MySQL 与测试用 SQLite(JSON1) 上语义一致，缺失该键时返回
+        # NULL，故普通视频与无 metadata 的资产不会被误排除。
+        query = query.filter(
+            db.func.json_extract(DataAsset.metadata_json, "$.depth_raw").is_(None))
 
         # 排除已有非驳回状态任务的资产ID
         busy_ids = db.session.query(AnnotationTask.data_asset_id).filter(

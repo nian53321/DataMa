@@ -64,7 +64,7 @@
           :key="key"
           :label="fieldLabel(key)"
         >
-          <span style="word-break: break-all">{{ formatVal(val) }}</span>
+          <span style="word-break: break-all">{{ formatVal(privacy.mask(key, val)) }}</span>
         </el-descriptions-item>
       </el-descriptions>
       <el-empty v-else description="暂无数据" />
@@ -80,6 +80,7 @@ import { ref, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { getSnapshotsApi, rollbackSnapshotApi } from '@/api/data'
 import { useUserStore } from '@/stores/user'
+import { usePrivacyStore } from '@/stores/privacy'
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
@@ -93,6 +94,8 @@ const emit = defineEmits(['update:visible', 'rollback-success'])
 
 const userStore = useUserStore()
 const isAdmin = computed(() => userStore.role === 'admin')
+// 快照内容含受试者隐私字段，按右上角开关决定是否打码展示
+const privacy = usePrivacyStore()
 
 const snapshots = ref([])
 const loading = ref(false)

@@ -64,31 +64,34 @@ class ScaleSpec:
 # ---------------- 各量表评分参考规则（仅供展示，不自动写入受试者风险分级） ----------------
 
 def _grade_moca(score, bonus):
-    """MoCA：总分 ≥26 正常；<26 提示认知功能损害"""
+    """MoCA：总分 ≥26 无认知损害；<26 提示认知功能损害
+
+    分级取值统一为 无/轻度/中度/重度（与受试者认知风险分级体系一致，2026-10-06）
+    """
     score = float(score or 0) + float(bonus or 0)
     if score >= 26:
-        return "normal", "正常"
-    return "mci", "提示认知功能损害"
+        return "无", "正常"
+    return "轻度", "提示认知功能损害"
 
 
 def _grade_mmse(score, bonus):
-    """MMSE：≥27 正常；21~26 轻度痴呆；10~20 中度痴呆；<10 重度痴呆"""
+    """MMSE：≥27 无；21~26 轻度；10~20 中度；<10 重度"""
     score = float(score or 0) + float(bonus or 0)
     if score >= 27:
-        return "normal", "正常"
+        return "无", "正常"
     if score >= 21:
-        return "mci", "轻度痴呆（21~26 分）"
+        return "轻度", "轻度损害（21~26 分）"
     if score >= 10:
-        return "dementia", "中度痴呆（10~20 分）"
-    return "dementia", "重度痴呆（<10 分）"
+        return "中度", "中度损害（10~20 分）"
+    return "重度", "重度损害（<10 分）"
 
 
 def _grade_ad8(score, bonus):
-    """AD8：<2 正常；≥2 提示认知障碍（得分越高越差，反向量表）"""
+    """AD8：<2 无；≥2 提示认知障碍（得分越高越差，反向量表）"""
     score = float(score or 0) + float(bonus or 0)
     if score < 2:
-        return "normal", "正常"
-    return "mci", "提示认知障碍（≥2 分）"
+        return "无", "正常"
+    return "轻度", "提示认知障碍（≥2 分）"
 
 
 def _moca_education_bonus(edu_years):
@@ -313,7 +316,7 @@ def parse_scale_summary(data, scale_type=None):
         "total_score": 28.0,              # 总分（含教育校正）
         "max_score": 30.0,                # 满分
         "sections": [{"name", "score", "max_score"}, ...],  # 分项得分
-        "level": "normal",                # 分级参考 normal/mci/dementia（仅供展示）
+        "level": "无",                    # 分级参考 无/轻度/中度/重度（仅供展示）
         "level_label": "正常",
         "education_adjusted": True,       # 是否应用教育校正
         "education_bonus": 1.0,           # 教育校正加分

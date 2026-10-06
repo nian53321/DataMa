@@ -23,10 +23,11 @@ from sqlalchemy import func
 
 from app.api import data_bp
 from app.extensions import db
-from app.models import Role, Subject, DataAsset, DataType, DataLayer
+from app.models import Role, Subject, DataAsset, DataType, DataLayer, DESENS_MODALITIES
 from app.services import (
     SubjectService, AssetService, DataProcessingService, SnapshotService,
     ExportService, export_task_manager,
+    AssetDesensitizeService, desensitize_task_manager, resolve_desens_config,
 )
 from app.services.base import ValidationError
 from app.utils.response import success, fail
@@ -73,6 +74,12 @@ def _svc_processing():
 def _svc_snapshot():
     """构造 SnapshotService"""
     return SnapshotService(operator_id=int(get_jwt_identity()), operator_role=current_role())
+
+
+def _svc_desensitize():
+    """构造 AssetDesensitizeService（批量脱敏）"""
+    return AssetDesensitizeService(operator_id=int(get_jwt_identity()),
+                                   operator_role=current_role())
 
 
 def _remove_temp_file(tmp_path):
@@ -694,6 +701,141 @@ def export_assets_download(task_id):
     # 大文件流式传输前删除文件（Windows 上删除被占用文件会失败）
     resp.call_on_close(lambda: export_task_manager.cleanup_task(task_id))
     return resp
+
+
+# ====================== 批量脱敏（导出复用的前置加工） ======================
+#
+# 与导出的关系：脱敏实现完全同一套（video/audio/eeg/ecg/userinfo），只是把结果
+# **落盘留档**成「脱敏产物」，导出时可直接复用，避免每次导出都重跑分钟级的视频人脸脱敏。
+# 产物挂在原资产下（不新增资产行）—— 单实例模态约束 + 上传对账都要求如此，
+# 详见 `app/models/desensitize_artifact.py` 的模块 docstring。
+
+@data_bp.route("/assets/desensitize/existing", methods=["POST"])
+@role_required(Role.ADMIN, Role.ENGINEER)
+def assets_desensitize_existing():
+    """查询指定资产已有的脱敏产物（供清洗页列表打「已脱敏」标记）
+
+    请求：{"asset_ids": [int, ...]}
+    返回：{"<asset_id>": {"video": {...}, "eeg": {...}}, ...}（无产物的资产不出现）
+    """
+    data = request.get_json(silent=True) or {}
+    asset_ids = data.get("asset_ids") or []
+    if not isinstance(asset_ids, list):
+        return fail("asset_ids 必须为列表", 422)
+    if len(asset_ids) > 5000:
+        return fail("asset_ids 数量超过上限 5000", 422)
+    return success(_svc_desensitize().existing(asset_ids))
+
+
+@data_bp.route("/assets/desensitize/preview", methods=["POST"])
+@role_required(Role.ADMIN, Role.ENGINEER)
+def assets_desensitize_preview():
+    """预览批量脱敏：每个资产会被怎么处理（重做 / 复用 / 跳过 / 失败）
+
+    请求体：
+      asset_ids: [int]                  # 待处理资产
+      desensitize: {enabled, userinfo, audio, video, eeg, ecg, video_strength}
+      force: bool                       # 已有可用产物也重做
+
+    返回：{total, by_action, by_modality, to_process, reuse_count, skip_count,
+           fail_count, video_strength, items, truncated}
+    """
+    data = request.get_json(silent=True) or {}
+    svc = _svc_desensitize()
+    try:
+        config = resolve_desens_config(data)
+        return success(svc.preview(data.get("asset_ids") or [], config))
+    except ValidationError as e:
+        return fail(str(e), 422)
+
+
+@data_bp.route("/assets/desensitize/start", methods=["POST"])
+@role_required(Role.ADMIN, Role.ENGINEER)
+def assets_desensitize_start():
+    """启动异步批量脱敏任务
+
+    立即返回 task_id，后台线程逐个资产脱敏（视频是分钟级，必须异步），
+    前端轮询 /progress 获取进度。
+
+    返回: {task_id: str}
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        config = resolve_desens_config(data)
+    except Exception as e:
+        return fail(str(e), 422)
+    task_id = desensitize_task_manager.create_task(
+        data.get("asset_ids") or [], config,
+        operator_id=int(get_jwt_identity()),
+        operator_role=current_role(),
+    )
+    return success({"task_id": task_id}, message="批量脱敏任务已启动")
+
+
+@data_bp.route("/assets/desensitize/tasks", methods=["GET"])
+@role_required(Role.ADMIN, Role.ENGINEER)
+def assets_desensitize_tasks():
+    """列出当前用户最近提交的批量脱敏任务（供前端"回来自动接管"）
+
+    用户把脱敏挂到后台（关弹窗/切页/刷新）后回来，前端调这个接口找回未完成的
+    任务并继续显示进度。任务状态存在 Redis（见 app/utils/task_store.py），
+    所以**不依赖浏览器本地存储**，换标签页/重开浏览器都能看到。
+
+    query:
+      - limit: 最多返回条数（默认 10，上限 50）
+      - active: =1 时只返回进行中（pending/running）的任务
+
+    返回: {items: [task, ...]}（字段同 /progress）
+    """
+    try:
+        limit = min(50, max(1, int(request.args.get("limit") or 10)))
+    except (TypeError, ValueError):
+        limit = 10
+    active_only = (request.args.get("active") or "").strip().lower() in ("1", "true", "yes")
+    items = desensitize_task_manager.list_tasks(
+        operator_id=int(get_jwt_identity()),
+        active_only=active_only,
+        limit=limit,
+    )
+    return success({"items": items})
+
+
+@data_bp.route("/assets/desensitize/progress/<task_id>", methods=["GET"])
+@role_required(Role.ADMIN, Role.ENGINEER)
+def assets_desensitize_progress(task_id):
+    """查询批量脱敏任务进度
+
+    任务状态存在 Redis，因此**任意 worker、任意时刻**都能读到 —— 用户关掉
+    界面/刷新后回来仍可继续查看进度。
+
+    返回: {task_id, status(pending/running/success/failed), percent, status_text,
+           total, processed, current, frame_hint, done, reused, skipped, failed,
+           by_modality, errors, error, created_at, updated_at,
+           idle_seconds, stale}
+      - stale=True 表示任务仍是 running 但已超过 5 分钟没有心跳（可能因服务
+        重启/进程被强杀而中断），前端应如实提示而不是无限等待
+    """
+    task = desensitize_task_manager.get_task(task_id)
+    if not task:
+        return fail("任务不存在或已过期", 404)
+    return success(task)
+
+
+@data_bp.route("/assets/desensitize/artifact/<int:asset_id>", methods=["DELETE"])
+@role_required(Role.ADMIN, Role.ENGINEER)
+def assets_desensitize_delete_artifact(asset_id):
+    """删除某资产的脱敏产物（记录 + 磁盘文件）
+
+    可选 query 参数 modality（video/audio/eeg/ecg/userinfo）只删指定模态；
+    缺省删除该资产的全部产物。用于"重新脱敏"或回收磁盘空间。
+    """
+    modality = (request.args.get("modality") or "").strip() or None
+    if modality and modality not in DESENS_MODALITIES:
+        return fail("未知脱敏模态：%s" % modality, 422)
+    removed = _svc_desensitize().delete(asset_id, modality)
+    if not removed:
+        return fail("该资产没有对应的脱敏产物", 404)
+    return success({"removed": removed}, message="脱敏产物已删除")
 
 
 # ====================== 数据清洗与标准化 ======================

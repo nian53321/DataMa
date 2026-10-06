@@ -40,6 +40,17 @@ from app.models.desensitize import (
 )
 from app.models.scan_config import ScanConfig
 from app.models.external_key import ExternalKey
+from app.models.desensitize_artifact import (
+    DesensitizedArtifact,
+    DESENS_MODALITIES,
+    MODALITY_LABELS,
+    MODALITY_USERINFO,
+    MODALITY_AUDIO,
+    MODALITY_VIDEO,
+    MODALITY_EEG,
+    MODALITY_ECG,
+    KEY_SCOPE_PLATFORM,
+)
 
 __all__ = [
     "User",
@@ -84,4 +95,13 @@ __all__ = [
     "init_default_desensitize",
     "ScanConfig",
     "ExternalKey",
+    "DesensitizedArtifact",
+    "DESENS_MODALITIES",
+    "MODALITY_LABELS",
+    "MODALITY_USERINFO",
+    "MODALITY_AUDIO",
+    "MODALITY_VIDEO",
+    "MODALITY_EEG",
+    "MODALITY_ECG",
+    "KEY_SCOPE_PLATFORM",
 ]

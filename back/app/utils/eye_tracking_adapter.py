@@ -15,7 +15,7 @@
 不做的事：
 - 不映射 risk_value → cognitive_risk_level
 - 不映射 custom_phone → phone
-- 不自动划分风险分级（normal/mci/dementia）
+- 不自动划分风险分级（分级体系仅有 无/轻度/中度/重度 四级）
 """
 import os
 import re

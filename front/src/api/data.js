@@ -89,3 +89,37 @@ export const exportDownloadApi = (taskId) =>
     skipErrorHandler: true,
     timeout: 0,
   })
+
+// ==================== 批量脱敏（导出复用的前置加工） ====================
+//
+// 与导出的脱敏实现完全同一套（video/audio/eeg/ecg/userinfo），只是把结果落盘成
+// 「脱敏产物」挂在原资产下，导出时可勾选直接复用，避免每次导出都重跑分钟级的
+// 视频人脸脱敏。产物在数据湖里仍是 DMEC 密文。
+
+// 查询指定资产已有的脱敏产物（供列表打「已脱敏」标记）
+// 返回 { "<asset_id>": { video: {...}, eeg: {...} }, ... }
+export const desensitizeExistingApi = (assetIds) =>
+  request.post('/data/assets/desensitize/existing', { asset_ids: assetIds })
+
+// 预览批量脱敏：每个资产会被怎么处理（重做 / 复用 / 跳过 / 失败），无副作用
+export const desensitizePreviewApi = (data) =>
+  request.post('/data/assets/desensitize/preview', data)
+
+// 启动异步批量脱敏任务，返回 task_id（视频是分钟级，必须异步）
+export const desensitizeStartApi = (data) =>
+  request.post('/data/assets/desensitize/start', data)
+
+// 查询批量脱敏任务进度
+export const desensitizeProgressApi = (taskId) =>
+  request.get(`/data/assets/desensitize/progress/${taskId}`)
+
+// 列出最近提交的批量脱敏任务（任务状态在服务端 Redis 里，所以"挂到后台"后
+// 即使关了弹窗、切了页面、刷新浏览器，回来也能靠它找回未完成的任务继续看进度）
+export const desensitizeTasksApi = (params) =>
+  request.get('/data/assets/desensitize/tasks', { params })
+
+// 删除某资产的脱敏产物（记录 + 磁盘文件）；modality 可选，只删指定模态
+export const desensitizeDeleteArtifactApi = (assetId, modality) =>
+  request.delete(`/data/assets/desensitize/artifact/${assetId}`, {
+    params: modality ? { modality } : {},
+  })

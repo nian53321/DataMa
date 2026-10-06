@@ -74,6 +74,14 @@
   ⚠️ 这是 v2 以来**第一条改变输出**的提速（v4/v5 都是逐字节不变）：被跳过的帧用旧框。
   验收只能用**直接安全指标** —— 原始人脸框内掩膜泄漏，实测 **1500 帧恒为 0**；
   带 `MASK_PAD` 的宽口径会高估 20 倍，不可用。细节与三道保险见 `DETECT_ROI_DIFF` 常量注释。
+- **v7：马赛克强度做成档位（现场"马赛克效果再加强一点"）**。把"块/人脸"的目标比值
+  做成 `VIDEO_STRENGTH_RATIOS` 三个档（standard=1/8 / strong=1/6 / strongest=1/4），
+  **默认 strongest**（2026-10-07 起；此前默认 strong）。档位只改选级目标，不改算法结构。
+  ⚠️ 因为阶梯步长是 2.0（很粗），**"目标比值"≠"实际比值"**：实际落在
+  `[目标, 目标×2)`，加强档在大脸上会到约 1/3（比档位字面更粗）。若哪天要求
+  "精确 1/6"，只能把步长调细 = 支路变多 = 变慢，与 v4 的提速目标直接冲突。
+  定档必须用**安全指标**（SFace 余弦）而非观感，实测见 `bench_video_desens/`
+  的强度扫描脚本与 README。
 - **选级规则：取「不小于目标的最细一级」（向上取整），不再取"最接近"**。
   向上取整保证 块/人脸 **恒 ≥ 1/8**（实测最优档），"最接近"会掉到 1/11 附近；
   代价是块平均略粗（观感更方块化），换来的是**粗阶梯下也不会掉进"等于没脱敏"区**
@@ -157,7 +165,12 @@ from app.utils.transcode import get_ffmpeg
 #     故改为「只在人脸 ROI 内画面明显变化时才跑 YuNet」，硬上限 6 帧。
 #     ⚠️ **本条与 v4/v5 不同：会改变输出**（被跳过的帧用旧框），验收靠直接指标 ——
 #     原始人脸框内掩膜泄漏 **恒为 0**（1500 帧实测），不是"逐字节相同"。见常量区注释。
-VERSION_TAG = "video-desens-v6"
+# v7：**马赛克强度档位**（现场"马赛克再加强一点"）。把「块/人脸」目标比值做成可选档位
+#     （standard=1/8 / strong=1/6 / strongest=1/4），**默认 strongest（2026-10-07 起）**。
+#     ⚠️ 本条同样**改变输出**（默认档位变了）。定档依据是自己实测的 SFace 余弦扫描，
+#     见 VIDEO_STRENGTH_RATIOS 上方注释；`mosaic_ladder`/`mosaic_level` 的**默认参数
+#     保持 standard 不变**（单测按该口径钉死，且"不传档位"应当等于旧行为）。
+VERSION_TAG = "video-desens-v7"
 
 # 代理尺寸：按**面积**归一，与实测基准 480x270 等价。
 # 竖屏/超宽屏不会因为"宽度固定"而面积暴涨（拖动 Pass1 耗时）。
@@ -208,6 +221,38 @@ MOSAIC_BLOCK_STEP = 2.0      # 相邻级块边长倍率（↑ 支路数 ↓ 耗�
 MOSAIC_TARGET_RATIO = 0.125  # 选级依据：取**不小于** 该比例×人脸短边 的最细一级（= 1/8）
 MOSAIC_LADDER_MAX = 12       # 级数上限（掩膜以 20 为步长编码，uint8 最多容纳 12 级）
 MASK_LEVEL_STEP = 20         # 掩膜灰度按级编码：级号 k → k*20（1..12 → 20..240）
+
+# ==================== 马赛克强度档位（v7） ====================
+#
+# 现场要求"马赛克效果再加强一点"。**加重模糊是反向的**（见上表的模糊实测），
+# 但马赛克不是：块越粗余弦越低（1/32 的 0.71~0.82 掉到 1/8 的 0.126/0.029/0.070/0.086）。
+# 所以"加强"= **把选级的块/人脸目标比值往上抬**。
+#
+# ⚠️ 一条必须知道的实现事实：**选级是"向上取整"，且阶梯步长是 2.0（很粗）**，
+#   因此"目标比值"≠"实际达到的比值"。实际值落在 ``[目标, 目标×2)`` 内。
+#   例（480x270 代理、阶梯 [3,6,12,24,48]）：
+#       目标 1/8 → 小脸 37px 选 6px（0.162）、大脸 151px 选 24px（0.159）
+#       目标 1/6 → 小脸 37px 选 12px（0.324）、大脸 151px 选 48px（0.318）
+#   即"加强档"在大脸上实际会到约 1/3，**比档位名字更粗**。这不是 bug，是粗阶梯的代价；
+#   要精确命中 1/6 只能把步长调细（= 支路变多 = 变慢），与 v4 的提速目标冲突。
+#   → 因此档位命名用「标准/加强/最强」描述**方向与相对关系**，不承诺字面比值。
+#
+# 定档依据：本机对真实人脸素材按三个目标比值实测（脚本
+# `bench_video_desens/v21_strength_scan.py`，结果 `v21_strength_scan.json`）：
+# 四档人脸尺度下 SFace 余弦（同一人阈值 0.363）三档全部远低于阈值，且加强档整体更低；
+# 具体数字与"是否值得设为默认"的结论见该 JSON 与 README §十九。
+VIDEO_STRENGTH_STANDARD = "standard"    # 目标 1/8 —— v4~v6 的生产口径
+VIDEO_STRENGTH_STRONG = "strong"        # 目标 1/6
+VIDEO_STRENGTH_STRONGEST = "strongest"  # 目标 1/4 —— **默认**（最粗，观感最"方块化"）
+VIDEO_STRENGTH_RATIOS = {
+    VIDEO_STRENGTH_STANDARD: 0.125,
+    VIDEO_STRENGTH_STRONG: 1.0 / 6.0,
+    VIDEO_STRENGTH_STRONGEST: 0.25,
+}
+# ⚠️ 改这个常量 = 改**所有**导出口径：它同时是「批量脱敏」与「导出」两侧的默认值、
+# 复用指纹的输入、以及未知档位字符串的回退目标。两侧必须同为一个值，否则界面上
+# （批量脱敏选 A 档 / 导出停在 B 档）会静默复用不上 —— 已发生过一次（2026-10-07 报障）。
+DEFAULT_VIDEO_STRENGTH = VIDEO_STRENGTH_STRONGEST
 
 # v1 的固定 boxblur 半径（radius=4 → 窗口 9px @代理）。**v3 起彻底弃用**
 # （人脸区改马赛克，模块内不再引用）。保留只为让早期实验脚本按文件路径加载本模块时
@@ -390,7 +435,10 @@ __all__ = ["VERSION_TAG", "MODEL_NAME", "desensitize_video_file",
            "desensitize_video_file_parallel", "segment_plan",
            "probe_video", "model_path", "build_filter_complex",
            "mosaic_ladder", "mosaic_level", "mask_level_value",
-           "mask_level_threshold", "mask_rect"]
+           "mask_level_threshold", "mask_rect", "strength_ratio",
+           "VIDEO_STRENGTH_RATIOS", "DEFAULT_VIDEO_STRENGTH",
+           "VIDEO_STRENGTH_STANDARD", "VIDEO_STRENGTH_STRONG",
+           "VIDEO_STRENGTH_STRONGEST"]
 
 
 # ==================== 路径与探测 ====================
@@ -538,17 +586,31 @@ def _tail(path, limit=600):
 
 # ==================== 马赛克块阶梯（纯函数） ====================
 
-def mosaic_ladder(proxy_w, proxy_h):
+def strength_ratio(strength=None):
+    """强度档位 → 目标比值（块/人脸）；未知/缺省档位取 `DEFAULT_VIDEO_STRENGTH`
+
+    刻意对**未知档位**也返回默认值而不是抛异常：档位是界面传下来的字符串，
+    一次前端拼写错误不该让整条导出失败（更不该静默回退成"不脱敏"——
+    回退到默认最强档是安全方向）。
+    """
+    return VIDEO_STRENGTH_RATIOS.get(strength or DEFAULT_VIDEO_STRENGTH,
+                                     VIDEO_STRENGTH_RATIOS[DEFAULT_VIDEO_STRENGTH])
+
+
+def mosaic_ladder(proxy_w, proxy_h, target_ratio=None):
     """生成马赛克块边长阶梯（升序、去重、已按该尺度收敛）
 
     - 块边长按 ``MOSAIC_BLOCK_STEP`` 几何递增，直到**最后一级 ≥** "人脸占满画面短边"
-      所需的块（``MOSAIC_TARGET_RATIO * min(proxy_w, proxy_h)``）。
+      所需的块（``target_ratio * min(proxy_w, proxy_h)``）。
       因为选级是**向上取整**（见 `mosaic_level`），最后一级必须严格够得到最大人脸的
       目标块 —— 否则最大的脸会退化成"取最粗一级"，比值跌回安全带以下
     - 与 v2 的 boxblur 半径不同，块边长**没有 ffmpeg 硬上限**（`pixelize` 允许 1..1024），
       此处按 ``min(proxy_w, proxy_h)`` 收敛纯粹是为**省支路**（每多一级多一路的耗时）
+    - :param target_ratio: 强度档位对应的目标比值；``None`` = 旧口径 ``MOSAIC_TARGET_RATIO``
+      （**默认保持旧值**，这样"不传档位"与 v4~v6 行为逐字节一致，单测钉死的就是这条）
     """
-    largest_block = MOSAIC_TARGET_RATIO * float(min(proxy_w, proxy_h))
+    ratio = MOSAIC_TARGET_RATIO if target_ratio is None else float(target_ratio)
+    largest_block = ratio * float(min(proxy_w, proxy_h))
     blocks = []
     block = float(MOSAIC_BLOCK_BASE)
     for _ in range(MOSAIC_LADDER_MAX):
@@ -560,25 +622,27 @@ def mosaic_ladder(proxy_w, proxy_h):
     return blocks
 
 
-def mosaic_level(min_side, blocks):
+def mosaic_level(min_side, blocks, target_ratio=None):
     """按人脸短边（代理 px）选级号（1-based）：取**不小于**目标的最细一级
 
-    目标 = ``MOSAIC_TARGET_RATIO * 人脸短边``（= 脸短边 / 8），从细到粗找**第一个 ≥ 目标**
-    的块；都不到就取最粗一级。
+    目标 = ``target_ratio * 人脸短边``（默认 ``MOSAIC_TARGET_RATIO`` = 脸短边 / 8），
+    从细到粗找**第一个 ≥ 目标**的块；都不到就取最粗一级。
 
-    - **向上取整**（v4 改）：实际比值恒落在 ``[1/8, 1/4]``，**永远不会低于 1/8** ——
+    - **向上取整**（v4 改）：实际比值恒落在 ``[目标, 目标×步长)``，**永远不会低于目标** ——
       这是实测最优档（37/77/116/151 四档余弦 0.126/0.029/0.070/0.086）。
       换成"最接近"时会掉到 1/11 附近（比值区间 [目标/√步长, 目标√步长]），
       步长放粗后甚至能掉到 1/16 以下 —— 而 1/32 的余弦是 0.71~0.82，等于**没脱敏**。
       这条保证是阶梯能从 12 级砍到 5 级的前提
-    - 代价：块平均略粗（比值上界 1/4 ≈ 脸只剩 4 个块），观感更"方块化"；
-      安全性上**没有**模糊那种"越强越差"的回升（块再粗余弦也不升）
+    - 代价：块平均略粗（比值上界 = 目标×步长），观感更"方块化"；
+      安全性上**没有**模糊那种"越强越差"的回升（块再粗余弦也不升，v7 已复测）
     - 脸比最细一级（3px）还小时只能取第 1 级 —— 此时块**相对更大 = 更安全**，
       不存在 v2 模糊那种"最弱一级仍不够"的问题
+    - :param target_ratio: 见 `mosaic_ladder`；``None`` = 旧口径
     """
     if min_side <= 0 or not blocks:
         return 1
-    target = MOSAIC_TARGET_RATIO * float(min_side)
+    ratio = MOSAIC_TARGET_RATIO if target_ratio is None else float(target_ratio)
+    target = ratio * float(min_side)
     for index, block in enumerate(blocks):
         if block >= target:
             return index + 1
@@ -800,7 +864,7 @@ def _roi_change_ratio(gray, key_gray, boxes, pw, ph,
 # ==================== 主流程 ====================
 
 def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
-                           on_progress=None):
+                           on_progress=None, strength=None):
     """对视频做人脸区域脱敏
 
     :param src_path: 明文视频路径（调用方负责先解密）
@@ -809,10 +873,13 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
     :param timeout: 秒；缺省按 ``max(600, 时长*30)``
     :param on_progress: 可选回调 ``(frames_done)``，每约 120 帧一次（帧级进度，
                         与导出服务的**文件级**进度回调不同，故不共用）
+    :param strength: 马赛克强度档位（standard/strong/strongest，见 `VIDEO_STRENGTH_RATIOS`）。
+                     缺省/未知 → `DEFAULT_VIDEO_STRENGTH`（最强）。档位只改**选级目标比值**，
+                     不改算法结构，因此各档输出的帧数、掩膜覆盖、耗时量级都一致。
     :return: (ok, err, stats)
              stats 含 frames / detect_runs / detect_ratio / detected_frames /
              mask_frames / faces / proxy / source / fps / elapsed / audio_removed /
-             version。三个检测计数**含义不同**（v6 起不再相等）：
+             version / strength / target_ratio。三个检测计数**含义不同**（v6 起不再相等）：
              `detect_runs` = 实际跑 YuNet 的帧数 ≤ `frames`；
              `detected_frames` = 其中检出人脸的帧数；
              `mask_frames` = 掩膜非空的帧数（= 真正被脱敏的帧，正常等于 frames）
@@ -869,7 +936,10 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
     # ---- Pass2：马赛克（块边长按人脸尺寸分级）+ 掩膜合成 + 编码 + 去音轨 ----
     # 块边长按**人脸短边**选级：近景大脸用更粗的块，否则等于没脱敏。
     # 各级马赛克与合成都在代理尺度上做，最后只升采样一次。
-    ladder = mosaic_ladder(proxy_w, proxy_h)
+    # 强度档位（v7）只影响"目标比值"，阶梯与选级用**同一个** ratio 构造 —— 两处不一致
+    # 会让最大的脸退化成"取最粗一级"（阶梯末级够不到目标），比值跌破安全带。
+    target_ratio = strength_ratio(strength)
+    ladder = mosaic_ladder(proxy_w, proxy_h, target_ratio)
     filter_complex = build_filter_complex(
         fps, ladder, proxy_w, proxy_h, width, height)
 
@@ -973,7 +1043,8 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
                 if last_boxes:
                     # 按人脸短边选马赛克级：近景大脸用更粗的块，远景小脸用更细的块；
                     # 同一帧内重叠时让**更粗的一级覆盖更细的一级**（按级号升序绘制）
-                    painted = [(mosaic_level(min(bw, bh), ladder), bx, by, bw, bh)
+                    painted = [(mosaic_level(min(bw, bh), ladder, target_ratio),
+                                bx, by, bw, bh)
                                for (bx, by, bw, bh) in last_boxes]
                     for level, bx, by, bw, bh in sorted(painted, key=lambda it: it[0]):
                         level_faces[level] = level_faces.get(level, 0) + 1
@@ -1034,6 +1105,10 @@ def desensitize_video_file(src_path, dst_path, logger=None, timeout=None,
             "fps": round(fps, 4),
             "elapsed": round(elapsed, 3),
             "audio_removed": info["audio_streams"] > 0,
+            # 强度档位进 stats：事后核对"这份视频是按哪一档脱敏的"只能靠它
+            # （档位不同 → 块粗细分档不同 → 输出不同，但版本号是一样的）
+            "strength": strength or DEFAULT_VIDEO_STRENGTH,
+            "target_ratio": round(target_ratio, 6),
             "mosaic_ladder": ladder,
             "mosaic_levels": {str(k): v for k, v in sorted(level_faces.items())},
         })
@@ -1216,6 +1291,11 @@ def _merge_segment_stats(results, info, count, elapsed, merged_frames):
         "fps": first.get("fps"),
         "elapsed": round(elapsed, 3),
         "audio_removed": info.get("audio_streams") > 0,
+        # 强度档位必须**逐段一致**才成立（各段用同一个 strength），故取首段值即可；
+        # 段间若不一致说明上层透传写错，这里额外留一个自证字段
+        "strength": first.get("strength"),
+        "target_ratio": first.get("target_ratio"),
+        "segment_strengths": [row[2].get("strength") for row in results],
         "mosaic_ladder": first.get("mosaic_ladder"),
         "mosaic_levels": {str(k): v for k, v in sorted(
             ((int(k), v) for k, v in levels.items()))},
@@ -1224,7 +1304,7 @@ def _merge_segment_stats(results, info, count, elapsed, merged_frames):
 
 
 def desensitize_video_file_parallel(src_path, dst_path, logger=None, timeout=None,
-                                    on_progress=None, segments=None):
+                                    on_progress=None, segments=None, strength=None):
     """段级并行包装：切成 n 段并发跑完整管线，再拼回单一 mp4（v20 实测 1.634×）
 
     与 :func:`desensitize_video_file` 的分工：
@@ -1240,10 +1320,13 @@ def desensitize_video_file_parallel(src_path, dst_path, logger=None, timeout=Non
     改成调度器会让那些断言失去意义。
 
     :param segments: 强制段数（测试用）；None = 按 `segment_plan` 从时长推算
+    :param strength: 马赛克强度档位（见 `VIDEO_STRENGTH_RATIOS`）；**所有段用同一档**，
+                     否则拼接后一条视频里各段的块粗细不一致（观感割裂且无法复核）
     """
     def _fallback():
         return desensitize_video_file(src_path, dst_path, logger=logger,
-                                      timeout=timeout, on_progress=on_progress)
+                                      timeout=timeout, on_progress=on_progress,
+                                      strength=strength)
 
     ffmpeg = get_ffmpeg()
     if not ffmpeg:
@@ -1290,7 +1373,8 @@ def desensitize_video_file_parallel(src_path, dst_path, logger=None, timeout=Non
             try:
                 results[index] = desensitize_video_file(
                     parts_src[index], parts_out[index], logger=None, timeout=None,
-                    on_progress=lambda done, i=index: _bump(i, done))
+                    on_progress=lambda done, i=index: _bump(i, done),
+                    strength=strength)
             except Exception as exc:                    # noqa: BLE001
                 results[index] = (False, "%s: %s" % (type(exc).__name__, exc), {})
 

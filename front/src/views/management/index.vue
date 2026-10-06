@@ -134,9 +134,6 @@
             <el-option label="轻度" value="轻度" />
             <el-option label="中度" value="中度" />
             <el-option label="重度" value="重度" />
-            <el-option label="正常" value="normal" />
-            <el-option label="轻度认知障碍" value="mci" />
-            <el-option label="痴呆" value="dementia" />
             <el-option label="未评估" value="none" />
           </el-select>
         </el-form-item>
@@ -168,15 +165,19 @@
         <el-table-column type="selection" width="44" />
         <el-table-column prop="pseudo_id" label="伪ID" min-width="170" show-overflow-tooltip />
         <el-table-column prop="real_name" label="姓名" width="110" show-overflow-tooltip align="center" header-align="center">
-          <template #default="{ row }">{{ row.real_name || '—' }}</template>
+          <template #default="{ row }">{{ privacy.mask('real_name', row.real_name) || '—' }}</template>
         </el-table-column>
-        <el-table-column prop="age" label="年龄" width="60" align="center" header-align="center" />
-        <el-table-column prop="gender" label="性别" width="60" align="center" header-align="center" />
+        <el-table-column prop="age" label="年龄" width="60" align="center" header-align="center">
+          <template #default="{ row }">{{ privacy.mask('age', row.age) ?? '—' }}</template>
+        </el-table-column>
+        <el-table-column prop="gender" label="性别" width="60" align="center" header-align="center">
+          <template #default="{ row }">{{ privacy.mask('gender', row.gender) || '—' }}</template>
+        </el-table-column>
         <el-table-column prop="phone" label="联系电话" min-width="100" show-overflow-tooltip align="center" header-align="center">
-          <template #default="{ row }">{{ row.phone || '—' }}</template>
+          <template #default="{ row }">{{ privacy.mask('phone', row.phone) || '—' }}</template>
         </el-table-column>
         <el-table-column prop="id_card" label="身份证号" min-width="120" show-overflow-tooltip align="center" header-align="center">
-          <template #default="{ row }">{{ row.id_card || '—' }}</template>
+          <template #default="{ row }">{{ privacy.mask('id_card', row.id_card) || '—' }}</template>
         </el-table-column>
         <el-table-column prop="cognitive_risk_level" label="认知风险分级" width="120" align="center" header-align="center">
           <template #default="{ row }">
@@ -324,7 +325,7 @@
             <span v-if="subjectMap[row.subject_id]">
               {{ subjectMap[row.subject_id].pseudo_id }}
               <span v-if="subjectMap[row.subject_id].name" style="color: #909399; margin-left: 4px">
-                ({{ subjectMap[row.subject_id].name }})
+                ({{ privacy.mask('real_name', subjectMap[row.subject_id].name) }})
               </span>
             </span>
             <span v-else>—</span>
@@ -1045,12 +1046,15 @@ import { supportsFsAccess, getUnsupportedReason } from '@/utils/dirWatcher'
 import { runScanFromFiles, loadSubjectCache, loadUploadedMap, saveUploadedMap } from '@/utils/browserScan'
 import { getSubjectTemplateApi, getScanConfigsApi, createScanConfigApi, updateScanConfigApi, deleteScanConfigApi, runScanNowApi } from '@/api/system'
 import { useUserStore } from '@/stores/user'
+import { usePrivacyStore } from '@/stores/privacy'
 import { useBrowserScanStore } from '@/stores/browserScan'
 import VersionHistoryDialog from '@/components/VersionHistoryDialog.vue'
 import GlobalVersionDialog from '@/components/GlobalVersionDialog.vue'
 import { useRouter } from 'vue-router'
 
 const userStore = useUserStore()
+// 隐私信息可见性（管理员右上角开关）：关闭时隐私字段在此页按脱敏规则打码
+const privacy = usePrivacyStore()
 const canEdit = computed(() => ['admin', 'nurse', 'engineer'].includes(userStore.role))
 const canDelete = computed(() => userStore.role === 'admin')
 
@@ -1230,7 +1234,7 @@ const dataTypeTextMap = {
   eye: '眼动', gait: '步态', scale: '量表', task: '任务',
   json: '辅助数据', unknown: '未知',
 }
-const riskTextMap = { normal: '正常', mci: '轻度认知障碍', dementia: '痴呆', none: '未评估', unknown: '未知', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }
+const riskTextMap = { none: '未评估', unknown: '未知', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }
 const genderTextMap = { '男': '男', '女': '女', unknown: '未知' }
 
 // 视图切换：subject 按受试者 / type 按数据类型
@@ -1267,8 +1271,8 @@ const onResetFilters = () => {
 }
 
 // 风险分级展示
-const riskText = (v) => ({ normal: '正常', mci: '轻度认知障碍', dementia: '痴呆', '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }[v] || '未评估')
-const riskTagType = (v) => ({ normal: 'success', mci: 'warning', dementia: 'danger', '无': 'info', '轻度': 'warning', '中度': 'danger', '重度': 'danger' }[v] || 'info')
+const riskText = (v) => ({ '无': '无', '轻度': '轻度', '中度': '中度', '重度': '重度' }[v] || '未评估')
+const riskTagType = (v) => ({ '无': 'info', '轻度': 'warning', '中度': 'danger', '重度': 'danger' }[v] || 'info')
 
 // 功能卡片：脱敏配置仅 admin 可见，其他功能卡片对所有有权限用户可见
 const allFeatures = [
@@ -1389,7 +1393,7 @@ const loadSubjectTemplate = async () => {
       { field_key: 'education_level', field_label: '教育程度', field_type: 'input', required: false, span: 24, placeholder: '如 高中/本科', options: [] },
       { field_key: 'phone', field_label: '联系电话', field_type: 'input', required: false, span: 12, placeholder: '如 13800138000', options: [] },
       { field_key: 'id_card', field_label: '身份证号', field_type: 'input', required: false, span: 12, placeholder: '如 110101199001011234', options: [] },
-      { field_key: 'cognitive_risk_level', field_label: '认知风险分级', field_type: 'select', required: false, span: 24, placeholder: '', options: [{ label: '无', value: '无' }, { label: '轻度', value: '轻度' }, { label: '中度', value: '中度' }, { label: '重度', value: '重度' }, { label: '正常', value: 'normal' }, { label: '轻度认知障碍', value: 'mci' }, { label: '痴呆', value: 'dementia' }] },
+      { field_key: 'cognitive_risk_level', field_label: '认知风险分级', field_type: 'select', required: false, span: 24, placeholder: '', options: [{ label: '无', value: '无' }, { label: '轻度', value: '轻度' }, { label: '中度', value: '中度' }, { label: '重度', value: '重度' }] },
       { field_key: 'emotion_status', field_label: '情绪状态', field_type: 'input', required: false, span: 24, placeholder: '如 焦虑/抑郁', options: [] },
       { field_key: 'moca_score', field_label: 'MoCA 得分', field_type: 'number', required: false, span: 12, placeholder: '0-30', options: [], max: 30 },
       { field_key: 'mmse_score', field_label: 'MMSE 得分', field_type: 'number', required: false, span: 12, placeholder: '0-30', options: [], max: 30 },
@@ -1678,9 +1682,10 @@ const updateTypeChart = () => {
 
 // 风险分级 - 柱状图
 const updateRiskChart = () => {
-  const riskColorMap = { normal: '#67c23a', mci: '#e6a23c', dementia: '#f56c6c', none: '#909399', unknown: '#c0c4cc', '无': '#909399', '轻度': '#e6a23c', '中度': '#f56c6c', '重度': '#f56c6c' }
-  // 固定顺序展示
-  const order = ['无', '轻度', '中度', '重度', 'normal', 'mci', 'dementia', 'none']
+  const riskColorMap = { none: '#909399', unknown: '#c0c4cc', '无': '#909399', '轻度': '#e6a23c', '中度': '#f56c6c', '重度': '#f56c6c' }
+  // 固定顺序展示（2026-10-06：认知风险分级仅 无/轻度/中度/重度 四级）
+  // 注：这三类库内无数据，原实现下恒为 0 值空柱
+  const order = ['无', '轻度', '中度', '重度', 'none']
   const rows = (dataStats.value.risk_distribution || []).slice()
   order.forEach((k) => {
     if (!rows.find((r) => r.risk_level === k)) rows.push({ risk_level: k, count: 0 })
@@ -2925,6 +2930,8 @@ onMounted(() => {
   loadBatchOptions()
   initBrowserWatch()
   window.addEventListener('resize', handleLayerResize)
+  // 隐私遮罩依赖脱敏规则：直接进入本页时兜底加载（store 内部幂等，重复调用无副作用）
+  if (userStore.role === 'admin') privacy.loadConfig()
 })
 
 onBeforeUnmount(() => {

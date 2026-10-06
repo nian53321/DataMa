@@ -36,6 +36,28 @@
           </el-breadcrumb>
         </div>
         <div class="header-right">
+          <!-- 隐私信息可见性开关（仅管理员）：关闭后姓名/电话/身份证等按脱敏规则打码显示 -->
+          <el-tooltip
+            v-if="isAdmin"
+            placement="bottom"
+            :content="privacy.showSensitive
+              ? '当前显示隐私信息（姓名/电话/身份证等为真实值）'
+              : '当前隐藏隐私信息（按脱敏规则打码显示）'"
+          >
+            <span class="privacy-switch">
+              <el-icon class="privacy-icon">
+                <View v-if="privacy.showSensitive" />
+                <Hide v-else />
+              </el-icon>
+              <span class="privacy-label">隐私信息</span>
+              <el-switch
+                v-model="showSensitive"
+                size="small"
+                :disabled="!privacy.loaded"
+                style="--el-switch-on-color: #f56c6c"
+              />
+            </span>
+          </el-tooltip>
           <el-button text :icon="QuestionFilled" @click="helpDrawer = true">帮助</el-button>
           <el-dropdown @command="handleCommand">
             <span class="user-info">
@@ -94,21 +116,23 @@
         <el-collapse-item name="cleaning" title="🧹 数据清洗及标准化">
           <div class="help-section">
             <p><b>用途：</b>对原始数据进行清洗、去噪、标准化处理。</p>
-            <p><b>操作：</b>选择待处理的数据资产，触发清洗/标准化任务。</p>
-            <p class="help-tip">提示：清洗任务通过 Celery 异步执行（功能开发中，当前为模拟提交）。</p>
+            <p><b>数据接入：</b>列表以<b>受试者</b>为单位展示，展开某位受试者即可查看其名下的全部文件，并可单独勾选需要处理的子文件。</p>
+            <p><b>操作：</b>顶部切换到「批量清洗 / 批量标准化」后，展开受试者勾选文件（或"全选当前筛选结果"），再执行清洗/标准化任务。</p>
+            <p class="help-tip">提示：筛选条件（模态类型/分层/状态/文件名）作用于<b>文件</b>，只展示含匹配文件的受试者。清洗任务通过 Celery 异步执行（功能开发中，当前为模拟提交）。</p>
           </div>
         </el-collapse-item>
         <el-collapse-item name="annotation" title="✏️ 数据标注">
           <div class="help-section">
             <p><b>用途：</b>对数据资产进行标注，支持预标注→人工标注→医生复核全流程。</p>
-            <p><b>多模态支持：</b>视频、音频、脑电（EEG）、心电（ECG）、眼动、步态、量表、认知任务八种数据类型，工作台会根据数据类型自动选择合适的预览方式。</p>
+            <p><b>多模态支持：</b>视频、音频、脑电（EEG）、心电（ECG）、眼动五种数据类型，工作台会根据数据类型自动选择合适的预览方式。</p>
+            <p class="help-tip">步态、量表、认知任务等模态，以及 RealSense 采集的深度信息视频，均不出现在标注选择列表中。</p>
             <p><b>主要操作：</b></p>
             <ul>
               <li>新建任务：选择数据资产创建标注任务，支持多资产批量创建为同一任务组</li>
               <li>预标注：对 pending 状态任务触发自动预标注（生成建议标签）</li>
               <li>标注工作台：进入工作台后可按任务组翻页标注，EEG/ECG 自动渲染为 ECharts 多通道波形（内置 dataZoom 缩放）</li>
               <li>添加标签：仅需选择标签和填写备注，不再需要填写时间区间</li>
-              <li>复核：医生角色可对已标注任务进行通过/驳回，复核时可微调标注内容</li>
+              <li>复核：医生角色可对已标注任务进行通过/驳回；复核弹窗内提供与工作台一致的数据预览（视频/音频可播放，EEG/ECG 渲染波形），便于对照原始数据判断标注是否正确，并可微调标注内容</li>
               <li>编辑：可修改标注员、复核医生、备注（状态变更需通过流程按钮）</li>
               <li>删除：级联删除任务及其所有标注结果与版本</li>
             </ul>
@@ -194,18 +218,36 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
-import { QuestionFilled } from '@element-plus/icons-vue'
+import { usePrivacyStore } from '@/stores/privacy'
+import { ElMessage } from 'element-plus'
+import { QuestionFilled, View, Hide } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
 const userStore = useUserStore()
+const privacy = usePrivacyStore()
 const userInfo = computed(() => userStore.userInfo)
 const isCollapse = ref(false)
 const helpDrawer = ref(false)
 const activeHelp = ref('dashboard')
+
+// 隐私信息可见性开关（仅管理员可见可用）
+const isAdmin = computed(() => userInfo.value?.role === 'admin')
+const showSensitive = computed({
+  get: () => privacy.showSensitive,
+  set: (val) => {
+    privacy.setShowSensitive(val)
+    ElMessage.success(val ? '已显示隐私信息' : '已隐藏隐私信息（按脱敏规则打码显示）')
+  },
+})
+
+onMounted(() => {
+  // 管理员需要脱敏规则用于前端遮罩；非管理员后端已脱敏，无需拉取
+  if (isAdmin.value) privacy.loadConfig()
+})
 
 const ALL_MENUS = [
   { key: 'dashboard', path: '/dashboard', title: '工作台', icon: 'Odometer' },
@@ -276,6 +318,33 @@ const handleCommand = (command) => {
     display: flex;
     align-items: center;
     gap: 16px;
+  }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .privacy-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 8px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: #606266;
+    cursor: pointer;
+    user-select: none;
+    transition: background-color 0.2s;
+    &:hover {
+      background: #f5f7fa;
+    }
+    .privacy-icon {
+      font-size: 15px;
+    }
+    .privacy-label {
+      white-space: nowrap;
+    }
   }
   .collapse-btn {
     cursor: pointer;

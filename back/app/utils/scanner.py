@@ -312,15 +312,29 @@ def _find_user_info(sub_dir, failure_collector=None):
     return None, None
 
 
+# 触发回填的判据字段：userInfo 里必然携带、且不受批次/备注等可选配置影响。
+# 其中任一为空即重新解析一次 userInfo 补齐。
+#
+# 2026-10-06 修：原判据是「age 或 gender 有值就整体 return」，属于**粗粒度**
+# 判断。字段映射是逐步长出来的，旧数据在创建时缺的那一列（当时还没有该映射，
+# 典型如 collection_time）会因为年龄/性别已有值而被整体跳过，此后永远补不上 ——
+# 现场代价：5 个受试者的采集时间列为空，而它们的 userInfo.createDatetime 其实
+# 全都有值（见 .workbuddy/memory/2026-10-06.md）。
+_BACKFILL_TRIGGER_KEYS = ("age", "gender", "real_name", "collection_time")
+
+
 def _backfill_subject_fields(subject, sub_dir, failure_collector=None):
     """为已存在受试者补齐 userInfo 字段（仅填充空字段，不覆盖已有值）
 
-    场景：受试者首次扫描时 userInfo.json(.enc) 仍在写入，解析失败导致
-    受试者创建时缺失元数据。后续扫描检测到关键字段（年龄/性别）均为空
-    时重新解析并补齐，写入由调用方统一 commit。
+    场景两类，都是「创建时拿不到这份元数据」：
+    1. 受试者首次扫描时 userInfo.json(.enc) 仍在写入，解析失败导致创建时无元数据；
+    2. 创建时的代码还没有某个字段的映射（如 collection_time），该列在旧数据上恒空。
+
+    仅在 `_BACKFILL_TRIGGER_KEYS` 仍有空字段时才去解析 userInfo（解密有成本），
+    补齐后后续轮次直接命中快路径返回。写入由调用方统一 commit。
     """
-    if subject.age is not None or subject.gender:
-        return  # 已有 userInfo 数据，无需补齐
+    if all(getattr(subject, k, None) not in (None, "") for k in _BACKFILL_TRIGGER_KEYS):
+        return  # 判据字段齐全，无需补齐
     _, fields = _find_user_info(sub_dir, failure_collector=failure_collector)
     if not fields:
         return

@@ -12,8 +12,10 @@
 - 列表按角色脱敏（admin 不脱敏）
 """
 import os
+import re
 import logging
 import shutil
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -22,13 +24,65 @@ from app.extensions import db
 from app.models import Subject, DataAsset, DataType
 from app.models.annotation import AnnotationTask, Annotation, AnnotationVersion
 from app.models.data import DataVersion
+from app.models.desensitize_artifact import DesensitizedArtifact
 from app.services.base import BaseService, ValidationError, ConflictError, NotFoundError
 from app.utils.audit import log_operation, snapshot_update, snapshot_delete
 from app.models.data_snapshot import save_snapshot
+from app.utils.collection_time import _CN_TZ
 from app.utils.desensitize import desensitize_list
 from app.utils.like_query import build_like_contains
 from app.utils.response import paginate
 from app.utils.scanner import _PSEUDO_ID_RE
+
+# 带显式时区标记的 ISO 串：结尾 Z，或 ±HH:MM / ±HHMM 偏移
+_TZ_AWARE_RE = re.compile(r"(?:[Zz]|[+-]\d{2}:?\d{2})$")
+
+
+def _parse_collection_time(value):
+    """把接口传来的「采集时间」解析为 **UTC naive datetime**（可直接写库）
+
+    口径（2026-10-06 定，改前是错的）：接口传的是**北京时间** —— 前端 date-picker
+    给的是本地时间，人工录入也是按北京时间填；而 `subjects.collection_time` 列存
+    **UTC**（`Subject.to_dict` 用 `to_local_str` 再 +8 展示）。所以这里必须
+    北京 → UTC（减 8 小时）。
+
+    ⚠️ 历史坑：原实现 `strptime` 后直接落库 = 把北京时间当 UTC 存 → 展示层再 +8 →
+    **页面比真实采集时间晚 8 小时**。现场实测（受试者 115）：userInfo
+    `createDatetime="2026-09-07 04:11:01"`（真采集时刻，UTC；其 pseudo_id 的 epoch
+    前缀 `1788754261089` 反算得 2026-09-07 04:11:01Z，逐秒吻合），但 `/data/parse-userinfo`
+    为配合 date-picker 把它 `to_local_str` 成北京 `12:11:01` 返回，前端
+    `browserScan.js` / 管理页表单原样回传 → 库里存成 `12:11:01` → 页面显示 `20:11:01`。
+    详见 `.workbuddy/memory/2026-10-06.md`。
+
+    兼容：
+    - `datetime` 原样透传；
+    - 带**显式时区标记**的 ISO 串（`...Z` / `...+08:00`）按其自带时区归一到 UTC，
+      不做「北京时间」假设；
+    - 其余 `YYYY-MM-DD HH:MM:SS`（ISO 的 `T` 分隔也认，先截断到 19 位）按北京时间。
+    解析失败返回 None，由调用方保持原值不动。
+    """
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+
+    # 带显式时区标记的 ISO 串：尊重其自带偏移，避免被当北京时间再减 8h
+    if _TZ_AWARE_RE.search(text):
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
+        except (ValueError, TypeError):
+            dt = None
+        if dt is not None:
+            if dt.tzinfo is None:
+                return dt
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    try:
+        naive = datetime.strptime(text.replace("T", " ")[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    return naive - _CN_TZ
 
 
 class SubjectService(BaseService):
@@ -144,15 +198,10 @@ class SubjectService(BaseService):
             ad8_score=data.get("ad8_score"),
             remark=data.get("remark"),
         )
-        # 采集时间：创建时同样支持字符串转 datetime（与 update_subject 保持一致）
-        if data.get("collection_time"):
-            try:
-                from datetime import datetime
-                subject.collection_time = datetime.strptime(
-                    str(data["collection_time"])[:19], "%Y-%m-%d %H:%M:%S"
-                )
-            except (ValueError, TypeError):
-                pass
+        # 采集时间：接口传的是**北京时间**字符串 → 统一转 UTC 落库（与 update_subject 同口径）
+        parsed_ct = _parse_collection_time(data.get("collection_time"))
+        if parsed_ct is not None:
+            subject.collection_time = parsed_ct
         self.session.add(subject)
         # 创建后留档（best-effort，便于历史追溯）— flush 拿 id，不 commit
         try:
@@ -184,15 +233,11 @@ class SubjectService(BaseService):
                   "remark"]:
             if f in data:
                 setattr(subject, f, data[f])
-        # 采集时间单独处理（字符串转 datetime）
-        if "collection_time" in data and data["collection_time"]:
-            try:
-                from datetime import datetime
-                subject.collection_time = datetime.strptime(
-                    str(data["collection_time"])[:19], "%Y-%m-%d %H:%M:%S"
-                )
-            except (ValueError, TypeError):
-                pass
+        # 采集时间单独处理：接口传北京时间字符串 → 转 UTC 落库（与 create_subject 同口径）
+        if "collection_time" in data:
+            parsed_ct = _parse_collection_time(data["collection_time"])
+            if parsed_ct is not None:
+                subject.collection_time = parsed_ct
         # 伪ID 唯一性与格式校验
         if data.get("pseudo_id") and data["pseudo_id"] != subject.pseudo_id:
             if not _PSEUDO_ID_RE.match(data["pseudo_id"].strip()):
@@ -278,7 +323,12 @@ class SubjectService(BaseService):
 
 def _purge_asset_records(asset):
     """级联删除数据资产关联的子表记录（外键约束 nullable=False，必须显式删除）
-    涉及：DataVersion、AnnotationTask→Annotation、AnnotationTask→AnnotationVersion、AnnotationTask
+    涉及：DataVersion、AnnotationTask→Annotation、AnnotationTask→AnnotationVersion、
+    AnnotationTask、DesensitizedArtifact（脱敏产物索引）
+
+    ⚠️ 脱敏产物记录**必须在删资产前删掉**：外键是 RESTRICT，漏了会直接抛
+    IntegrityError 让整个删除失败。产物**磁盘文件**不在这里删 —— 本函数运行在事务
+    内，项目纪律是 commit 之后才动磁盘（残留文件由启动清扫兜底）。
     """
     # 1. 删除该资产关联的所有标注任务及其子记录
     tasks = AnnotationTask.query.filter_by(data_asset_id=asset.id).all()
@@ -288,6 +338,9 @@ def _purge_asset_records(asset):
         db.session.delete(t)
     # 2. 删除该资产的所有版本记录
     DataVersion.query.filter_by(data_asset_id=asset.id).delete(synchronize_session=False)
+    # 3. 删除该资产的脱敏产物索引（含文件路径，供调用方在 commit 后清理）
+    DesensitizedArtifact.query.filter_by(data_asset_id=asset.id).delete(
+        synchronize_session=False)
 
 
 def _collect_asset_file_paths(asset, storage_root):
