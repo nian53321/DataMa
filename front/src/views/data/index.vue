@@ -628,10 +628,24 @@ const activeTab = ref('access')
 // 含 json 的原始列表：清洗/标准化流程忽略 json 模态（userInfo 备份等辅助文件），
 // 但**批量脱敏需要它**（受试者信息脱敏的对象正是 userInfo.json）→ 仅脱敏模式纳入
 const rawAssets = ref([])
-const allAssets = computed(() =>
-  batchMode.value === 'desensitize'
-    ? rawAssets.value
-    : rawAssets.value.filter((a) => a.data_type !== 'json'))
+
+// 原始深度序列资产（RealSense DZST，.zst）：不是可解码的视频，
+// 而是需由后端 depth-video 端点实时转码才能播放的深度帧序列（见可视化页）。
+// 它在库里 data_type='video'，若不排除会被当普通视频纳入清洗/标准化/脱敏，
+// 而这些流程解不开 DZST 封装 → 必然失败。故与可视化页同口径，在源头滤掉。
+// 判定双保险：扩展名 .zst 或 metadata.depth_raw（realsense._upload_raw_depth 写入）。
+const isDepthRawAsset = (a) => {
+  if (!a) return false
+  const m = a.metadata || {}
+  return (a.file_name || '').toLowerCase().endsWith('.zst') || m.depth_raw === true
+}
+
+const allAssets = computed(() => {
+  const list = rawAssets.value.filter((a) => !isDepthRawAsset(a))
+  return batchMode.value === 'desensitize'
+    ? list
+    : list.filter((a) => a.data_type !== 'json')
+})
 // 全量受试者（用于受试者分组展示 pseudo_id / 姓名）
 const allSubjects = ref([])
 const loading = ref(false)
@@ -927,7 +941,9 @@ const DESENS_EXISTING_CHUNK = 5000
 const loadExistingArtifacts = async () => {
   // 非 admin/engineer 调该接口必然 403，直接跳过以免刷无谓的错误提示
   if (!canClean.value) return
-  const ids = rawAssets.value.map((a) => a.id)
+  // 只查当前可见范围内的资产（allAssets 已排除深度序列等不可处理项），
+  // 避免为界面上不存在的资产白跑一批查询
+  const ids = allAssets.value.map((a) => a.id)
   if (!ids.length) { existingMap.value = {}; return }
   const merged = {}
   try {
