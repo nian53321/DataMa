@@ -146,8 +146,8 @@
         <template #header><span>受试者信息</span></template>
         <el-descriptions :column="{ xs: 1, sm: 2, md: 3, lg: 6 }" border size="small">
           <el-descriptions-item label="伪ID">{{ subjectInfo?.pseudo_id || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="年龄">{{ subjectInfo?.age || '—' }}</el-descriptions-item>
-          <el-descriptions-item label="性别">{{ subjectInfo?.gender || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="年龄">{{ maskField('age', subjectInfo?.age) ?? '—' }}</el-descriptions-item>
+          <el-descriptions-item label="性别">{{ maskField('gender', subjectInfo?.gender) || '—' }}</el-descriptions-item>
           <el-descriptions-item label="认知风险">{{ riskText(subjectInfo?.cognitive_risk_level) }}</el-descriptions-item>
           <el-descriptions-item label="MMSE">{{ subjectInfo?.mmse_score ?? '—' }}</el-descriptions-item>
           <el-descriptions-item label="MoCA">{{ subjectInfo?.moca_score ?? '—' }}</el-descriptions-item>
@@ -326,13 +326,21 @@
                     <el-button size="small" @click="toggleAllEegChannels(true)">全部显示</el-button>
                     <el-button size="small" @click="toggleAllEegChannels(false)">全部取消</el-button>
                   </el-button-group>
+                  <el-radio-group v-model="eegLayout" size="small">
+                    <el-radio-button value="stack">堆叠</el-radio-button>
+                    <el-radio-button value="overlay">叠加</el-radio-button>
+                  </el-radio-group>
                   <el-tag v-if="eegMeta" size="small" type="success">{{ eegMeta.device }}</el-tag>
                   <el-tag v-if="eegMeta" size="small">{{ eegMeta.channels }}通道 · {{ eegMeta.sampleRate }}Hz · {{ eegMeta.duration }}s</el-tag>
                 </el-space>
               </div>
             </template>
-            <div class="chart-label">多通道波形（{{ eegMeta?.channels || 0 }} 通道叠加）</div>
-            <div ref="eegChannelRef" style="height: 600px"></div>
+            <div class="chart-label">
+              多通道波形（{{ eegMeta?.channels || 0 }} 通道 ·
+              {{ eegLayout === 'stack' ? '纵向堆叠，各通道独立 Y 轴' : '叠加显示，共用 Y 轴' }} ·
+              原始值，未做基线/单位换算）
+            </div>
+            <div ref="eegChannelRef" :style="{ height: eegLayout === 'stack' ? `${Math.max(600, (eegMeta?.channels || 1) * 90)}px` : '600px' }"></div>
           </el-card>
         </el-col>
         <!-- 心电 ECG -->
@@ -600,14 +608,22 @@
                       <el-button size="small" @click="toggleAllEegChannels(true)">全部显示</el-button>
                       <el-button size="small" @click="toggleAllEegChannels(false)">全部取消</el-button>
                     </el-button-group>
+                    <el-radio-group v-model="eegLayout" size="small">
+                      <el-radio-button value="stack">堆叠</el-radio-button>
+                      <el-radio-button value="overlay">叠加</el-radio-button>
+                    </el-radio-group>
                     <el-tag size="small" type="success">当前文件</el-tag>
                     <el-tag v-if="eegMeta" size="small" type="success">{{ eegMeta.device }}</el-tag>
                     <el-tag v-if="eegMeta" size="small">{{ eegMeta.channels }}通道 · {{ eegMeta.sampleRate }}Hz · {{ eegMeta.duration }}s</el-tag>
                   </el-space>
                 </div>
               </template>
-              <div class="chart-label">多通道波形（{{ eegMeta?.channels || 0 }} 通道叠加）</div>
-              <div ref="eegChannelRef" style="height: 600px"></div>
+              <div class="chart-label">
+                多通道波形（{{ eegMeta?.channels || 0 }} 通道 ·
+                {{ eegLayout === 'stack' ? '纵向堆叠，各通道独立 Y 轴' : '叠加显示，共用 Y 轴' }} ·
+                原始值，未做基线/单位换算）
+              </div>
+              <div ref="eegChannelRef" :style="{ height: eegLayout === 'stack' ? `${Math.max(600, (eegMeta?.channels || 1) * 90)}px` : '600px' }"></div>
             </el-card>
           </el-col>
 
@@ -695,12 +711,17 @@ import { getSubjectsApi as getSubjects, getAssetsApi } from '@/api/data'
 import { fetchAllPages } from '@/utils/fetchAll'
 import { fetchSignedUrlApi } from '@/api/media'
 import { useUserStore } from '@/stores/user'
+import { usePrivacyStore } from '@/stores/privacy'
 import { ElMessage } from 'element-plus'
 
 const userStore = useUserStore()
+const privacy = usePrivacyStore()
 const route = useRoute()
 // 仅管理员可下载原始文件（/file 接口后端已限制 @role_required(ADMIN)）
 const isAdmin = computed(() => userStore.role === 'admin')
+// 受试者敏感字段展示脱敏：非 admin 后端已脱敏故原样返回；
+// admin 受「隐私信息」开关控制（关闭时按 /system/desensitize/config 规则打码）
+const maskField = (key, value) => privacy.mask(key, value)
 
 const selectedSubject = ref(null)
 const subjectList = ref([])
@@ -726,6 +747,9 @@ const riskPieRef = ref()
 const assetBarRef = ref()
 const eegMeta = ref(null)
 const ecgMeta = ref(null)
+// 脑电布局：overlay=全部通道叠加在同一坐标系（默认，共用 Y 轴便于横向对比）
+// stack=纵向堆叠瀑布图（每通道独立 Y 轴，通道多时需要长页面滚动）
+const eegLayout = ref('overlay')
 const eyeMeta = ref(null)       // 眼动指标（sync_data 解析结果）
 const eyeParseFailed = ref(false)  // 眼动解析失败标记：失败时不回退模拟数据，直接展示失败状态
 const scaleMeta = ref(null)     // 量表得分（按文件模式单选，MoCA 等）
@@ -735,7 +759,13 @@ let scaleRadarEls = {}          // 量表雷达图 DOM 引用映射（受试者�
 let scaleRadarCharts = {}       // 量表雷达图 echarts 实例映射（assetId -> chart）
 let radarChart = null
 let eegChannelChart = null
+// 脑电图容器尺寸观察器：堆叠模式容器高度随通道数变化，需自动 resize
+let eegResizeObserver = null
+// EEG 渲染序号：updateEegCharts 含 await，快速切换受试者/资产时丢弃过期渲染
+let eegRenderSeq = 0
 let eegChannelsData = []
+// legend 选中状态（通道名 -> 是否显示），控制堆叠子图里哪些通道参与排布
+let eegLegendSel = {}
 let ecgChart = null
 let eyeChart = null
 let gaitChart = null
@@ -1087,7 +1117,31 @@ const trackOffset = (t) => {
 
 const initCharts = () => {
   if (radarRef.value && !radarChart) radarChart = echarts.init(radarRef.value)
-  if (eegChannelRef.value && !eegChannelChart) eegChannelChart = echarts.init(eegChannelRef.value)
+  // EEG 卡片受 v-if 控制（该受试者/资产无 EEG 时整块卸载），DOM 换了但旧实例
+  // 仍持有已脱离文档的节点。initCharts 跳过重建会导致图画在看不见的地方，
+  // 故这里比对实例绑定的 DOM，不是当前 ref 就先销毁再重建。
+  if (eegChannelRef.value) {
+    const bound = eegChannelChart && !eegChannelChart.isDisposed()
+      ? eegChannelChart.getDom() : null
+    if (bound && bound !== eegChannelRef.value) {
+      try { eegChannelChart.dispose() } catch (e) { /* 实例可能已失效 */ }
+      eegChannelChart = null
+      eegResizeObserver?.disconnect()
+      eegResizeObserver = null
+    }
+    if (!eegChannelChart) {
+      eegChannelChart = echarts.init(eegChannelRef.value)
+      // 堆叠模式下容器高度随通道数变化（模板 :style 绑定），ECharts 不会自动
+      // 跟随容器尺寸；window resize 事件覆盖不到这种「同页内高度变化」，
+      // 故用 ResizeObserver 兜底，任何容器尺寸变化都重新 resize。
+      if (typeof ResizeObserver !== 'undefined') {
+        eegResizeObserver = new ResizeObserver(() => {
+          if (eegChannelChart && !eegChannelChart.isDisposed()) eegChannelChart.resize()
+        })
+        eegResizeObserver.observe(eegChannelRef.value)
+      }
+    }
+  }
   if (ecgRef.value && !ecgChart) ecgChart = echarts.init(ecgRef.value)
   if (eyeRef.value && !eyeChart) eyeChart = echarts.init(eyeRef.value)
   if (gaitRef.value && !gaitChart) gaitChart = echarts.init(gaitRef.value)
@@ -1123,122 +1177,281 @@ const genGait = (points) => {
   return { left, right }
 }
 
-const updateEegCharts = (eeg) => {
+// 通道数据极值：不用 Math.min(...arr) 展开语法 —— 通道点数可达 3000+，
+// 大数组展开有爆栈风险（参数个数上限），EEG 每帧要算 16 次，必须走循环。
+const chExtent = (arr) => {
+  let mn = Infinity, mx = -Infinity
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i]
+    if (v < mn) mn = v
+    if (v > mx) mx = v
+  }
+  return [mn, mx]
+}
+
+// 通道峰峰值
+const updateEegCharts = async (eeg) => {
   if (!eeg) return
+  const seq = ++eegRenderSeq
+  const prevChannels = eegMeta.value?.channels || 0
   eegMeta.value = eeg.meta
   if (!eegChannelChart) return
   const channels = eeg.channels || []
   if (!channels.length) return
-  // 16 通道叠加在一张图里，Y 轴用全局最大最小值
+  // eegMeta 变化会改写堆叠模式的容器高度（channels * 90），ECharts 感知不到
+  // 容器尺寸变化。必须等 DOM 更新后 resize canvas，否则 grid 按新高度布局、
+  // canvas 仍是初始化时的旧高度 → 只显示上半部分（需切一次叠加再切回来才正常）。
+  if (eegMeta.value?.channels !== prevChannels) {
+    await nextTick()
+    // await 期间可能已切换受试者/资产，或图表实例已被销毁重建
+    if (seq !== eegRenderSeq || !eegChannelChart) return
+    eegChannelChart.resize()
+  }
+  if (seq !== eegRenderSeq) return
   const colors = ['#5470c6', '#91cc75', '#fac858', '#ee6666', '#73c0de', '#3ba272',
     '#fc8452', '#9a60fd', '#ea7ccc', '#5d7092', '#c9db70', '#00c2ff',
     '#ff7d00', '#8d98b3', '#e0c3fc', '#fbbf00']
   const numPoints = channels[0].data.length
   const xData = Array.from({ length: numPoints }, (_, i) => i)
 
-  // 保存通道数据用于 legend 切换时重新计算 Y 轴范围
+  // 原始通道数据，**不做任何数值变换**（无基线去除、无缩放、无平移）
   eegChannelsData = channels.map((ch, idx) => ({
     name: ch.name.replace('EXG Channel ', 'CH'),
     data: ch.data,
-  }))
-
-  // 计算全局最大最小值
-  let globalMin = Infinity
-  let globalMax = -Infinity
-  channels.forEach(ch => {
-    for (const v of ch.data) {
-      if (v < globalMin) globalMin = v
-      if (v > globalMax) globalMax = v
-    }
-  })
-
-  const legendData = channels.map((ch, idx) => ({
-    name: ch.name.replace('EXG Channel ', 'CH'),
     color: colors[idx % colors.length],
   }))
 
-  const series = channels.map((ch, idx) => ({
-    name: ch.name.replace('EXG Channel ', 'CH'),
+  const stackMode = eegLayout.value === 'stack'
+  // 后端 unit='counts' 表示原始 ADC 计数，无量纲后缀
+  const unit = eegMeta.value && eegMeta.value.unit === 'counts' ? '' : ' μV'
+
+  // 堆叠模式：每个通道一个独立 grid + 独立 Y 轴，刻度即该通道的原始幅值。
+  // 各通道直流偏置差异极大（实测 45310~106260，是单通道波幅的 7.6 倍），
+  // 共用一个 Y 轴会把每条波形压成一条窄带（观感上「很平、没有波动」）。
+  // 独立 Y 轴既保留原始数值，又让每条波形占满自己的绘图区。
+  // 叠加模式：全部通道共用一个 Y 轴，范围取全局原始值。
+  const visibleCh = () => eegChannelsData.filter(ch => eegLegendSel[ch.name] !== false)
+
+  // Y 轴刻度缩写：原始计数常在 1e4~1e5，6 位数字会挤爆左边距
+  const axFmt = (v) => (Math.abs(v) >= 10000
+    ? `${(v / 1000).toFixed(1)}k`
+    : String(Math.round(v)))
+
+  const chRange = (ch) => {
+    const [mn, mx] = chExtent(ch.data)
+    const pad = (mx - mn) * 0.12 || 1
+    return [Number((mn - pad).toFixed(2)), Number((mx + pad).toFixed(2))]
+  }
+
+  const buildSeries = (list) => list.map((ch, i) => ({
+    name: ch.name,
     type: 'line',
     showSymbol: false,
     data: ch.data,
-    lineStyle: { width: 1, color: colors[idx % colors.length] },
-    itemStyle: { color: colors[idx % colors.length] },
+    xAxisIndex: stackMode ? i : 0,
+    yAxisIndex: stackMode ? i : 0,
+    lineStyle: { width: 1, color: ch.color },
+    itemStyle: { color: ch.color },
     emphasis: { focus: 'series' },
   }))
 
+  // 每个 grid 必须有自己的 xAxis —— ECharts 的 grid.xAxisIndex 是「引用」，
+  // 若 N 个 grid 只给 1 个 xAxis，其余 grid 的坐标系在 axisProxy 阶段拿不到
+  // axis 对象，渲染时读 axis.type 直接抛
+  // "Cannot read properties of undefined (reading 'type')"。
+  // 视觉上只保留最后一个子图的刻度与轴名，中间子图 axisLabel/axisLine 全关。
+  const buildXAxes = (n) => {
+    const out = []
+    for (let i = 0; i < n; i++) {
+      const isLast = i === n - 1
+      out.push({
+        type: 'category',
+        gridIndex: i,
+        data: xData,
+        axisLabel: isLast
+          ? { fontSize: 9, interval: Math.floor(numPoints / 8) || 1 }
+          : { show: false },
+        axisTick: { show: false },
+        axisLine: isLast
+          ? { show: true, lineStyle: { color: '#dcdfe6' } }
+          : { show: false },
+        splitLine: { show: false },
+        axisPointer: { label: isLast ? { show: true } : { show: false } },
+      })
+    }
+    return out
+  }
+
+  // 叠加模式：单个 x 轴，带轴名
+  const buildOverlayXAxis = () => ([{
+    type: 'category',
+    gridIndex: 0,
+    data: xData,
+    name: '采样点',
+    nameLocation: 'middle',
+    nameGap: 24,
+    axisLabel: { fontSize: 9, interval: Math.floor(numPoints / 8) || 1 },
+    axisTick: { show: false },
+    axisLine: { show: true, lineStyle: { color: '#dcdfe6' } },
+    splitLine: { show: false },
+  }])
+
+  const buildStackAxes = (list) => {
+    const n = list.length
+    const top = 46
+    const bottom = 40
+    const gap = 8
+    // 以容器真实高度为准，而不是按可见通道数重算高度：
+    // 容器高度由「总通道数」决定（模板 :style），若这里按可见通道数 n 算
+    // plotH，取消部分通道后子图只占容器上半部分，下半部分空着。
+    const boxH = eegChannelRef.value?.clientHeight || Math.max(600, (eegMeta.value?.channels || n) * 90)
+    const plotH = Math.max(120, boxH - top - bottom)
+    const cellH = (plotH - gap * (n - 1)) / n
+    const grid = []
+    const yAxis = []
+    list.forEach((ch, i) => {
+      const [lo, hi] = chRange(ch)
+      grid.push({
+        left: 104, right: 24,
+        top: top + i * (cellH + gap),
+        height: cellH,
+        xAxisIndex: i,
+        yAxisIndex: i,
+      })
+      yAxis.push({
+        type: 'value',
+        gridIndex: i,
+        min: lo,
+        max: hi,
+        // 通道名贴在各自子图左上角
+        name: ch.name,
+        nameLocation: 'end',
+        nameGap: 6,
+        nameTextStyle: { fontSize: 9, color: ch.color, align: 'right' },
+        axisLabel: { fontSize: 9, formatter: axFmt },
+        axisLine: { show: true, lineStyle: { color: '#dcdfe6' } },
+        splitLine: { show: true, lineStyle: { color: '#f2f3f5' } },
+        splitNumber: 3,
+      })
+    })
+    return { grid, yAxis, xAxis: buildXAxes(n) }
+  }
+
+  const buildOverlayAxes = (list) => {
+    let gMin = Infinity
+    let gMax = -Infinity
+    list.forEach(ch => {
+      const [mn, mx] = chExtent(ch.data)
+      if (mn < gMin) gMin = mn
+      if (mx > gMax) gMax = mx
+    })
+    const pad = (gMax - gMin) * 0.05 || 1
+    return {
+      grid: { left: 104, right: 24, top: 46, bottom: 40 },
+      xAxis: buildOverlayXAxis(),
+      yAxis: [{
+        type: 'value',
+        min: Number((gMin - pad).toFixed(2)),
+        max: Number((gMax + pad).toFixed(2)),
+        name: `原始幅值${unit}`,
+        nameTextStyle: { fontSize: 10 },
+        axisLabel: { fontSize: 9, formatter: axFmt },
+        splitLine: { lineStyle: { color: '#f2f3f5' } },
+      }],
+    }
+  }
+
+  const renderAxes = (list) => (stackMode ? buildStackAxes(list) : buildOverlayAxes(list))
+
+  const vis = visibleCh()
+  if (!vis.length) return
+  const axes = renderAxes(vis)
+  // grid 可能是对象（叠加）或数组（堆叠），统一成 x 轴索引数组
+  const zoomIdx = Array.isArray(axes.grid)
+    ? axes.grid.map((_, i) => i)
+    : [0]
+
   eegChannelChart.setOption({
-    tooltip: { trigger: 'axis', axisPointer: { type: 'line' } },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'line' },
+      // 堆叠模式下鼠标只落在单个子图上，这里汇总所有可见通道在同一样ing点的原始值
+      formatter: (params) => {
+        const arr = Array.isArray(params) ? params : [params]
+        if (!arr.length) return ''
+        const point = arr[0].axisValue
+        const idx = Number(point)
+        const lines = [`采样点 ${point}`]
+        visibleCh().forEach(ch => {
+          const v = ch.data[idx]
+          if (v == null) return
+          lines.push(
+            `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;`
+            + `background:${ch.color};margin-right:5px"></span>${ch.name}: `
+            + `${Number(v).toFixed(1)}${unit}`)
+        })
+        return lines.join('<br/>')
+      },
+    },
     legend: {
       top: 4,
       textStyle: { fontSize: 10 },
-      data: legendData.map(d => d.name),
+      data: eegChannelsData.map(ch => ch.name),
+      selected: eegLegendSel,
     },
-    grid: { left: 80, right: 24, top: 50, bottom: 36 },
-    xAxis: {
-      type: 'category',
-      data: xData,
-      name: '采样点',
-      nameLocation: 'middle',
-      nameGap: 22,
-    },
-    yAxis: {
-      type: 'value',
-      min: globalMin,
-      max: globalMax,
-      name: 'μV',
-      nameLocation: 'end',
-      nameGap: 10,
-      nameTextStyle: { fontSize: 11 },
-    },
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    grid: axes.grid,
+    xAxis: axes.xAxis,
+    yAxis: axes.yAxis,
     dataZoom: [
-      { type: 'inside', xAxisIndex: 0 },
-      { type: 'slider', xAxisIndex: 0, height: 16, bottom: 6 },
+      { type: 'inside', xAxisIndex: zoomIdx },
+      { type: 'slider', xAxisIndex: zoomIdx, height: 16, bottom: 6 },
     ],
-    series,
+    series: buildSeries(vis),
   }, true)
 
-  // legend 切换时重新计算可见通道的 Y 轴范围
+  // legend 切换：重排子图，隐藏的通道不留空槽
   eegChannelChart.off('legendselectchanged')
   eegChannelChart.on('legendselectchanged', (params) => {
-    const selected = params.selected || {}
-    let visMin = Infinity, visMax = -Infinity
-    let hasVisible = false
-    eegChannelsData.forEach(ch => {
-      if (selected[ch.name] !== false) {
-        hasVisible = true
-        for (const v of ch.data) {
-          if (v < visMin) visMin = v
-          if (v > visMax) visMax = v
-        }
-      }
-    })
-    if (hasVisible) {
-      eegChannelChart.setOption({ yAxis: [{ min: visMin, max: visMax }] })
-    }
+    eegLegendSel = { ...(params.selected || {}) }
+    const vis2 = visibleCh()
+    if (!vis2.length) return
+    const ax2 = renderAxes(vis2)
+    const zi = Array.isArray(ax2.grid) ? ax2.grid.map((_, i) => i) : [0]
+    eegChannelChart.setOption({
+      grid: ax2.grid,
+      xAxis: ax2.xAxis,
+      yAxis: ax2.yAxis,
+      dataZoom: [
+        { type: 'inside', xAxisIndex: zi },
+        { type: 'slider', xAxisIndex: zi, height: 16, bottom: 6 },
+      ],
+      series: buildSeries(vis2),
+    }, true)
+    eegChannelChart.resize()
   })
 }
 
-// 批量显示/隐藏所有脑电通道
+// 批量显示/隐藏所有脑电通道（Y 轴由 legendselectchanged 统一重排）
 const toggleAllEegChannels = (show) => {
   if (!eegChannelChart || !eegChannelsData.length) return
   const selected = {}
   eegChannelsData.forEach(ch => { selected[ch.name] = show })
+  eegLegendSel = selected
   eegChannelChart.setOption({ legend: { selected } })
-  if (show) {
-    // 显示全部时重算全局 Y 轴范围
-    let visMin = Infinity, visMax = -Infinity
-    eegChannelsData.forEach(ch => {
-      for (const v of ch.data) {
-        if (v < visMin) visMin = v
-        if (v > visMax) visMax = v
-      }
-    })
-    if (isFinite(visMin) && isFinite(visMax)) {
-      eegChannelChart.setOption({ yAxis: [{ min: visMin, max: visMax }] })
-    }
-  }
 }
+
+// 切换堆叠/叠加布局：容器高度与 Y 轴口径都变，需按新布局完整重绘
+watch(eegLayout, async () => {
+  if (!eegChannelsData.length) return
+  await nextTick()
+  eegChannelChart?.resize()
+  const payload = {
+    meta: eegMeta.value,
+    channels: eegChannelsData.map(ch => ({ name: ch.name.replace(/^CH/, 'EXG Channel '), data: ch.data })),
+  }
+  updateEegCharts(payload)
+})
 
 // 渲染真实 ECG 数据（单通道波形）
 // 后端返回结构：{ meta: { channels, sampleRate, duration, device, points, baseline }, data: [[时间秒, 幅值], ...] }
@@ -1642,6 +1855,7 @@ const disposeAllCharts = () => {
   }
   safeDispose(radarChart, radarRef); radarChart = null
   safeDispose(eegChannelChart, eegChannelRef); eegChannelChart = null
+  eegResizeObserver?.disconnect(); eegResizeObserver = null
   safeDispose(ecgChart, ecgRef); ecgChart = null
   safeDispose(eyeChart, eyeRef); eyeChart = null
   safeDispose(gaitChart, gaitRef); gaitChart = null
@@ -1901,6 +2115,8 @@ const handleResize = () => {
 }
 
 onMounted(async () => {
+  // 年龄/性别遮罩依赖脱敏规则；管理员若尚未加载则补一次（幂等）
+  privacy.loadConfig()
   await loadSubjects()
   await nextTick()
   // 初始页：概览图表（统计卡片 + 风险分布饼图 + 模态分布柱图）

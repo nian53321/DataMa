@@ -29,7 +29,7 @@ from app.services.base import BaseService, ValidationError, ConflictError, NotFo
 from app.utils.audit import log_operation, snapshot_update, snapshot_delete
 from app.models.data_snapshot import save_snapshot
 from app.utils.collection_time import _CN_TZ
-from app.utils.desensitize import desensitize_list
+from app.utils.desensitize import desensitize_list, filter_masked_fields
 from app.utils.like_query import build_like_contains
 from app.utils.response import paginate
 from app.utils.scanner import _PSEUDO_ID_RE
@@ -181,6 +181,16 @@ class SubjectService(BaseService):
         if Subject.query.filter_by(pseudo_id=pseudo_id).first():
             raise ConflictError("受试者伪ID已存在")
 
+        # 写入侧脱敏防护：导入/前端回填可能带来「导出时已脱敏」的掩码值
+        # （如 张** / 136****5031）。这类值不是明文，写库后管理员隐私开关
+        # 打开与关闭显示完全相同（都是掩码），开关失去意义；且管理员改
+        # mask_char 后会在旧掩码上叠加（张** → 张# → 张##）。视为未提供。
+        data, dropped_masked = filter_masked_fields(data)
+        if dropped_masked:
+            logger.info(
+                "创建受试者 %s：剔除掩码值字段 %s（源数据已脱敏，按未提供处理）",
+                pseudo_id, dropped_masked)
+
         subject = Subject(
             pseudo_id=pseudo_id,
             real_name=(data.get("real_name") or "").strip() or None,
@@ -226,6 +236,14 @@ class SubjectService(BaseService):
         """
         subject = self._get_or_404(Subject, subject_id, "受试者不存在")
         old_dict = subject.to_dict()  # 修改前快照
+
+        # 写入侧脱敏防护（同 create_subject）：阻止掩码值被回写
+        if data:
+            data, dropped_masked = filter_masked_fields(data)
+            if dropped_masked:
+                logger.info(
+                    "更新受试者 %s：剔除掩码值字段 %s（源数据已脱敏，按未提供处理）",
+                    subject.pseudo_id, dropped_masked)
 
         for f in ["real_name", "age", "gender", "education_level", "phone", "id_card",
                   "cognitive_risk_level", "emotion_status", "collection_batch",

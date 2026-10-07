@@ -56,8 +56,12 @@
             </template>
             <el-table :data="recentSubjects" border size="small" empty-text="暂无数据">
               <el-table-column prop="pseudo_id" label="伪ID" width="120" />
-              <el-table-column prop="age" label="年龄" width="70" />
-              <el-table-column prop="gender" label="性别" width="70" />
+              <el-table-column prop="age" label="年龄" width="70">
+                <template #default="{ row }">{{ privacy.mask('age', row.age) ?? '—' }}</template>
+              </el-table-column>
+              <el-table-column prop="gender" label="性别" width="70">
+                <template #default="{ row }">{{ privacy.mask('gender', row.gender) || '—' }}</template>
+              </el-table-column>
               <el-table-column prop="status" label="状态">
                 <template #default="{ row }">
                   <el-tag size="small">{{ row.status }}</el-tag>
@@ -175,9 +179,12 @@ import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import { Refresh } from '@element-plus/icons-vue'
 import { getDashboardStatsApi } from '@/api/dashboard'
+import { usePrivacyStore } from '@/stores/privacy'
 
 const router = useRouter()
 const loading = ref(false)
+// 管理员「隐私信息」开关：后端对 admin 返回明文，前端按开关决定是否遮罩
+const privacy = usePrivacyStore()
 
 const stats = ref({
   subject_total: 0,
@@ -361,6 +368,8 @@ const updateCharts = () => {
 const loadStats = async () => {
   loading.value = true
   try {
+    // 遮罩规则来自该接口；未加载时 ruleMap 为空，privacy.mask() 会原样返回明文
+    await privacy.loadConfig()
     const params = {}
     if (logsFilterUsername.value) params.username = logsFilterUsername.value
     const res = await getDashboardStatsApi(params)

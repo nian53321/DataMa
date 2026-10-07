@@ -142,6 +142,97 @@ def is_enabled():
         return _cache["enabled"]
 
 
+# ===================== 掩码值识别（写入侧防护） =====================
+#
+# 背景：导出时勾选「受试者信息脱敏」产生的包，其 userInfo.json 里姓名/电话等
+# 已经是 `张**` / `136****5031` 这样的掩码值。若导入链路不做识别，这些掩码会
+# 被当成真实数据写库 —— 库里从此没有明文，管理员隐私开关「打开/关闭」显示
+# 完全相同（都是掩码），开关形同虚设；更糟的是当管理员把 mask_char 从 `*`
+# 改成 `#` 时，读时脱敏会在旧掩码上再叠一层（`张**` → `张#` → `张##`），
+# 每次读取掩码增长一层。
+#
+# 判定口径：值中出现 mask_char，且**除 mask_char 外没有足够比例的有效字符**，
+# 即认为「这是掩码而非明文」。刻意做得保守 —— 宁可漏判（保留原值）也不误判
+# （把真实姓名当掩码丢弃，那是在毁数据）。
+
+def is_masked_value(value, mask_char="*", field_key=None):
+    """判断单个值是否为「脱敏后的掩码」而非真实数据
+
+    Args:
+        value: 待判定的值（None / 空串 → 不是掩码）
+        mask_char: 掩码字符，默认 '*'
+        field_key: 字段名（预留，用于按字段调整阈值）
+    Returns:
+        bool: True 表示该值是掩码
+    """
+    if value is None:
+        return False
+    s = str(value).strip()
+    if not s:
+        return False
+    mc = (mask_char or "*")[0]
+
+    # 整串全是掩码字符（'***' / '****'）—— 一定是掩码
+    if all(ch == mc for ch in s):
+        return True
+
+    # 含掩码字符，且掩码占比 >= 1/3 —— 视为掩码。
+    # 阈值依据：真实手机号 11 位中最多含 1 个 '-'（不含 *），真实姓名不含 *；
+    # 而 mask_middle(keep_head=3, keep_tail=4) 作用于 11 位手机号会产出
+    # 4 个掩码字符（36%），mask_middle(1,0) 作用于 3 字姓名产出 2 个（67%）。
+    # 取 1/3 可同时覆盖两者，又不会误伤「含单个 *」的真实值。
+    if mc in s:
+        cnt = s.count(mc)
+        if cnt / len(s) >= 1.0 / 3.0:
+            return True
+    return False
+
+
+def filter_masked_fields(data_dict, fields=None):
+    """剔除 dict 中「值为掩码」的敏感字段，返回 (清理后的 dict, 被剔除的字段名列表)
+
+    用于写入侧：把导出包带来的掩码值当作「未提供」处理，不写库。
+    非脱敏字段（如 age / mmse_score 等数值字段）默认不做判定，
+    避免把正常的 0 / 小数值误删；需要时由调用方用 fields 显式指定。
+
+    Args:
+        data_dict: 待清理的字段字典（**不修改原对象**）
+        fields: 参与判定的字段名列表；None 表示「所有已配置脱敏规则的字段」
+    Returns:
+        (cleaned_dict, dropped_list)
+    """
+    if not data_dict:
+        return {}, []
+    if not _cache["loaded"]:
+        try:
+            _load_config()
+        except Exception:
+            return dict(data_dict), []
+    with _cache_lock:
+        rules = dict(_cache["rules"])
+
+    if fields is None:
+        candidates = [k for k in data_dict.keys() if k in rules]
+    else:
+        candidates = [k for k in fields if k in data_dict and k in rules]
+
+    cleaned = dict(data_dict)
+    dropped = []
+    for k in candidates:
+        v = cleaned.get(k)
+        if v is None:
+            continue
+        rule = rules[k]
+        mc = rule.get("mask_char", "*")
+        if is_masked_value(v, mc, field_key=k):
+            cleaned[k] = None
+            dropped.append(k)
+    if dropped:
+        _logger.info(
+            "写入侧脱敏防护：剔除掩码值字段 %s（视为未提供，未写库）", dropped)
+    return cleaned, dropped
+
+
 def mask_value(value, algorithm, keep_head=0, keep_tail=0, mask_char="*"):
     """对单个值应用指定算法的脱敏处理
 

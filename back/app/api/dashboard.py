@@ -11,6 +11,7 @@ from app.models import (
 )
 from app.utils.response import success
 from app.utils.audit import get_current_user, current_role
+from app.utils.desensitize import desensitize_dict
 
 
 @dashboard_bp.route("/stats", methods=["GET"])
@@ -77,8 +78,11 @@ def stats():
     ).count()
 
     # 最近受试者
+    # 按角色脱敏（admin 不脱敏）：本接口只有 @jwt_required、非 admin 也能调，
+    # 不走 SubjectService.list_subjects 故须在此显式脱敏，
+    # 否则非 admin 可拿到 age/gender/phone 等明文
     recent_subjects = [
-        s.to_dict() for s in
+        desensitize_dict(s.to_dict(), role) for s in
         Subject.query.order_by(Subject.created_at.desc()).limit(5).all()
     ]
 

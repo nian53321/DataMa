@@ -36,6 +36,7 @@ from app.utils.media_auth import media_auth_required
 logger = logging.getLogger(__name__)
 from app.utils.decorators import role_required, retry_on_deadlock
 from app.utils.audit import get_current_user, current_role
+from app.utils.desensitize import desensitize_dict
 
 # 北京时间时区偏移（与 app.utils.time._CN_TZ 一致）
 _CN_TZ_DELTA = timedelta(hours=8)
@@ -177,7 +178,10 @@ def create_subject():
     """创建受试者"""
     data = request.get_json(silent=True) or {}
     subject = _svc_subject().create_subject(data)
-    return success(subject.to_dict(), message="创建成功", code=201)
+    # 返回体按角色脱敏：admin 明文，其他角色走规则打码。
+    # 本接口 nurse / engineer 也可调用，不脱敏等于把明文写回响应。
+    return success(desensitize_dict(subject.to_dict(), current_role()),
+                   message="创建成功", code=201)
 
 
 @data_bp.route("/subjects/<int:subject_id>", methods=["PUT"])
@@ -186,7 +190,7 @@ def update_subject(subject_id):
     """更新受试者信息"""
     data = request.get_json(silent=True) or {}
     subject = _svc_subject().update_subject(subject_id, data)
-    return success(subject.to_dict(), message="更新成功")
+    return success(desensitize_dict(subject.to_dict(), current_role()), message="更新成功")
 
 
 @data_bp.route("/subjects/<int:subject_id>", methods=["DELETE"])

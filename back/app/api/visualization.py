@@ -15,6 +15,8 @@ from app.models import Subject, DataAsset, DataType
 from app.utils.response import success, fail
 from app.utils.time import to_local_str
 from app.utils.media_auth import media_auth_required
+from app.utils.audit import current_role
+from app.utils.desensitize import desensitize_dict
 from app.services.asset_service import _decrypt_for_serving
 
 
@@ -26,8 +28,12 @@ def subject_overview(subject_id):
     if not subject:
         return fail("受试者不存在", 404)
     assets = DataAsset.query.filter_by(subject_id=subject_id).all()
+    # 按角色脱敏（admin 不脱敏）：本接口直接回传 subject.to_dict()，
+    # 不走 SubjectService.list_subjects，故必须在此显式脱敏，
+    # 否则非 admin 可拿到 age/gender/phone 等明文（可视化页受试者信息面板会展示）
+    subject_data = desensitize_dict(subject.to_dict(), current_role())
     return success({
-        "subject": subject.to_dict(),
+        "subject": subject_data,
         "modalities": [
             {"id": a.id, "data_type": a.data_type.value, "file_name": a.file_name,
              "file_url": f"/api/data/assets/{a.id}/file",
@@ -308,13 +314,33 @@ def _parse_eeg_csv(text):
         sample_rate = 500
         duration_sec = round(total / sample_rate, 2)
 
-    # 降采样：每通道最多保留 1500 点（便于前端绘制）
+    # 降采样：min-max 桶聚合（与心电 ecg_asset_parse 同一范式）。
+    # 跨步采样（每 N 点取 1）会混叠掉高频成分、把波形削平，
+    # 每桶按时间顺序输出最小/最大值两点，完整保留包络。
+    # 注意：桶内取的是**原始采样点本身的值**（不取均值），不改任何幅值。
     max_points = 1500
-    step = max(1, total // max_points)
-
     channels = []
     for ci, (_, ch_name) in enumerate(channel_indices):
-        downsampled = [round(channel_data[ci][i], 2) for i in range(0, total, step)]
+        raw = channel_data[ci]
+        if total <= max_points:
+            downsampled = [round(v, 2) for v in raw]
+        else:
+            bucket = total / max_points
+            downsampled = []
+            for b in range(max_points):
+                start = int(b * bucket)
+                end = min(int((b + 1) * bucket), total)
+                if start >= end:
+                    continue
+                seg = raw[start:end]
+                vmin, vmax = min(seg), max(seg)
+                if vmin == vmax:
+                    downsampled.append(round(vmin, 2))
+                    continue
+                # 桶内极值按原始时间顺序输出，保持包络的时序形态
+                pair = sorted([(start + seg.index(vmin), vmin),
+                               (start + seg.index(vmax), vmax)])
+                downsampled.extend(round(v, 2) for _, v in pair)
         channels.append({"name": ch_name, "data": downsampled})
 
     return success({
@@ -324,6 +350,9 @@ def _parse_eeg_csv(text):
             "channels": num_channels,
             "totalSamples": total,
             "device": f"OpenBCI ({num_channels}ch)",
+            # 原始 ADC 计数，未做任何基线/增益/单位换算
+            "baselineRemoved": False,
+            "unit": "counts",
         },
         "channels": channels,
     })

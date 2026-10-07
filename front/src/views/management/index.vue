@@ -10,6 +10,7 @@
       </el-space>
     </div>
 
+    
     <el-radio-group v-model="viewMode" style="margin-bottom: 12px" @change="onViewModeChange">
       <el-radio-button value="subject">按受试者</el-radio-button>
       <el-radio-button value="type">按数据类型</el-radio-button>
