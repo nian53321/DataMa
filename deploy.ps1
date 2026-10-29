@@ -28,6 +28,32 @@ function Test-Command {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+# 执行外部命令并返回退出码，保证"绝不因 stderr 输出而中断脚本"。
+# 背景（实测 Windows PowerShell 5.1.26100）：在 $ErrorActionPreference='Stop' 下，
+# 原生命令写到 stderr 的任意一行都会被包装成 NativeCommandError 并作为**终止性错误**抛出，
+# 而且 `2>$null`、`2>&1`、`*> $null 2>&1` 三种重定向都挡不住（重定向只改变去向，
+# 不改变错误分类）。唯一可靠的办法是临时把偏好降为 Continue，靠 $LASTEXITCODE 判定。
+# 这对本脚本至关重要：docker image inspect 对缺失镜像、docker pull 拉取失败、docker info
+# 在守护进程未启动时，全部会写 stderr —— 而这些正是脚本"预期会失败并降级"的分支。
+function Invoke-ExternalQuiet {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $Exe @Arguments 2>&1)
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    # catch 前后 $LASTEXITCODE 由被调进程决定；执行失败时它会被置为真实退出码（实测失败时为 1）
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output   = $output
+    }
+}
+
 function Get-RandomHex {
     param([int]$Length = 32)
     # 用 .NET RandomNumberGenerator 生成密码学安全的随机字节
@@ -89,27 +115,33 @@ if (-not (Test-Command 'docker')) {
     Write-Host '  请先安装 Docker Desktop: https://www.docker.com/products/docker-desktop/' -ForegroundColor Yellow
     exit 1
 }
-$dockerVersion = (docker --version 2>$null)
-Write-OK "Docker 已安装: $dockerVersion"
+$verResult = Invoke-ExternalQuiet -Exe 'docker' -Arguments @('--version')
+$dockerVersion = ($verResult.Output | Where-Object { $_ -is [string] } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' '
+if ($dockerVersion) { Write-OK "Docker 已安装: $dockerVersion" } else { Write-Warn2 '无法读取 docker 版本（继续尝试）' }
 
 # 检查 docker compose 子命令（新版 Docker 内置，不再需要 docker-compose 可执行文件）
-$composeOutput = docker compose version 2>&1
-if ($LASTEXITCODE -ne 0) {
+$composeResult = Invoke-ExternalQuiet -Exe 'docker' -Arguments @('compose', 'version')
+if ($composeResult.ExitCode -ne 0) {
     Write-Err2 'docker compose 子命令不可用'
     Write-Host '  请升级 Docker Desktop 到较新版本（内置 compose 子命令）' -ForegroundColor Yellow
     exit 1
 }
-$composeVersion = ($composeOutput | Select-String 'Docker Compose version').ToString().Trim()
+# 输出首行形如 "Docker Compose version v2.24.5"，但不同版本措辞会变，
+# 因此匹配不到关键字时回退为输出原文 —— 不能直接对 Select-String 的空结果调 .ToString()
+# （$null.ToString() 会抛 "不能对 Null 值表达式调用方法" 并终止脚本，已实测）。
+$composeLine = $composeResult.Output | Select-String 'Docker Compose version' | Select-Object -First 1
+$composeVersion = if ($composeLine) { $composeLine.ToString().Trim() } else { ($composeResult.Output -join ' ').Trim() }
 Write-OK "Docker Compose: $composeVersion"
 
-# 检查 Docker Engine 是否在运行
-try {
-    docker info *> $null 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw 'docker info 失败'
-    }
-    Write-OK 'Docker Engine 正在运行'
-} catch {
+# 检查 Docker Engine 是否在运行。守护进程未启动时 docker info 必然往 stderr 写
+# "failed to connect to the docker API"，在 Stop 偏好下会直接抛异常，
+# 因此取值走 Invoke-ExternalQuiet，并用退出码 + Server 版本双重判定，避免误报。
+$infoResult = Invoke-ExternalQuiet -Exe 'docker' -Arguments @('info', '--format', '{{.ServerVersion}}')
+$serverVersion = ($infoResult.Output | Where-Object { $_ -is [string] } | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ''
+$engineRunning = ($infoResult.ExitCode -eq 0) -and ($serverVersion -match '^\d+\.\d+')
+if ($engineRunning) {
+    Write-OK "Docker Engine 正在运行（Server $serverVersion）"
+} else {
     Write-Err2 'Docker Engine 未运行'
     Write-Host '  请启动 Docker Desktop 并等待右下角鲸鱼图标变为稳定状态' -ForegroundColor Yellow
     exit 1
@@ -157,6 +189,19 @@ if (-not (Test-Path $keysMasterKey)) {
     Write-Warn2 'back/keys/master.key 不存在，首次启动后端会自动生成'
 } else {
     Write-OK 'back/keys/master.key（已存在，将复用）'
+    # 密钥目录自动快照：master.key 一旦丢失，后端会在下次启动时"静默自建"新密钥，
+    # 旧密文永久无法解密且全程无报错。脚本每次运行先留一份快照，成本近乎为零。
+    # 快照放在 back/keys/_backup/<时间戳>/，不递归自身、不进 git、不影响容器读取
+    # （容器只读 /app/keys/master.key 与 desens.key 两个具名文件）。
+    $keysBackupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $keysBackupDir = Join-Path $keysDir "_backup/$keysBackupStamp"
+    try {
+        New-Item -ItemType Directory -Path $keysBackupDir -Force | Out-Null
+        Get-ChildItem -Path $keysDir -File | Copy-Item -Destination $keysBackupDir -Force
+        Write-OK "密钥已快照到 back/keys/_backup/$keysBackupStamp/"
+    } catch {
+        Write-Warn2 "密钥快照失败（$($_.Exception.Message)），请手工复制 back/keys 目录"
+    }
 }
 
 # ============ 3. 生成或修补 back/.env ============
@@ -186,20 +231,35 @@ if (-not (Test-Path $envFile)) {
     }
     # 已有 .env 但缺密钥文件路径（旧版升级）：补上，否则容器内后端回落到默认
     # /app/master.key 与挂载目录 /app/keys 不一致，会误生成新密钥导致旧数据无法解密
+    #
+    # 判据必须用 (?m) 多行模式：PowerShell 的 -match/-notmatch 默认不启用多行，
+    # `^` 只锚定整个字符串的起点。原实现 `$content -notmatch '^\s*MASTER_KEY_PATH\s*='`
+    # 因此永远只看第一行 —— 对正常 .env（该键在 30 行左右）恒判为"缺失"，
+    # 结果是每次重跑脚本都会往文件里重复追加一组同名配置，逐次膨胀。
     $missingKeyPaths = @()
-    if ($content -notmatch '^\s*MASTER_KEY_PATH\s*=') { $missingKeyPaths += 'MASTER_KEY_PATH' }
-    if ($content -notmatch '^\s*DESENS_KEY_PATH\s*=') { $missingKeyPaths += 'DESENS_KEY_PATH' }
+    if (-not [regex]::IsMatch($content, '(?m)^\s*MASTER_KEY_PATH\s*=')) { $missingKeyPaths += 'MASTER_KEY_PATH' }
+    if (-not [regex]::IsMatch($content, '(?m)^\s*DESENS_KEY_PATH\s*=')) { $missingKeyPaths += 'DESENS_KEY_PATH' }
     if ($missingKeyPaths.Count -gt 0) {
         $lines = @()
+        $inserted = $false
         foreach ($line in $content -split "`r?`n") {
             $lines += $line
-            if ($line -match '^\s*GUNICORN_WORKERS\s*=') {
+            if (-not $inserted -and $line -match '^\s*GUNICORN_WORKERS\s*=') {
                 # 在 GUNICORN_WORKERS 之后追加密钥路径配置（与 .env.example 顺序一致）
                 $lines += ''
                 $lines += '# 密钥文件路径（docker-compose 把宿主机 back/keys/ 目录挂载到容器 /app/keys）'
                 if ('MASTER_KEY_PATH' -in $missingKeyPaths) { $lines += 'MASTER_KEY_PATH=/app/keys/master.key' }
                 if ('DESENS_KEY_PATH' -in $missingKeyPaths) { $lines += 'DESENS_KEY_PATH=/app/keys/desens.key' }
+                $inserted = $true
             }
+        }
+        if (-not $inserted) {
+            # 自建 .env 可能没有 GUNICORN_WORKERS 作锚点。原先这种情况会"什么都没写"
+            # 但仍打印"已自动补上"，属于谎报；这里改为追加到文件末尾。
+            $lines += ''
+            $lines += '# 密钥文件路径（docker-compose 把宿主机 back/keys/ 目录挂载到容器 /app/keys）'
+            if ('MASTER_KEY_PATH' -in $missingKeyPaths) { $lines += 'MASTER_KEY_PATH=/app/keys/master.key' }
+            if ('DESENS_KEY_PATH' -in $missingKeyPaths) { $lines += 'DESENS_KEY_PATH=/app/keys/desens.key' }
         }
         $content = $lines -join "`n"
         Write-EnvFile -Path $envFile -Content $content
@@ -217,8 +277,8 @@ if ($needGenerate) {
     # 读取并替换（值用双引号包裹：防止密码以 # 开头时被 dotenv/compose 当成注释；
     # 密码已不含 $，compose 不会插值）
     $content = Get-Content $envFile -Raw -Encoding UTF8
-    $content = $content -replace 'DB_PASSWORD=.*', "DB_PASSWORD=`"$dbPassword`""
-    $content = $content -replace 'JWT_SECRET_KEY=.*', "JWT_SECRET_KEY=`"$jwtSecret`""
+    $content = $content -replace '(?m)^[ \t]*DB_PASSWORD=.*', "DB_PASSWORD=`"$dbPassword`""
+    $content = $content -replace '(?m)^[ \t]*JWT_SECRET_KEY=.*', "JWT_SECRET_KEY=`"$jwtSecret`""
     Write-EnvFile -Path $envFile -Content $content
 
     Write-OK "已生成 DB_PASSWORD（已脱敏显示）"
@@ -233,8 +293,8 @@ if ($needGenerate) {
         Write-Warn2 '检测到 back/.env 中 DB_PASSWORD 含有 $ 字符（docker compose 会将其插值改写导致密码不一致）'
         $dbPassword = Get-StrongPassword
         $jwtSecret = Get-RandomHex 32
-        $content = $content -replace 'DB_PASSWORD=.*', "DB_PASSWORD=`"$dbPassword`""
-        $content = $content -replace 'JWT_SECRET_KEY=.*', "JWT_SECRET_KEY=`"$jwtSecret`""
+        $content = $content -replace '(?m)^[ \t]*DB_PASSWORD=.*', "DB_PASSWORD=`"$dbPassword`""
+        $content = $content -replace '(?m)^[ \t]*JWT_SECRET_KEY=.*', "JWT_SECRET_KEY=`"$jwtSecret`""
         Write-EnvFile -Path $envFile -Content $content
         Write-OK '已重新生成不含 $ 字符的 DB_PASSWORD（已脱敏显示）'
     }
@@ -313,15 +373,19 @@ $baseImages = @(
 )
 $pullFailed = @()
 foreach ($img in $baseImages) {
-    # 先检查本地是否已有该镜像（避免重复拉取）
-    $exists = docker image inspect $img *> $null 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    # 先检查本地是否已有该镜像（避免重复拉取）。
+    # 必须走 Invoke-ExternalQuiet：镜像不存在时 docker 会往 stderr 写 "Error: No such image"，
+    # 在 $ErrorActionPreference='Stop' 下这行 stderr 会变成终止性错误 —— 而本分支的设计意图
+    # 恰恰就是"不存在就去拉"，裸调会让脚本在第一个缺失镜像处直接崩掉（实测 PS 5.1）。
+    $inspectResult = Invoke-ExternalQuiet -Exe 'docker' -Arguments @('image', 'inspect', $img)
+    if ($inspectResult.ExitCode -eq 0) {
         Write-OK "$img（本地已存在）"
         continue
     }
     Write-Host "  拉取 $img ..." -ForegroundColor DarkGray
-    docker pull $img *> $null 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    # 同理：拉取失败必定写 stderr（网络/鉴权），此处只记录不中断
+    $pullResult = Invoke-ExternalQuiet -Exe 'docker' -Arguments @('pull', $img)
+    if ($pullResult.ExitCode -eq 0) {
         Write-OK "$img"
     } else {
         Write-Warn2 "$img 拉取失败（可能是网络问题）"

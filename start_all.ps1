@@ -7,8 +7,10 @@
     见 reset_orbbec_usb.ps1），宿主机无需运行任何采集进程。
     本脚本：
       1. 检查深度摄像头是否已透传给 WSL2（未透传时提示运行 reset_orbbec_usb.ps1）
-      2. 启动全部 Docker 服务（后端/前端/MySQL/Redis/Celery）
-      3. 等待后端健康检查
+      2. 检查 back/.env 与根目录 .env 是否就绪（首次部署需先跑 deploy.ps1）
+      3. 检查 Docker Engine 是否在运行
+      4. docker compose up -d --build 启动全部服务（后端/前端/MySQL/Redis/Celery）
+      5. 等待后端健康检查
 .NOTES
     用法（项目根目录，PowerShell）：
       ./start_all.ps1                # 日常启动（深度相机需先透传）
@@ -58,24 +60,58 @@ if ($usbipd) {
         Write-Host '  请以管理员身份运行: ./reset_orbbec_usb.ps1 （会自动启动服务并透传设备）' -ForegroundColor Yellow
         Write-Host '  或管理员 PowerShell 执行: Start-Service usbipd' -ForegroundColor Yellow
     }
-    # 注意：usbipd-win 5.x attach 后设备挂到 WSL 共享内核 vhci，从 Windows 侧
-    # usbipd list 中消失，因此"列表里找不到"通常意味着已透传（或未插/未 bind）；
-    # 若设备仍在列表（Shared/Not shared）则未透传。
-    $listOut = @(& $usbipd list)
-    $line = $listOut | Select-String '2bc5:066b|8086:0b5c|8086:0b5d|Orbbec Femto Bolt|RealSense' | Select-Object -First 1
-    if ($line) {
-        $stateMatch = @($line.ToString() -split '\s{2,}' | Where-Object { $_ -match 'Shared|Attached|Not shared' })
-        $state = if ($stateMatch.Count -gt 0) { $stateMatch[0] } else { 'Unknown' }
-        if ($state -match 'Attached') {
-            Write-OK "深度摄像头已透传给 WSL（busid=$((($line.ToString()) -split '\s{2,}')[0].Trim())），容器内可直接识别"
-        } else {
-            Write-Warn "深度摄像头未透传给 WSL2（usbipd list 中状态: $state）"
-            Write-Host '  请以管理员身份运行: ./reset_orbbec_usb.ps1' -ForegroundColor Yellow
-            Write-Host '  （首次部署或拔插摄像头后必做；完成后深度相机在视频采集弹窗中可用）' -ForegroundColor Yellow
+    # usbipd list 的输出分两段：
+    #   Connected:  BUSID  VID:PID  DEVICE  STATE   ← 仍挂在 Windows 侧的设备（有 STATE 列）
+    #   Persisted:  GUID   DEVICE                    ← 历史上 bind 过的设备（**没有** STATE 列）
+    # 关键事实：usbipd-win 5.x attach 成功后设备会从 Connected 段消失、只留 Persisted 记录。
+    # 所以"VID:PID 不在列表里"既可能是已透传，也可能是没插 —— 不能一句话下结论。
+    # 旧实现对任意匹配行都去解析 STATE，而命中 Persisted 段那行永远解不出状态 → 得到
+    # 'Unknown' → 把"已透传"误报成"未透传"，反过来引导用户去反复 reset。
+    # 另外 usbipd 会往 stderr 写 warning（如 UsbDk 冲突），在 Stop 偏好下会中断脚本，
+    # 故临时降偏好取值。
+    $prevEapUsb = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $listOut = @(& $usbipd list 2>&1)
+    $ErrorActionPreference = $prevEapUsb
+
+    $inPersisted = $false
+    $connectedLine = $null
+    $persistedLine = $null
+    foreach ($rawLine in $listOut) {
+        $t = [string]$rawLine
+        if ($t -match '^\s*Persisted:') { $inPersisted = $true; continue }
+        if ($t -match '^\s*Connected:') { $inPersisted = $false; continue }
+        if ($t -notmatch '2bc5:066b|8086:0b5c|8086:0b5d|Orbbec Femto Bolt|RealSense') { continue }
+        if ($inPersisted) {
+            if (-not $persistedLine) { $persistedLine = $t }
+        } elseif (-not $connectedLine) {
+            $connectedLine = $t
         }
+    }
+
+    if ($connectedLine) {
+        # 仍在 Connected 段 → 可以读到真实 STATE
+        $fields = @($connectedLine -split '\s{2,}' | Where-Object { $_ -and $_.Trim() })
+        $busid = $fields[0].Trim()
+        $state = 'Unknown'
+        foreach ($f in $fields) {
+            if ($f -match 'Attached|Shared|Not shared') { $state = $f.Trim(); break }
+        }
+        if ($state -match 'Attached') {
+            Write-OK "深度摄像头已 attach 到 WSL（busid=$busid），容器内可直接识别"
+        } elseif ($state -match 'Shared') {
+            Write-Warn "深度摄像头已共享但尚未 attach 到 WSL（busid=$busid）"
+            Write-Host '  请以管理员身份运行: ./reset_orbbec_usb.ps1' -ForegroundColor Yellow
+        } else {
+            Write-Warn "深度摄像头未透传（busid=$busid，状态: $state）"
+            Write-Host '  请以管理员身份运行: ./reset_orbbec_usb.ps1（会自动 bind + attach）' -ForegroundColor Yellow
+        }
+    } elseif ($persistedLine) {
+        # 不在 Connected 段，但 Persisted 段留有记录 → 最可能是已 attach 给 WSL
+        Write-OK '深度摄像头未出现在 Windows 设备列表中（Persisted 段留有历史记录），通常表示已 attach 给 WSL'
+        Write-Host '  若视频采集弹窗里仍看不到相机，再以管理员身份运行: ./reset_orbbec_usb.ps1' -ForegroundColor DarkGray
     } else {
-        # 设备枚举失败（usbipd 显示 0000:0005 "描述符无效"/Windows 报错误 43）时软件无法修复，
-        # 必须物理断电重启设备或排查 USB 链路（端口/线材）。给出明确排查步骤，避免盲目重试。
+        # 两段都没有 → 没插 / 没 bind / USB 枚举失败，需要分情况提示
         $broken = $listOut | Select-String '0000:0002|0000:0005|描述符请求失败|描述符无效|未知 USB 设备' | Select-Object -First 1
         if ($broken) {
             Write-Err2 '深度摄像头 USB 枚举失败（Windows 无法识别设备，错误代码 43 / 描述符无效）'
@@ -115,6 +151,25 @@ Write-OK '环境文件检查通过'
 
 # ============ 3. 启动 Docker 服务 ============
 Write-Step '启动 Docker 服务'
+
+# Docker Desktop 未启动（或 WSL 后端还没就绪）是最常见的失败原因。先做一次明确判定，
+# 否则用户只会看到一串 "failed to connect to the docker API at npipe://..."。
+# 注意：Windows PowerShell 5.1 在 $ErrorActionPreference='Stop' 下会把原生命令写到
+# stderr 的任意一行当终止错误抛出，`2>$null` / `2>&1` / `*> $null 2>&1` 都挡不住（实测），
+# 所以这里临时把偏好降为 Continue 再取值，靠退出码判定。
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$dockerInfoOut = @(docker info --format '{{.ServerVersion}}' 2>&1)
+$dockerInfoExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+$serverVersion = (($dockerInfoOut | Where-Object { $_ -is [string] }) -join '').Trim()
+if ($dockerInfoExit -ne 0 -or $serverVersion -notmatch '^\d+\.\d+') {
+    Write-Err2 'Docker Engine 未运行（或 Docker Desktop 尚未就绪）'
+    Write-Host '  请先启动 Docker Desktop，等右下角鲸鱼图标变为稳定状态后再运行本脚本' -ForegroundColor Yellow
+    exit 1
+}
+Write-OK "Docker Engine 正在运行（Server $serverVersion）"
+
 & docker compose up -d --build
 if ($LASTEXITCODE -ne 0) {
     Write-Err2 'docker compose up 失败，请查看上方日志'
