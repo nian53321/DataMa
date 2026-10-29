@@ -59,7 +59,7 @@
 |---|---|---|
 | Docker Desktop（≥ 4.30） | 容器运行时（WSL2 后端） | 官网下载 https://www.docker.com/products/docker-desktop/ |
 | usbipd-win | 把 USB 设备透传给 WSL2（**深度摄像头必需**） | `winget install dorssel.usbipd-win` |
-| Ubuntu（WSL 发行版） | usbip 客户端，负责识别/挂载摄像头（**深度摄像头必需**） | `wsl --install -d Ubuntu` |
+| Ubuntu（WSL 发行版） | usbip 客户端，负责识别/挂载摄像头（**深度摄像头必需**） | `wsl --install -d Ubuntu`，或本地 `.wsl` 镜像（见下方方式 B） |
 
 > **为什么深度摄像头必须装 usbipd-win + Ubuntu？**
 > Docker Desktop（WSL2 后端）的 Linux 容器无法直接访问 Windows 宿主机 USB 设备。
@@ -85,6 +85,8 @@
 
 ### 安装 usbipd-win 与 Ubuntu（深度摄像头必做）
 
+#### 方式 A：在线安装（有网络、Microsoft Store 可用）
+
 以普通 PowerShell 执行：
 
 ```powershell
@@ -107,6 +109,58 @@ usbipd --version   # 应能输出版本号
 > 若 `wsl --install` 报错，先执行 `wsl --update` 再重试。
 > Ubuntu 发行版名如果不是 `ubuntu`（例如 `Ubuntu-22.04`），运行 `reset_orbbec_usb.ps1` 时加参数：
 > `./reset_orbbec_usb.ps1 -WslDistro Ubuntu-22.04`
+
+#### 方式 B：用本地 `.wsl` 镜像安装（离线 / 内网 / Microsoft Store 不可用）
+
+Windows 的 WSL **2.4.4 及以上**版本支持直接读取本地 `.wsl` 文件安装发行版。`.wsl` 就是一个
+改过扩展名的 tar 归档（gzip 压缩），内含 rootfs 与 `/etc/wsl-distribution.conf`，
+后者决定注册名与首次启动行为。
+
+本项目实测可用的镜像：
+
+| 项 | 值 |
+|---|---|
+| 版本 | Ubuntu WSL 24.04.5 LTS (Noble Numbat) |
+| 下载地址 | `https://cdimages.ubuntu.com/ubuntu-wsl/noble/daily-live/current/noble-wsl-amd64.wsl` |
+| 大小 | 388,975,696 字节（约 371 MB） |
+| SHA256 | `bb415d824822c4b878125729af451a5d18fb13d1cf5cbed9a7393ad64ac6039e` |
+| 注册后的发行版名 | `Ubuntu-24.04`（取自镜像内 `/etc/wsl-distribution.conf` 的 `oobe.defaultName`） |
+| 架构 | amd64（对应 `*-arm64.wsl` 为 ARM 设备） |
+
+> **下载地址为什么不是 `aka.ms/wslubuntu2404`**：该短链已失效（302 跳转到 bing）；
+> `aka.ms/wslubuntu2204` 仍可用但只指向 2022 年构建的 22.04 包。Ubuntu 官方也已停止在
+> `cloud-images.ubuntu.com/wsl/` 发布 WSL 镜像（该页明确提示发布已迁至 `cdimages.ubuntu.com`，
+> 旧路径下只剩 `manifest` 与空的 `unpacked/` 目录）。上表是当前唯一仍在维护的官方路径。
+
+安装步骤：
+
+```powershell
+# 1. 校验文件完整性（结果必须与上表 SHA256 完全一致）
+Get-FileHash "$env:USERPROFILE\Downloads\noble-wsl-amd64.wsl" -Algorithm SHA256
+
+# 2. 确认 WSL 版本 ≥ 2.4.4（低于此版本不认 --from-file）
+wsl --version
+
+# 3. 安装
+wsl --install --from-file "$env:USERPROFILE\Downloads\noble-wsl-amd64.wsl"
+
+# 4. 验证：列表中应出现 Ubuntu-24.04，VERSION 为 2
+wsl -l -v
+```
+
+也可以在资源管理器里**双击**该 `.wsl` 文件安装，效果等同（`.wsl` 扩展名已关联到安装动作）。
+
+首次启动会执行镜像内的 `/usr/lib/wsl/wsl-setup`，引导创建 UNIX 用户名与密码——
+这一步与在线安装相同，本平台只用该发行版作 usbip 客户端，用户名密码不参与部署流程。
+
+> **⚠️ 本方式注册的发行版名是 `Ubuntu-24.04`**。`reset_orbbec_usb.ps1` 的 `-WslDistro`
+> 默认值是 `ubuntu`，名称不匹配时脚本会**自动改用第一个可用的非 docker 发行版**并打印警告
+> （`reset_orbbec_usb.ps1` 第 826-842 行），所以只有一个 Ubuntu 时不指定也能跑通。
+> 但机器上同时存在多个 Ubuntu（如 22.04 + 24.04）时自动选择可能不是你要的那个，建议显式指定：
+>
+> ```powershell
+> .\reset_orbbec_usb.ps1 -WslDistro Ubuntu-24.04
+> ```
 
 ### 系统要求
 
@@ -244,7 +298,7 @@ cd <项目目录>
 
 1. 安装 Docker Desktop 并重启，配置镜像加速
 2. `winget install dorssel.usbipd-win`
-3. `wsl --install -d Ubuntu`
+3. `wsl --install -d Ubuntu`（无外网或 Store 不可用时，改用本地 `.wsl` 镜像，见上方"方式 B"）
 
 ### 第二步：摄像头 USB 透传（有深度摄像头时）
 
