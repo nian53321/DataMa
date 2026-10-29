@@ -262,9 +262,12 @@ cd <项目目录>
 .\start_all.ps1
 ```
 
-脚本自动完成：检查摄像头透传状态（未透传时提示运行 `reset_orbbec_usb.ps1`）→ `docker compose up -d --build` → 等待后端健康检查。深度摄像头由容器内 pyk4a / pyrealsense2 直连 USB（usbipd-win 5.x 共享内核 vhci 透传），宿主机无需运行任何采集进程（`camera_service/` 旧架构降级服务不再自动启动）。
+脚本自动完成：检查摄像头透传状态（未透传时提示运行 `reset_orbbec_usb.ps1`）→ 检查 `back/.env` 与根目录 `.env` → 检查 Docker Engine 是否在运行 → `docker compose up -d --build` → 等待后端健康检查。深度摄像头由容器内 pyk4a / pyrealsense2 直连 USB（usbipd-win 5.x 共享内核 vhci 透传），宿主机无需运行任何采集进程（`camera_service/` 旧架构降级服务不再自动启动）。
 
-> 首次部署会构建镜像（需 5-10 分钟）。若 `back/.env` 不存在（首次部署），先运行一次 `.\deploy.ps1` 生成 `back/.env` 与根目录 `.env`（自动生成强密码 + JWT 密钥，值带引号写入），之后日常启动用 `.\start_all.ps1` 即可。
+> **每次运行都会执行 `--build`**（保留这一行为是有意的：后台改了 `back/` 或 `front/` 的代码，
+> 不重建镜像就不会生效）。首次构建需 5-10 分钟，之后有 Docker 层缓存通常几十秒。
+> 若 `back/.env` 不存在（首次部署），先运行一次 `.\deploy.ps1` 生成 `back/.env` 与根目录 `.env`
+> （自动生成强密码 + JWT 密钥，值带引号写入），之后日常启动用 `.\start_all.ps1` 即可。
 
 #### 方式 B：一键部署脚本（仅首次部署/重新部署，会拉镜像+构建）
 
@@ -274,8 +277,9 @@ cd <项目目录>
 ```
 
 脚本自动完成：
-- 检查 Docker 环境
+- 检查 Docker 环境（docker / docker compose 子命令 / Docker Engine 是否在运行）
 - 生成 `back/.env`（自动生成强密码和 JWT 密钥；密码仅含 `!*()-_=+` 等 URL 安全字符，值带引号写入）
+- 检测 `back/keys/master.key` 已存在时，自动快照到 `back/keys/_backup/<时间戳>/`（防止误覆盖导致旧密文永久无法解密）
 - 同步根目录 `.env`（供 docker-compose.yml 读取 DB_PASSWORD）
 - 拉镜像 + 构建镜像 + 启动所有服务
 - 等待后端健康检查通过
@@ -294,8 +298,8 @@ cd <项目目录>
 >
 > **密码字符限制**（务必遵守，否则部署后 MySQL/后端密码不一致）：
 > - ❌ 不能包含 `$` —— docker compose 解析 `.env` 时会把 `$VAR` 当作变量插值改写
-> - ❌ 不能包含 `@` —— 后端 SQLAlchemy 连接串把第一个 `@` 当作用户名/密码分隔符，`@` 后内容会拼进 host 导致连接失败
-> - ❌ 建议避免 `# % & / : ?` 等字符（部分解析器会把 `#` 当注释、`:` `/` `?` `%` 影响 URL 连接串）
+> - ❌ 不能包含 `/` —— 后端拼连接串时用 `urllib.parse.quote()` 编码密码，而 `quote()` 默认不转义 `/`，会把 DSN 的路径段切断
+> - ⚠️ 建议避免 `# % & : ?` 等字符 —— 它们在不同解析层面（docker compose 读 `.env`、MySQL 的 URL 连接串）可能被赋予特殊含义；其中 `@` `:` `#` 会被 `quote()` 转义、通常不会出问题，但既然有更安全的选择就不必冒险
 > - ✅ 推荐使用 `!*()-_=+` 或纯字母数字（如 `python -c "import secrets;print(secrets.token_hex(16))"` 生成的 32 位 hex）
 >
 > **注意**：密码自定义需在**首次部署前**完成；若已用自动密码部署过，之后再改密码需同步修改 `back/.env` 和根目录 `.env` 两处，且 MySQL 容器只在首次初始化数据卷时读取密码（改密码需 `docker compose exec mysql mysql -uroot -p` 执行 `ALTER USER` 或删除 mysql 数据卷重建）。
@@ -317,8 +321,9 @@ Copy-Item .env.example .env
 | `JWT_SECRET_KEY` | JWT 签名密钥 | `python -c "import secrets;print(secrets.token_hex(32))"` |
 
 **注意**：保持 `DB_HOST=mysql`、`CELERY_BROKER_URL=redis://redis:6379/0`、`CELERY_RESULT_BACKEND=redis://redis:6379/1` 不要改回 localhost，这是容器间服务名通信的必需配置。
-**注意**：`.env` 中密码/密钥**不要包含 `$` 字符**——docker compose 解析 `.env` 时会把 `$VAR` 当作变量插值改写，导致 MySQL 与后端密码不一致（双引号包裹也无法避免）。
-**注意**：密码**不要包含 `@` 字符**——后端 SQLAlchemy 数据库连接串会把第一个 `@` 当作 userinfo 分隔符，`@` 后面的内容会拼进 host 导致连接失败（如报 `Can't connect to MySQL server on 'xxx@mysql'`）。后端已对密码做 URL 编码，手工填写含 `@` 的密码也能正常工作；`deploy.ps1` 生成的密码仅使用 `!*()-_=+` 等 URL 安全字符。建议直接使用 `python -c "import secrets;print(secrets.token_hex(16))"` 生成的 32 位 hex 密码，或使用 `.\deploy.ps1` 自动生成。
+**注意**：`.env` 中密码/密钥**不要包含 `$` 字符**——docker compose 解析 `.env` 时会把 `$VAR` 当作变量插值改写，导致 MySQL 与后端密码不一致（双引号包裹也挡不住）。
+**注意**：密码**不要包含 `/` 字符**——后端用 Python `urllib.parse.quote()` 给用户名/密码做 URL 编码（见 [back/app/config.py](back/app/config.py) 中 `SQLALCHEMY_DATABASE_URI` 的拼装），而 `quote()` 默认把 `/` 当作安全字符**不转义**，含 `/` 的密码会把连接串的路径段切断。
+`@`、`:`、`#` 等字符会被 `quote()` 正确转义成 `%40`/`%3A`/`%23`，手工填写不会破坏连接串；`deploy.ps1` 自动生成的密码只用 `!*()-_=+` 与字母数字，天然避开上述所有问题。建议直接使用 `python -c "import secrets;print(secrets.token_hex(16))"` 生成的 32 位 hex 密码，或使用 `.\deploy.ps1` 自动生成。
 
 ##### 步骤 2：同步根目录 .env
 
@@ -385,7 +390,7 @@ docker compose logs -f frontend
 | `DESENS_KEY_PATH` | `/app/keys/desens.key` | 脱敏 HMAC 密钥文件路径（容器内；宿主机对应 `back/keys/desens.key`） |
 | `GUNICORN_WORKERS` | `4` | Gunicorn worker 数量（**docker-compose 中已覆盖为 1**，深度相机 USB 由容器内独占采集，多 worker 会导致 USB 竞争冲突） |
 
-> **未在 .env 中列出但代码会读取的配置**（一般用默认值即可，详见 [back/app/config.py](file:///d:/Py_Project/DataManagement/back/app/config.py)）：
+> **未在 .env 中列出但代码会读取的配置**（一般用默认值即可，详见 [back/app/config.py](back/app/config.py)）：
 > - `BASE_DIR`、`DATA_LAKE_DIR`：数据湖路径；`MASTER_KEY_PATH` / `DESENS_KEY_PATH`：主密钥与脱敏密钥路径（容器内 `/app/keys/*.key`，宿主机 `back/keys/` 目录挂载）
 > - `ENCRYPTION_ENABLED`：是否启用文件加密（默认启用）
 > - `MAX_UPLOAD_SIZE`：上传大小限制
@@ -426,7 +431,8 @@ docker compose start
 # 完全卸载（保留 volume 数据）
 docker compose down
 
-# 完全卸载并删除数据（谨慎！会丢失数据库和数据湖文件）
+# 完全卸载并删除命名卷（谨慎！mysql-data 被删 = 业务数据全丢）
+# 注意：数据湖是宿主机绑定挂载 ./back/data_lake，down -v 不会删除它，需自行手动删除
 docker compose down -v
 
 # 重新构建镜像（代码变更后）
@@ -444,10 +450,16 @@ docker compose exec mysql mysql -uroot -p
 
 | 备份项 | 位置 | 丢失后果 |
 |---|---|---|
-| MySQL 数据 | `mysql-data` volume | 业务数据全丢 |
-| 数据湖文件 | `backend-data` volume | 所有原始数据全丢 |
+| MySQL 数据 | Docker 命名卷 `mysql-data` | 业务数据全丢 |
+| 数据湖文件 | 宿主机目录 `back/data_lake/`（`docker-compose.yml` 把它绑定挂载到容器 `/app/data_lake`） | 所有原始数据全丢 |
 | `master.key` | `back/keys/master.key` | **加密文件永久无法解密** |
 | 外部密钥 | MySQL 中的 `external_key` 表 | 外部加密文件无法解密 |
+
+> **注意（易踩的坑）**：`backend-data` 命名卷是早期方案，`docker-compose.yml` 已改为把宿主机
+> `./back/data_lake` 绑定挂载到容器 `/app/data_lake`，`volumes:` 段里不再声明该卷。
+> 因此**不要**再用 `docker run -v datamanagement_backend-data:/data ...` 去备份数据湖——
+> Docker 对不存在的卷会静默新建一个空卷，命令会打包出一个内容为空的 tar.gz，
+> 看起来"备份成功"，实际什么都没备份。
 
 ### 备份 MySQL 数据（含外部密钥）
 
@@ -455,16 +467,22 @@ docker compose exec mysql mysql -uroot -p
 # 导出（包含 external_key 表）
 docker compose exec mysql mysqldump -uroot -p<DB_PASSWORD> data_management > backup_$(Get-Date -Format 'yyyyMMdd').sql
 
-# 恢复
+# 恢复（PowerShell 不支持 "<" 输入重定向，必须用管道）
 Get-Content backup_20260728.sql | docker compose exec -T mysql mysql -uroot -p<DB_PASSWORD> data_management
 ```
 
 ### 备份数据湖文件
 
+数据湖是宿主机目录 `back/data_lake`（不是 Docker 卷），直接用系统自带的 `tar` 打包即可：
+
 ```powershell
-# 数据湖在 docker volume 中（backend-data）
-docker run --rm -v datamanagement_backend-data:/data -v ${PWD}:/backup alpine `
-  tar czf /backup/data_lake.tar.gz -C /data .
+cd <项目目录>
+tar -czf "data_lake_$(Get-Date -Format 'yyyyMMdd').tar.gz" -C back data_lake
+
+# 恢复（先停写入方，避免恢复过程中后端继续落盘）
+docker compose stop backend celery-worker
+tar -xzf data_lake_<导出时的日期>.tar.gz -C back
+docker compose start backend celery-worker
 ```
 
 ### 备份 master.key（**关键！丢失后所有加密数据无法恢复**）
@@ -480,20 +498,21 @@ Copy-Item back\keys\master.key back\keys\master.key.backup
 ```powershell
 # 1. 在旧设备导出数据
 docker compose exec mysql mysqldump -uroot -p<DB_PASSWORD> data_management > backup.sql
-docker run --rm -v datamanagement_backend-data:/data -v ${PWD}:/backup alpine tar czf /backup/data_lake.tar.gz -C /data .
+tar -czf data_lake.tar.gz -C back data_lake
 
-# 2. 拷贝到新设备（需要带走的文件）
+# 2. 拷贝到新设备（需要带走的文件，缺一不可）
 #    - 整个项目源码（可删 front/dist、front/node_modules、back/__pycache__）
-#    - back/keys/（内含 master.key）
-#    - back/.env
+#    - back/keys/（内含 master.key 与 desens.key，丢了加密数据就永久打不开）
+#    - back/.env 与 根目录 .env（两者必须同时带；只带 back/.env 会导致
+#      mysql 用默认密码初始化、后端用 back/.env 的密码连接，直接连不上）
 #    - backup.sql
 #    - data_lake.tar.gz
 
 # 3. 在新设备部署
 cd <项目目录>
 docker compose up -d mysql redis        # 先起 mysql 和 redis
-docker compose exec -T mysql mysql -uroot -p<DB_PASSWORD> data_management < backup.sql
-docker run --rm -v datamanagement_backend-data:/data -v ${PWD}:/backup alpine tar xzf /backup/data_lake.tar.gz -C /data
+Get-Content backup.sql | docker compose exec -T mysql mysql -uroot -p<DB_PASSWORD> data_management
+tar -xzf data_lake.tar.gz -C back
 docker compose up -d                      # 启动剩余服务
 ```
 
@@ -598,6 +617,7 @@ DataManagement/
 │   ├── .env.example            # 环境变量模板
 │   ├── .env                    # 实际环境变量（不入 git）
 │   ├── keys/                   # 加密主密钥 master.key（首次启动自动生成，不入 git）
+│   ├── data_lake/              # 数据湖（宿主机目录，绑定挂载到容器 /app/data_lake，不入 git）
 │   ├── requirements.txt
 │   ├── gunicorn_config.py
 │   ├── run.py                  # Flask 入口
@@ -654,4 +674,4 @@ DataManagement/
         └── main.js
 ```
 
-> 说明：`camera_service/`（宿主机采集服务）为旧架构降级路径，已被容器内 pyk4a / pyrealsense2 直连取代，仓库中不再包含；`back/migrations/`、`back/tests/`、`back/data_lake/` 为运行时生成或未纳入 git 管理的目录（数据湖实际存于 Docker volume `backend-data`）。
+> 说明：`camera_service/`（宿主机采集服务）为旧架构降级路径，已被容器内 pyk4a / pyrealsense2 直连取代，仓库中不再包含。`back/migrations/`、`back/tests/`、`back/data_lake/` 为运行时生成或未纳入 git 管理的目录；其中数据湖落在宿主机 `back/data_lake/`（`docker-compose.yml` 绑定挂载到容器 `/app/data_lake`），备份时直接打包该目录即可。
